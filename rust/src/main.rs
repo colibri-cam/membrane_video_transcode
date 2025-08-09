@@ -12,6 +12,8 @@ use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
 use std::os::fd::AsFd;
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Number of seconds to keep playing before exiting.
@@ -37,7 +39,7 @@ impl dc::Device for Card {}
 
 /// Convenience helper to build an `Error` from a static string.
 fn err(msg: &str) -> Error {
-    Error::new(ErrorKind::Other, msg)
+    Error::other(msg)
 }
 
 // ---------- helpers ----------
@@ -163,6 +165,104 @@ fn copy_nv12_frame(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize)
         let dst_off = uv_base + y * pitch;
         dst[dst_off..dst_off + w].copy_from_slice(&src[off..off + w]);
         off += w;
+    }
+}
+
+/// Helper managing vblank-synced presentation of NV12 frames.
+struct FrameDisplay {
+    tx: mpsc::Sender<Vec<u8>>,
+    handle: Option<thread::JoinHandle<()>>,
+    frame_size: usize,
+    db: Arc<std::sync::Mutex<Option<dumbbuf::DumbBuffer>>>,
+}
+
+impl FrameDisplay {
+    /// Spawn a worker thread that copies frames to the dumb buffer on each vblank.
+    fn start(
+        card: Arc<Card>,
+        db: dumbbuf::DumbBuffer,
+        w: u32,
+        h: u32,
+        crtc_idx: u32,
+    ) -> Result<Self> {
+        let pitch = db.pitch() as usize;
+        let frame_size = (w as usize * h as usize * 3) / 2;
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let db_arc = Arc::new(std::sync::Mutex::new(Some(db)));
+        let db_thread = Arc::clone(&db_arc);
+        let card_thread = Arc::clone(&card);
+        let handle = thread::spawn(move || {
+            let mut db = match db_thread.lock().ok().and_then(|mut g| g.take()) {
+                Some(d) => d,
+                None => return,
+            };
+            if let Ok(mut mapping) = card_thread.map_dumb_buffer(&mut db) {
+                loop {
+                    if card_thread
+                        .wait_vblank(
+                            VblankWaitTarget::Relative(1),
+                            VblankWaitFlags::empty(),
+                            crtc_idx,
+                            0,
+                        )
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let mut latest = None;
+                    let mut disconnected = false;
+                    loop {
+                        match rx.try_recv() {
+                            Ok(f) => latest = Some(f),
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                disconnected = true;
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(frame) = latest {
+                        copy_nv12_frame(&frame, mapping.as_mut(), pitch, w as usize, h as usize);
+                    }
+                    if disconnected {
+                        break;
+                    }
+                }
+                drop(mapping);
+            }
+            if let Ok(mut g) = db_thread.lock() {
+                *g = Some(db);
+            }
+        });
+        Ok(Self {
+            tx,
+            handle: Some(handle),
+            frame_size,
+            db: db_arc,
+        })
+    }
+
+    /// Queue a frame to be shown on the next vblank.
+    fn display_frame(&self, frame: &[u8]) -> Result<()> {
+        if frame.len() != self.frame_size {
+            return Err(err("invalid frame size"));
+        }
+        self.tx
+            .send(frame.to_vec())
+            .map_err(|_| err("display thread closed"))
+    }
+
+    /// Stop the worker thread and return the underlying dumb buffer.
+    fn stop(self) -> Result<dumbbuf::DumbBuffer> {
+        drop(self.tx);
+        if let Some(handle) = self.handle {
+            handle.join().map_err(|_| err("thread join failed"))?;
+        }
+        Arc::try_unwrap(self.db)
+            .map_err(|_| err("buffer still in use"))?
+            .into_inner()
+            .map_err(|_| err("mutex poisoned"))?
+            .ok_or_else(|| err("buffer missing"))
     }
 }
 
@@ -303,41 +403,6 @@ fn commit_atomic(card: &Card, req: AtomicModeReq) -> Result<()> {
     Ok(())
 }
 
-/// Stream NV12 frames to the dumb buffer, waiting for vblank before each update.
-fn play_video(
-    card: &Card,
-    db: &mut dumbbuf::DumbBuffer,
-    video: &mut File,
-    w: u32,
-    h: u32,
-    crtc_idx: u32,
-) -> Result<()> {
-    let pitch = db.pitch() as usize;
-    let frame_size = (w as usize * h as usize * 3) / 2;
-    let mut frame = vec![0u8; frame_size];
-    let mut mapping = card.map_dumb_buffer(db)?;
-    let dst = mapping.as_mut();
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(DISPLAY_TIME) {
-        card.wait_vblank(
-            VblankWaitTarget::Relative(1),
-            VblankWaitFlags::empty(),
-            crtc_idx,
-            0,
-        )?;
-        if let Err(e) = video.read_exact(&mut frame) {
-            if e.kind() == ErrorKind::UnexpectedEof {
-                video.seek(SeekFrom::Start(0))?;
-                video.read_exact(&mut frame)?;
-            } else {
-                return Err(e);
-            }
-        }
-        copy_nv12_frame(&frame, dst, pitch, w as usize, h as usize);
-    }
-    Ok(())
-}
-
 /// Clean up DRM resources allocated for the demo.
 fn teardown(
     card: &Card,
@@ -361,7 +426,7 @@ fn main() -> Result<()> {
         .ok_or_else(|| err("NV12 file required"))?;
     let mut video = File::open(&video_path)?;
 
-    let card = open_card(&card_path)?;
+    let card = Arc::new(open_card(&card_path)?);
     enable_atomic_caps(&card)?;
     let res = get_resources(&card)?;
     let conn = pick_connected_connector(&card, &res)?;
@@ -387,23 +452,33 @@ fn main() -> Result<()> {
     let mode = pick_mode(&conn)?;
     let (w, h) = mode.size();
 
-    let mut fbundle = create_dumb_and_fb_nv12(&card, w as u32, h as u32, &mut video)?;
+    let FbBundle { db, fb } = create_dumb_and_fb_nv12(&card, w as u32, h as u32, &mut video)?;
     let plane_h = find_plane_for_crtc(&card, &res, crtc_h)?;
 
     let (mode_blob, blob_id) = create_mode_blob(&card, &mode)?;
 
-    let req = build_atomic_request(&card, &conn, crtc_h, plane_h, fbundle.fb, &mode, mode_blob)?;
+    let req = build_atomic_request(&card, &conn, crtc_h, plane_h, fb, &mode, mode_blob)?;
     commit_atomic(&card, req)?;
     video.seek(SeekFrom::Start(0))?;
-    play_video(
-        &card,
-        &mut fbundle.db,
-        &mut video,
-        w as u32,
-        h as u32,
-        crtc_idx,
-    )?;
 
-    teardown(&card, blob_id, fbundle.fb, fbundle.db)?;
+    let display = FrameDisplay::start(Arc::clone(&card), db, w as u32, h as u32, crtc_idx)?;
+    let frame_size = (w as usize * h as usize * 3) / 2;
+    let mut frame = vec![0u8; frame_size];
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(DISPLAY_TIME) {
+        if let Err(e) = video.read_exact(&mut frame) {
+            if e.kind() == ErrorKind::UnexpectedEof {
+                video.seek(SeekFrom::Start(0))?;
+                video.read_exact(&mut frame)?;
+            } else {
+                return Err(e);
+            }
+        }
+        display.display_frame(&frame)?;
+        thread::sleep(Duration::from_millis(15));
+    }
+
+    let db = display.stop()?;
+    teardown(&card, blob_id, fb, db)?;
     Ok(())
 }
