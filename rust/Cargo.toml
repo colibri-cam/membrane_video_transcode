@@ -1,0 +1,15 @@
+[package]
+name = "atomic_kms_example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+drm = "0.14"  # aka "drm-rs"
+anyhow = "1"
+
+[profile.release]
+opt-level = "z"       # optimize for size
+lto = "fat"           # best size (slower build)
+codegen-units = 1
+panic = "abort"
+strip = "symbols"     # strip in Cargo (or run `strip -s` afterwards)
