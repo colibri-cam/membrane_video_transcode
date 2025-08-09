@@ -5,7 +5,10 @@ edition = "2021"
 
 [dependencies]
 drm = "0.14"  # aka "drm-rs"
-anyhow = "1"
+
+[features]
+default = []
+verbose = []          # enable to keep println-style logs
 
 [profile.release]
 opt-level = "z"       # optimize for size

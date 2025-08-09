@@ -1,19 +1,25 @@
-use anyhow::{anyhow, Context, Result};
 use drm::buffer::Buffer;                   // trait for .pitch()
 use drm::control as dc;
 use drm::control::atomic::AtomicModeReq;
 use drm::control::{connector, crtc, encoder, plane, property, AtomicCommitFlags, Device as _};
 use drm::control::dumbbuffer as dumbbuf;
 use drm::Device as _;                     // for set_client_capability()
-use drm::ClientCapability;                 // caps to enable atomic / universal planes
+use drm::ClientCapability;                // caps to enable atomic / universal planes
 use std::env;
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
+use std::io::{Error, ErrorKind, Result};
 use std::os::fd::AsFd;
 use std::thread;
 use std::time::Duration;
 
 const DISPLAY_TIME: u64 = 10; // seconds
+
+// compile-time log toggle
+#[cfg(feature = "verbose")]
+macro_rules! log { ($($t:tt)*) => { println!($($t)*); } }
+#[cfg(not(feature = "verbose"))]
+macro_rules! log { ($($t:tt)*) => {}; }
 
 // Thin wrapper so drm-rs trait impls apply
 struct Card(File);
@@ -21,82 +27,71 @@ impl AsFd for Card { fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> { self.0.as_
 impl drm::Device for Card {}
 impl dc::Device for Card {}
 
+fn err(msg: &str) -> Error { Error::new(ErrorKind::Other, msg) }
+
 // ---------- helpers ----------
 fn enable_atomic_caps(card: &Card) -> Result<()> {
     // Must be enabled *before* querying planes/properties
-    card.set_client_capability(ClientCapability::UniversalPlanes, true)
-        .context("enable DRM_CLIENT_CAP_UNIVERSAL_PLANES")?;
-    card.set_client_capability(ClientCapability::Atomic, true)
-        .context("enable DRM_CLIENT_CAP_ATOMIC")?;
-    println!("Enabled client caps: UNIVERSAL_PLANES + ATOMIC");
+    card.set_client_capability(ClientCapability::UniversalPlanes, true)?;
+    card.set_client_capability(ClientCapability::Atomic, true)?;
+    log!("Enabled client caps: UNIVERSAL_PLANES + ATOMIC");
     Ok(())
 }
 
-
 fn open_card(path: &str) -> Result<Card> {
-    println!("Opening DRM device: {path}");
-    let file = OpenOptions::new().read(true).write(true).open(path)
-        .with_context(|| format!("open {path}"))?;
+    log!("Opening DRM device: {path}");
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
     Ok(Card(file))
 }
 
 fn get_resources(card: &Card) -> Result<dc::ResourceHandles> {
-    Ok(card.resource_handles().context("get resources")?)
+    card.resource_handles()
 }
 
 fn pick_connected_connector(card: &Card, res: &dc::ResourceHandles) -> Result<connector::Info> {
     for &conn_h in res.connectors() {
-        let info = card.get_connector(conn_h, true).context("get connector")?;
+        let info = card.get_connector(conn_h, true)?;
         if info.state() == connector::State::Connected && !info.modes().is_empty() {
-            println!(
+            log!(
                 "Selected connector: id={}, type={:?}, modes={}",
                 u32::from(info.handle()), info.interface(), info.modes().len()
             );
             return Ok(info);
         }
     }
-    Err(anyhow!("No connected connector"))
+    Err(err("No connected connector"))
 }
 
 fn pick_encoder_and_crtc(card: &Card, conn: &connector::Info) -> Result<(encoder::Info, crtc::Handle)> {
-    let enc_h = conn.encoders().first().copied()
-        .ok_or_else(|| anyhow!("connector has no encoders"))?;
-    let enc = card.get_encoder(enc_h).context("get encoder")?;
-    let crtc_h = enc.crtc().ok_or_else(|| anyhow!("encoder has no crtc"))?;
-    println!(
+    let enc_h = conn.encoders().first().copied().ok_or_else(|| err("connector has no encoders"))?;
+    let enc = card.get_encoder(enc_h)?;
+    let crtc_h = enc.crtc().ok_or_else(|| err("encoder has no crtc"))?;
+    log!(
         "Selected encoder: id={}, type={:?}, CRTC id={}",
         u32::from(enc.handle()), enc.kind(), u32::from(crtc_h)
     );
     Ok((enc, crtc_h))
 }
 
-fn crtc_index(res: &dc::ResourceHandles, crtc_h: crtc::Handle) -> Result<u32> {
-    let idx = res.crtcs().iter().position(|&h| h == crtc_h)
-        .ok_or_else(|| anyhow!("CRTC not in resources"))? as u32;
-    Ok(idx)
-}
-
 fn pick_mode(conn: &connector::Info) -> Result<dc::Mode> {
-    let mode = *conn.modes().first().ok_or_else(|| anyhow!("connector has no modes"))?;
-    println!("Mode: {}x{}@{}Hz", mode.size().0, mode.size().1, mode.vrefresh());
+    let mode = *conn.modes().first().ok_or_else(|| err("connector has no modes"))?;
+    log!("Mode: {}x{}@{}Hz", mode.size().0, mode.size().1, mode.vrefresh());
     Ok(mode)
 }
 
 struct FbBundle {
     db: dumbbuf::DumbBuffer,
-    fb: dc::framebuffer::Handle
+    fb: dc::framebuffer::Handle,
 }
 
 fn create_dumb_and_fb(card: &Card, w: u32, h: u32) -> Result<FbBundle> {
     // drm-rs 0.14 signature: (size, format, bpp)
-    let mut db = card
-        .create_dumb_buffer((w, h), drm::buffer::DrmFourcc::Xrgb8888, 32)
-        .context("create dumb")?;
+    let mut db = card.create_dumb_buffer((w, h), drm::buffer::DrmFourcc::Xrgb8888, 32)?;
 
     let pitch = db.pitch();
     {
         // Map, draw, then drop the mapping before creating FB to avoid borrow conflicts
-        let mut mapping = card.map_dumb_buffer(&mut db).context("map dumb")?;
+        let mut mapping = card.map_dumb_buffer(&mut db)?;
         // draw gradient (XRGB8888 little-endian: B,G,R,X)
         let buf = unsafe { std::slice::from_raw_parts_mut(mapping.as_mut_ptr(), (pitch * h) as usize) };
         let pitch_usize = pitch as usize;
@@ -106,7 +101,7 @@ fn create_dumb_and_fb(card: &Card, w: u32, h: u32) -> Result<FbBundle> {
                 let g = ((y * 255) / h as usize) as u8;
                 let b = 128u8;
                 let off = y * pitch_usize + x * 4;
-                buf[off + 0] = b;
+                buf[off] = b;
                 buf[off + 1] = g;
                 buf[off + 2] = r;
                 buf[off + 3] = 0x00;
@@ -115,46 +110,42 @@ fn create_dumb_and_fb(card: &Card, w: u32, h: u32) -> Result<FbBundle> {
         // mapping dropped here
     }
 
-    let fb = card.add_framebuffer(&db, 24, 32).context("add fb")?;
-    println!("Created framebuffer id={}", u32::from(fb));
+    let fb = card.add_framebuffer(&db, 24, 32)?;
+    log!("Created framebuffer id={}", u32::from(fb));
 
-    Ok(FbBundle { db, fb})
+    Ok(FbBundle { db, fb })
 }
 
 fn find_plane_for_crtc(card: &Card, res: &dc::ResourceHandles, crtc_h: crtc::Handle) -> Result<plane::Handle> {
-    let idx = crtc_index(res, crtc_h)?; // still handy for logs
-    let planes = card.plane_handles().context("plane handles")?;
+    let planes = card.plane_handles()?;
     for &ph in planes.as_slice() {
-        let pinfo = card.get_plane(ph).context("get plane")?;
-        // Use the helper to turn filter into a list of allowed CRTCs
+        let pinfo = card.get_plane(ph)?;
+        // Use helper to turn filter into a list of allowed CRTCs
         let allowed = res.filter_crtcs(pinfo.possible_crtcs());
         if allowed.contains(&crtc_h) {
-            println!(
-                "Selected plane id={}, possible_crtcs_mask_index_includes={}",
-                u32::from(ph), idx
-            );
+            log!("Selected plane id={}", u32::from(ph));
             return Ok(ph);
         }
     }
-    Err(anyhow!("No compatible plane found"))
+    Err(err("No compatible plane found"))
 }
 
 fn create_mode_blob(card: &Card, mode: &dc::Mode) -> Result<(property::Value<'static>, u64)> {
-    let blob_val = card.create_property_blob(mode).context("create blob")?;
+    let blob_val = card.create_property_blob(mode)?;
     let blob_id = match blob_val { property::Value::Blob(id) => id, _ => unreachable!() };
-    println!("Created mode blob id={}", blob_id);
+    log!("Created mode blob id={}", blob_id);
     Ok((blob_val, blob_id))
 }
 
 fn find_prop(card: &Card, obj: impl dc::ResourceHandle, name: &CStr) -> Result<property::Handle> {
-    let props = card.get_properties(obj).context("get properties")?;
+    let props = card.get_properties(obj)?;
     for (handle, _raw) in props.iter() {
-        let info = card.get_property(*handle).context("get property")?;
+        let info = card.get_property(*handle)?;
         if info.name().to_bytes() == name.to_bytes() {
             return Ok(*handle);
         }
     }
-    Err(anyhow!("property {:?} not found", name))
+    Err(err("property not found"))
 }
 
 fn build_atomic_request(
@@ -209,10 +200,9 @@ fn build_atomic_request(
 }
 
 fn commit_atomic(card: &Card, req: AtomicModeReq) -> Result<()> {
-    println!("Committing atomic modeset...");
-    card.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
-        .context("atomic commit")?;
-    println!("Commit ok. Showing for {DISPLAY_TIME}s");
+    log!("Committing atomic modeset...");
+    card.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)?;
+    log!("Commit ok. Showing for {DISPLAY_TIME}s");
     Ok(())
 }
 
@@ -233,14 +223,17 @@ fn main() -> Result<()> {
     let conn = pick_connected_connector(&card, &res)?;
     let (_enc, crtc_h) = pick_encoder_and_crtc(&card, &conn)?;
 
-    let crtc_info = card.get_crtc(crtc_h).context("get crtc")?;
-    println!(
-        "Using CRTC: id={}, fb={}, x={}, y={}",
-        u32::from(crtc_info.handle()),
-        crtc_info.framebuffer().map(u32::from).unwrap_or(0),
-        crtc_info.position().0,
-        crtc_info.position().1
-    );
+    #[cfg(feature = "verbose")]
+    {
+        let crtc_info = card.get_crtc(crtc_h)?;
+        log!(
+            "Using CRTC: id={}, fb={}, x={}, y={}",
+            u32::from(crtc_info.handle()),
+            crtc_info.framebuffer().map(u32::from).unwrap_or(0),
+            crtc_info.position().0,
+            crtc_info.position().1
+        );
+    }
 
     let mode = pick_mode(&conn)?;
     let (w, h) = mode.size();
