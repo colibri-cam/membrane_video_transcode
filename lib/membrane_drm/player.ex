@@ -1,4 +1,4 @@
-defmodule Membrane.Drm.Player do
+defmodule Membrane.DRM.Player do
   @moduledoc """
   Membrane sink that renders raw video frames on a DRM display.
 
