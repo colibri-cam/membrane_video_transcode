@@ -7,17 +7,15 @@ use drm::control::{connector, crtc, encoder, plane, property, AtomicCommitFlags,
 use drm::ClientCapability; // caps to enable atomic / universal planes
 use drm::Device as _; // for set_client_capability()
 use drm::{VblankWaitFlags, VblankWaitTarget};
-use std::env;
+use rustler::{Binary, NifResult, ResourceArc};
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
-use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
+use std::io::Error;
 use std::os::fd::AsFd;
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::{Duration, Instant};
 
-/// Number of seconds to keep playing before exiting.
-const DISPLAY_TIME: u64 = 10;
+type Result<T> = std::result::Result<T, Error>;
 
 // compile-time log toggle
 #[cfg(feature = "verbose")]
@@ -266,8 +264,8 @@ impl FrameDisplay {
     }
 }
 
-/// Create an NV12 dumb buffer, populate it with the first frame, and register a framebuffer.
-fn create_dumb_and_fb_nv12(card: &Card, w: u32, h: u32, video: &mut File) -> Result<FbBundle> {
+/// Create an NV12 dumb buffer, initialize it to zero, and register a framebuffer.
+fn create_dumb_and_fb(card: &Card, w: u32, h: u32) -> Result<FbBundle> {
     // Allocate space for Y and interleaved UV planes.
     let db_height = h + h / 2;
     let mut db = card.create_dumb_buffer((w, db_height), drm::buffer::DrmFourcc::Nv12, 8)?;
@@ -275,8 +273,7 @@ fn create_dumb_and_fb_nv12(card: &Card, w: u32, h: u32, video: &mut File) -> Res
     let pitch = db.pitch() as usize;
     let frame_size = (w as usize * h as usize * 3) / 2;
     {
-        let mut frame = vec![0u8; frame_size];
-        video.read_exact(&mut frame)?;
+        let frame = vec![0u8; frame_size];
         let mut mapping = card.map_dumb_buffer(&mut db)?;
         copy_nv12_frame(&frame, mapping.as_mut(), pitch, w as usize, h as usize);
         // mapping dropped here
@@ -416,69 +413,94 @@ fn teardown(
     Ok(())
 }
 
-// ---------- main orchestration ----------
-fn main() -> Result<()> {
-    let card_path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "/dev/dri/card0".to_string());
-    let video_path = env::args()
-        .nth(2)
-        .ok_or_else(|| err("NV12 file required"))?;
-    let mut video = File::open(&video_path)?;
+// ---------- NIF bindings ----------
 
-    let card = Arc::new(open_card(&card_path)?);
-    enable_atomic_caps(&card)?;
-    let res = get_resources(&card)?;
-    let conn = pick_connected_connector(&card, &res)?;
-    let (_enc, crtc_h) = pick_encoder_and_crtc(&card, &conn)?;
-    let crtc_idx = res
-        .crtcs()
-        .iter()
-        .position(|h| *h == crtc_h)
-        .ok_or_else(|| err("CRTC handle not found"))? as u32;
+/// Holds the state required to display frames and clean up on drop.
+struct Display {
+    inner: Option<FrameDisplay>,
+    card: Arc<Card>,
+    blob_id: u64,
+    fb: dc::framebuffer::Handle,
+}
 
-    #[cfg(feature = "verbose")]
-    {
-        let crtc_info = card.get_crtc(crtc_h)?;
-        log!(
-            "Using CRTC: id={}, fb={}, x={}, y={}",
-            u32::from(crtc_info.handle()),
-            crtc_info.framebuffer().map(u32::from).unwrap_or(0),
-            crtc_info.position().0,
-            crtc_info.position().1
-        );
+impl Display {
+    fn new(card_path: &str) -> Result<(Self, u32, u32)> {
+        let card = Arc::new(open_card(card_path)?);
+        enable_atomic_caps(&card)?;
+        let res = get_resources(&card)?;
+        let conn = pick_connected_connector(&card, &res)?;
+        let (_enc, crtc_h) = pick_encoder_and_crtc(&card, &conn)?;
+        let crtc_idx = res
+            .crtcs()
+            .iter()
+            .position(|h| *h == crtc_h)
+            .ok_or_else(|| err("CRTC handle not found"))? as u32;
+        let mode = pick_mode(&conn)?;
+        let (w, h) = mode.size();
+        let FbBundle { db, fb } = create_dumb_and_fb(&card, w as u32, h as u32)?;
+        let plane_h = find_plane_for_crtc(&card, &res, crtc_h)?;
+        let (mode_blob, blob_id) = create_mode_blob(&card, &mode)?;
+        let req = build_atomic_request(&card, &conn, crtc_h, plane_h, fb, &mode, mode_blob)?;
+        commit_atomic(&card, req)?;
+        let display = FrameDisplay::start(Arc::clone(&card), db, w as u32, h as u32, crtc_idx)?;
+        Ok((
+            Self {
+                inner: Some(display),
+                card,
+                blob_id,
+                fb,
+            },
+            w as u32,
+            h as u32,
+        ))
     }
 
-    let mode = pick_mode(&conn)?;
-    let (w, h) = mode.size();
+    fn display_frame(&self, frame: &[u8]) -> Result<()> {
+        if let Some(ref disp) = self.inner {
+            disp.display_frame(frame)
+        } else {
+            Err(err("display stopped"))
+        }
+    }
+}
 
-    let FbBundle { db, fb } = create_dumb_and_fb_nv12(&card, w as u32, h as u32, &mut video)?;
-    let plane_h = find_plane_for_crtc(&card, &res, crtc_h)?;
-
-    let (mode_blob, blob_id) = create_mode_blob(&card, &mode)?;
-
-    let req = build_atomic_request(&card, &conn, crtc_h, plane_h, fb, &mode, mode_blob)?;
-    commit_atomic(&card, req)?;
-    video.seek(SeekFrom::Start(0))?;
-
-    let display = FrameDisplay::start(Arc::clone(&card), db, w as u32, h as u32, crtc_idx)?;
-    let frame_size = (w as usize * h as usize * 3) / 2;
-    let mut frame = vec![0u8; frame_size];
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(DISPLAY_TIME) {
-        if let Err(e) = video.read_exact(&mut frame) {
-            if e.kind() == ErrorKind::UnexpectedEof {
-                video.seek(SeekFrom::Start(0))?;
-                video.read_exact(&mut frame)?;
-            } else {
-                return Err(e);
+impl Drop for Display {
+    fn drop(&mut self) {
+        if let Some(disp) = self.inner.take() {
+            if let Ok(db) = disp.stop() {
+                let _ = teardown(&self.card, self.blob_id, self.fb, db);
             }
         }
-        display.display_frame(&frame)?;
-        thread::sleep(Duration::from_millis(15));
     }
-
-    let db = display.stop()?;
-    teardown(&card, blob_id, fb, db)?;
-    Ok(())
 }
+
+struct DisplayResource(std::sync::Mutex<Display>);
+
+unsafe impl Send for DisplayResource {}
+unsafe impl Sync for DisplayResource {}
+
+fn nif_error<E: std::fmt::Display>(e: E) -> rustler::Error {
+    rustler::Error::Term(Box::new(format!("{e}")))
+}
+
+#[rustler::nif]
+fn init_display(card_path: Option<String>) -> NifResult<ResourceArc<DisplayResource>> {
+    let path = card_path.unwrap_or_else(|| "/dev/dri/card0".to_string());
+    let (display, _w, _h) = Display::new(&path).map_err(nif_error)?;
+    Ok(ResourceArc::new(DisplayResource(std::sync::Mutex::new(
+        display,
+    ))))
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn display_frame(res: ResourceArc<DisplayResource>, frame: Binary) -> NifResult<()> {
+    let guard = res.0.lock().map_err(|_| nif_error("lock poisoned"))?;
+    guard.display_frame(frame.as_slice()).map_err(nif_error)
+}
+
+#[allow(non_local_definitions)]
+fn load(env: rustler::Env, _info: rustler::Term) -> bool {
+    rustler::resource!(DisplayResource, env)
+}
+
+rustler::init!("Elixir.DrmSink", load = load);

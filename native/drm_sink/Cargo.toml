@@ -1,10 +1,15 @@
 [package]
-name = "atomic_kms_example"
+name = "drm_sink"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "drm_sink"
+crate-type = ["cdylib"]
+
 [dependencies]
 drm = "0.14"  # aka "drm-rs"
+rustler = "0.36.2"
 
 [features]
 default = []
