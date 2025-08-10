@@ -4,7 +4,7 @@ This directory contains a small Rust example for atomic modesetting using the `d
 Follow these guidelines when modifying any files under this directory.
 
 ## Code Style
-- Use Rust 2021 edition conventions.
+- Use Rust 2024 edition conventions.
 - Format the code with `cargo fmt --all` before committing.
 - Keep imports sorted and grouped as produced by `rustfmt`.
 - Use 4 spaces for indentation and try to keep lines under 100 characters.
