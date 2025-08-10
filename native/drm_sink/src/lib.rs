@@ -6,7 +6,6 @@ use drm::control::FbCmd2Flags;
 use drm::control::atomic::AtomicModeReq;
 use drm::control::dumbbuffer as dumbbuf;
 use drm::control::{AtomicCommitFlags, Device as _, connector, crtc, encoder, plane, property};
-use drm::{VblankWaitFlags, VblankWaitTarget};
 use rustler::{Binary, NifResult, ResourceArc};
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
@@ -312,7 +311,6 @@ struct Display {
     prop_fb: property::Handle,
     prop_crtc: property::Handle,
     crtc_h: crtc::Handle,
-    crtc_idx: u32,
     w: u32,
     h: u32,
     cur: usize,
@@ -325,11 +323,6 @@ impl Display {
         let res = get_resources(&card)?;
         let conn = pick_connected_connector(&card, &res)?;
         let (_enc, crtc_h) = pick_encoder_and_crtc(&card, &conn)?;
-        let crtc_idx = res
-            .crtcs()
-            .iter()
-            .position(|h| *h == crtc_h)
-            .ok_or_else(|| err("CRTC handle not found"))? as u32;
         let mode = pick_mode(&conn)?;
         let (w16, h16) = mode.size();
         let (w, h) = (w16 as u32, h16 as u32);
@@ -366,7 +359,6 @@ impl Display {
                 prop_fb,
                 prop_crtc,
                 crtc_h,
-                crtc_idx,
                 w,
                 h,
                 cur: 0,
@@ -405,13 +397,8 @@ impl Display {
             self.prop_fb,
             property::Value::Framebuffer(Some(buf.fb)),
         );
+        // Commit asynchronously so the caller isn't blocked waiting for vblank.
         self.card.atomic_commit(AtomicCommitFlags::NONBLOCK, req)?;
-        self.card.wait_vblank(
-            VblankWaitTarget::Relative(1),
-            VblankWaitFlags::empty(),
-            self.crtc_idx,
-            0,
-        )?;
         self.cur = next;
         Ok(())
     }
