@@ -12,8 +12,7 @@ use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io::Error;
 use std::os::fd::AsFd;
-use std::sync::{mpsc, Arc};
-use std::thread;
+use std::sync::Arc;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -166,110 +165,6 @@ fn copy_nv12_frame(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize)
     }
 }
 
-/// Helper managing vblank-synced presentation of NV12 frames.
-struct FrameDisplay {
-    tx: mpsc::Sender<()>,
-    handle: Option<thread::JoinHandle<()>>,
-    frame_size: usize,
-    buf: Arc<std::sync::Mutex<Vec<u8>>>,
-    db: Arc<std::sync::Mutex<Option<dumbbuf::DumbBuffer>>>,
-}
-
-impl FrameDisplay {
-    /// Spawn a worker thread that copies frames to the dumb buffer on each vblank.
-    fn start(
-        card: Arc<Card>,
-        db: dumbbuf::DumbBuffer,
-        w: u32,
-        h: u32,
-        crtc_idx: u32,
-    ) -> Result<Self> {
-        let pitch = db.pitch() as usize;
-        let frame_size = (w as usize * h as usize * 3) / 2;
-        let (tx, rx) = mpsc::channel::<()>();
-        let buf = Arc::new(std::sync::Mutex::new(vec![0u8; frame_size]));
-        let db_arc = Arc::new(std::sync::Mutex::new(Some(db)));
-        let db_thread = Arc::clone(&db_arc);
-        let buf_thread = Arc::clone(&buf);
-        let card_thread = Arc::clone(&card);
-        let handle = thread::spawn(move || {
-            let mut db = match db_thread.lock().ok().and_then(|mut g| g.take()) {
-                Some(d) => d,
-                None => return,
-            };
-            if let Ok(mut mapping) = card_thread.map_dumb_buffer(&mut db) {
-                loop {
-                    if card_thread
-                        .wait_vblank(
-                            VblankWaitTarget::Relative(1),
-                            VblankWaitFlags::empty(),
-                            crtc_idx,
-                            0,
-                        )
-                        .is_err()
-                    {
-                        break;
-                    }
-                    let mut has_frame = false;
-                    let mut disconnected = false;
-                    loop {
-                        match rx.try_recv() {
-                            Ok(()) => has_frame = true,
-                            Err(mpsc::TryRecvError::Empty) => break,
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                disconnected = true;
-                                break;
-                            }
-                        }
-                    }
-                    if has_frame {
-                        if let Ok(buf) = buf_thread.lock() {
-                            copy_nv12_frame(&buf, mapping.as_mut(), pitch, w as usize, h as usize);
-                        }
-                    }
-                    if disconnected {
-                        break;
-                    }
-                }
-                drop(mapping);
-            }
-            if let Ok(mut g) = db_thread.lock() {
-                *g = Some(db);
-            }
-        });
-        Ok(Self {
-            tx,
-            handle: Some(handle),
-            frame_size,
-            buf,
-            db: db_arc,
-        })
-    }
-
-    /// Queue a frame to be shown on the next vblank.
-    fn display_frame(&self, frame: &[u8]) -> Result<()> {
-        if frame.len() != self.frame_size {
-            return Err(err("invalid frame size"));
-        }
-        let mut buf = self.buf.lock().map_err(|_| err("buffer lock poisoned"))?;
-        buf.copy_from_slice(frame);
-        self.tx.send(()).map_err(|_| err("display thread closed"))
-    }
-
-    /// Stop the worker thread and return the underlying dumb buffer.
-    fn stop(self) -> Result<dumbbuf::DumbBuffer> {
-        drop(self.tx);
-        if let Some(handle) = self.handle {
-            handle.join().map_err(|_| err("thread join failed"))?;
-        }
-        Arc::try_unwrap(self.db)
-            .map_err(|_| err("buffer still in use"))?
-            .into_inner()
-            .map_err(|_| err("mutex poisoned"))?
-            .ok_or_else(|| err("buffer missing"))
-    }
-}
-
 /// Create an NV12 dumb buffer, initialize it to zero, and register a framebuffer.
 fn create_dumb_and_fb(card: &Card, w: u32, h: u32) -> Result<FbBundle> {
     // Allocate space for Y and interleaved UV planes.
@@ -406,27 +301,21 @@ fn commit_atomic(card: &Card, req: AtomicModeReq) -> Result<()> {
     Ok(())
 }
 
-/// Clean up DRM resources allocated for the demo.
-fn teardown(
-    card: &Card,
-    blob_id: u64,
-    fb: dc::framebuffer::Handle,
-    db: dumbbuf::DumbBuffer,
-) -> Result<()> {
-    card.destroy_property_blob(blob_id).ok();
-    card.destroy_framebuffer(fb).ok();
-    card.destroy_dumb_buffer(db).ok();
-    Ok(())
-}
-
 // ---------- NIF bindings ----------
 
-/// Holds the state required to display frames and clean up on drop.
+/// Holds DRM state and triple framebuffers for atomic flips.
 struct Display {
-    inner: Option<FrameDisplay>,
     card: Arc<Card>,
     blob_id: u64,
-    fb: dc::framebuffer::Handle,
+    buffers: Vec<FbBundle>,
+    plane_h: plane::Handle,
+    prop_fb: property::Handle,
+    prop_crtc: property::Handle,
+    crtc_h: crtc::Handle,
+    crtc_idx: u32,
+    w: u32,
+    h: u32,
+    cur: usize,
 }
 
 impl Display {
@@ -442,40 +331,98 @@ impl Display {
             .position(|h| *h == crtc_h)
             .ok_or_else(|| err("CRTC handle not found"))? as u32;
         let mode = pick_mode(&conn)?;
-        let (w, h) = mode.size();
-        let FbBundle { db, fb } = create_dumb_and_fb(&card, w as u32, h as u32)?;
+        let (w16, h16) = mode.size();
+        let (w, h) = (w16 as u32, h16 as u32);
+
+        // Create three framebuffers for triple buffering.
+        let mut buffers = Vec::with_capacity(3);
+        for _ in 0..3 {
+            buffers.push(create_dumb_and_fb(&card, w, h)?);
+        }
+
         let plane_h = find_plane_for_crtc(&card, &res, crtc_h)?;
         let (mode_blob, blob_id) = create_mode_blob(&card, &mode)?;
-        let req = build_atomic_request(&card, &conn, crtc_h, plane_h, fb, &mode, mode_blob)?;
+        let req = build_atomic_request(
+            &card,
+            &conn,
+            crtc_h,
+            plane_h,
+            buffers[0].fb,
+            &mode,
+            mode_blob,
+        )?;
         commit_atomic(&card, req)?;
-        let display = FrameDisplay::start(Arc::clone(&card), db, w as u32, h as u32, crtc_idx)?;
+
+        let name = |s: &str| CString::new(s).unwrap();
+        let prop_fb = find_prop(&card, plane_h, &name("FB_ID"))?;
+        let prop_crtc = find_prop(&card, plane_h, &name("CRTC_ID"))?;
+
         Ok((
             Self {
-                inner: Some(display),
                 card,
                 blob_id,
-                fb,
+                buffers,
+                plane_h,
+                prop_fb,
+                prop_crtc,
+                crtc_h,
+                crtc_idx,
+                w,
+                h,
+                cur: 0,
             },
-            w as u32,
-            h as u32,
+            w,
+            h,
         ))
     }
 
-    fn display_frame(&self, frame: &[u8]) -> Result<()> {
-        if let Some(ref disp) = self.inner {
-            disp.display_frame(frame)
-        } else {
-            Err(err("display stopped"))
+    fn display_frame(&mut self, frame: &[u8]) -> Result<()> {
+        let frame_size = (self.w as usize * self.h as usize * 3) / 2;
+        if frame.len() != frame_size {
+            return Err(err("invalid frame size"));
         }
+        let next = (self.cur + 1) % self.buffers.len();
+        let buf = &mut self.buffers[next];
+        let pitch = buf.db.pitch() as usize;
+        {
+            let mut mapping = self.card.map_dumb_buffer(&mut buf.db)?;
+            copy_nv12_frame(
+                frame,
+                mapping.as_mut(),
+                pitch,
+                self.w as usize,
+                self.h as usize,
+            );
+        }
+        let mut req = AtomicModeReq::new();
+        req.add_property(
+            self.plane_h,
+            self.prop_crtc,
+            property::Value::CRTC(Some(self.crtc_h)),
+        );
+        req.add_property(
+            self.plane_h,
+            self.prop_fb,
+            property::Value::Framebuffer(Some(buf.fb)),
+        );
+        self.card.atomic_commit(AtomicCommitFlags::NONBLOCK, req)?;
+        self.card.wait_vblank(
+            VblankWaitTarget::Relative(1),
+            VblankWaitFlags::empty(),
+            self.crtc_idx,
+            0,
+        )?;
+        self.cur = next;
+        Ok(())
     }
 }
 
 impl Drop for Display {
     fn drop(&mut self) {
-        if let Some(disp) = self.inner.take() {
-            if let Ok(db) = disp.stop() {
-                let _ = teardown(&self.card, self.blob_id, self.fb, db);
-            }
+        self.card.destroy_property_blob(self.blob_id).ok();
+        for FbBundle { db, fb } in self.buffers.drain(..) {
+            self.card.destroy_framebuffer(fb).ok();
+            self.card.destroy_dumb_buffer(db).ok();
         }
     }
 }
@@ -500,7 +447,7 @@ fn init_display(card_path: Option<String>) -> NifResult<ResourceArc<DisplayResou
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn display_frame(res: ResourceArc<DisplayResource>, frame: Binary) -> NifResult<()> {
-    let guard = res.0.lock().map_err(|_| nif_error("lock poisoned"))?;
+    let mut guard = res.0.lock().map_err(|_| nif_error("lock poisoned"))?;
     guard.display_frame(frame.as_slice()).map_err(nif_error)
 }
 
