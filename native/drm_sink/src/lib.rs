@@ -13,7 +13,7 @@ use std::io::Error;
 use std::os::fd::AsFd;
 use std::sync::Arc;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::upper_case_acronyms)]
 enum PixelFormat {
     I420,
@@ -98,6 +98,13 @@ impl PixelFormat {
             Self::I420 | Self::I422 | Self::I444 | Self::YV12 => 3,
             Self::NV12 | Self::NV21 => 2,
             _ => 1,
+        }
+    }
+
+    fn fb_format(self) -> Self {
+        match self {
+            Self::I420 => Self::NV12,
+            other => other,
         }
     }
 }
@@ -351,6 +358,27 @@ fn copy_yv12_frame(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize)
     );
 }
 
+fn copy_i420_to_nv12(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize) {
+    let mut off = 0;
+    copy_plane(&src[off..off + w * h], &mut dst[0..], pitch, w, h);
+    off += w * h;
+    let u_size = (w / 2) * (h / 2);
+    let u_plane = &src[off..off + u_size];
+    off += u_size;
+    let v_plane = &src[off..off + u_size];
+    let uv_base = pitch * h;
+    for y in 0..(h / 2) {
+        let dst_off = uv_base + y * pitch;
+        for x in 0..(w / 2) {
+            let u = u_plane[y * (w / 2) + x];
+            let v = v_plane[y * (w / 2) + x];
+            let dst_idx = dst_off + 2 * x;
+            dst[dst_idx] = u;
+            dst[dst_idx + 1] = v;
+        }
+    }
+}
+
 fn copy_packed_frame(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize, bpp: usize) {
     let row = w * bpp;
     for y in 0..h {
@@ -524,6 +552,7 @@ struct Display {
     h: u32,
     cur: usize,
     fmt: PixelFormat,
+    fb_fmt: PixelFormat,
 }
 
 impl Display {
@@ -537,10 +566,12 @@ impl Display {
         let (w16, h16) = mode.size();
         let (w, h) = (w16 as u32, h16 as u32);
 
+        let fb_fmt = fmt.fb_format();
+
         // Create three framebuffers for triple buffering.
         let mut buffers = Vec::with_capacity(3);
         for _ in 0..3 {
-            buffers.push(create_dumb_and_fb(&card, w, h, fmt)?);
+            buffers.push(create_dumb_and_fb(&card, w, h, fb_fmt)?);
         }
 
         let plane_h = find_plane_for_crtc(&card, &res, crtc_h)?;
@@ -573,6 +604,7 @@ impl Display {
                 h,
                 cur: 0,
                 fmt,
+                fb_fmt,
             },
             w,
             h,
@@ -589,14 +621,26 @@ impl Display {
         let pitch = buf.db.pitch() as usize;
         {
             let mut mapping = self.card.map_dumb_buffer(&mut buf.db)?;
-            copy_frame(
-                frame,
-                mapping.as_mut(),
-                pitch,
-                self.w as usize,
-                self.h as usize,
-                self.fmt,
-            );
+            if self.fmt == self.fb_fmt {
+                copy_frame(
+                    frame,
+                    mapping.as_mut(),
+                    pitch,
+                    self.w as usize,
+                    self.h as usize,
+                    self.fmt,
+                );
+            } else if self.fmt == PixelFormat::I420 && self.fb_fmt == PixelFormat::NV12 {
+                copy_i420_to_nv12(
+                    frame,
+                    mapping.as_mut(),
+                    pitch,
+                    self.w as usize,
+                    self.h as usize,
+                );
+            } else {
+                return Err(err("unsupported format conversion"));
+            }
         }
         let mut req = AtomicModeReq::new();
         req.add_property(
