@@ -87,4 +87,13 @@ defmodule Membrane.Drm.Player do
     :ok = DrmSink.display_frame(state.display, state.last_payload)
     {[timer_interval: {:demand_timer, :no_interval}, demand: :input], state}
   end
+
+  @impl true
+  def handle_terminate_request(_ctx, %{display: display} = state) do
+    if display do
+      :ok = DrmSink.close_display(display)
+    end
+
+    {[terminate: :normal], %{state | display: nil}}
+  end
 end

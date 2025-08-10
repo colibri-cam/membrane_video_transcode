@@ -626,7 +626,7 @@ impl Drop for Display {
     }
 }
 
-struct DisplayResource(std::sync::Mutex<Display>);
+struct DisplayResource(std::sync::Mutex<Option<Display>>);
 
 unsafe impl Send for DisplayResource {}
 unsafe impl Sync for DisplayResource {}
@@ -647,14 +647,25 @@ fn init_display<'a>(
     let pf = PixelFormat::from_str(&pf_str).ok_or_else(|| nif_error("unknown pixel format"))?;
     let (display, _w, _h) = Display::new("/dev/dri/card0", pf).map_err(nif_error)?;
     Ok(ResourceArc::new(DisplayResource(std::sync::Mutex::new(
-        display,
+        Some(display),
     ))))
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn display_frame(res: ResourceArc<DisplayResource>, frame: Binary) -> NifResult<()> {
     let mut guard = res.0.lock().map_err(|_| nif_error("lock poisoned"))?;
-    guard.display_frame(frame.as_slice()).map_err(nif_error)
+    if let Some(display) = guard.as_mut() {
+        display.display_frame(frame.as_slice()).map_err(nif_error)
+    } else {
+        Err(nif_error("display closed"))
+    }
+}
+
+#[rustler::nif]
+fn close_display(res: ResourceArc<DisplayResource>) -> NifResult<()> {
+    let mut guard = res.0.lock().map_err(|_| nif_error("lock poisoned"))?;
+    let _ = guard.take();
+    Ok(())
 }
 
 #[allow(non_local_definitions)]
