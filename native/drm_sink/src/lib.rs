@@ -168,9 +168,10 @@ fn copy_nv12_frame(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize)
 
 /// Helper managing vblank-synced presentation of NV12 frames.
 struct FrameDisplay {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<()>,
     handle: Option<thread::JoinHandle<()>>,
     frame_size: usize,
+    buf: Arc<std::sync::Mutex<Vec<u8>>>,
     db: Arc<std::sync::Mutex<Option<dumbbuf::DumbBuffer>>>,
 }
 
@@ -185,9 +186,11 @@ impl FrameDisplay {
     ) -> Result<Self> {
         let pitch = db.pitch() as usize;
         let frame_size = (w as usize * h as usize * 3) / 2;
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let (tx, rx) = mpsc::channel::<()>();
+        let buf = Arc::new(std::sync::Mutex::new(vec![0u8; frame_size]));
         let db_arc = Arc::new(std::sync::Mutex::new(Some(db)));
         let db_thread = Arc::clone(&db_arc);
+        let buf_thread = Arc::clone(&buf);
         let card_thread = Arc::clone(&card);
         let handle = thread::spawn(move || {
             let mut db = match db_thread.lock().ok().and_then(|mut g| g.take()) {
@@ -207,11 +210,11 @@ impl FrameDisplay {
                     {
                         break;
                     }
-                    let mut latest = None;
+                    let mut has_frame = false;
                     let mut disconnected = false;
                     loop {
                         match rx.try_recv() {
-                            Ok(f) => latest = Some(f),
+                            Ok(()) => has_frame = true,
                             Err(mpsc::TryRecvError::Empty) => break,
                             Err(mpsc::TryRecvError::Disconnected) => {
                                 disconnected = true;
@@ -219,8 +222,10 @@ impl FrameDisplay {
                             }
                         }
                     }
-                    if let Some(frame) = latest {
-                        copy_nv12_frame(&frame, mapping.as_mut(), pitch, w as usize, h as usize);
+                    if has_frame {
+                        if let Ok(buf) = buf_thread.lock() {
+                            copy_nv12_frame(&buf, mapping.as_mut(), pitch, w as usize, h as usize);
+                        }
                     }
                     if disconnected {
                         break;
@@ -236,6 +241,7 @@ impl FrameDisplay {
             tx,
             handle: Some(handle),
             frame_size,
+            buf,
             db: db_arc,
         })
     }
@@ -245,9 +251,9 @@ impl FrameDisplay {
         if frame.len() != self.frame_size {
             return Err(err("invalid frame size"));
         }
-        self.tx
-            .send(frame.to_vec())
-            .map_err(|_| err("display thread closed"))
+        let mut buf = self.buf.lock().map_err(|_| err("buffer lock poisoned"))?;
+        buf.copy_from_slice(frame);
+        self.tx.send(()).map_err(|_| err("display thread closed"))
     }
 
     /// Stop the worker thread and return the underlying dumb buffer.
