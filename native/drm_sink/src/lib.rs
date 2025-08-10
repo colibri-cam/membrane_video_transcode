@@ -1,11 +1,11 @@
-use drm::buffer::Buffer; // trait for .pitch()
-use drm::control as dc;
-use drm::control::atomic::AtomicModeReq;
-use drm::control::dumbbuffer as dumbbuf;
-use drm::control::FbCmd2Flags;
-use drm::control::{connector, crtc, encoder, plane, property, AtomicCommitFlags, Device as _};
 use drm::ClientCapability; // caps to enable atomic / universal planes
 use drm::Device as _; // for set_client_capability()
+use drm::buffer::Buffer; // trait for .pitch()
+use drm::control as dc;
+use drm::control::FbCmd2Flags;
+use drm::control::atomic::AtomicModeReq;
+use drm::control::dumbbuffer as dumbbuf;
+use drm::control::{AtomicCommitFlags, Device as _, connector, crtc, encoder, plane, property};
 use drm::{VblankWaitFlags, VblankWaitTarget};
 use rustler::{Binary, NifResult, ResourceArc};
 use std::ffi::{CStr, CString};
