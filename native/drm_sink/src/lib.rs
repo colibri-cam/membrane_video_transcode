@@ -682,6 +682,7 @@ fn nif_error<E: std::fmt::Display>(e: E) -> rustler::Error {
 #[rustler::nif]
 fn init_display<'a>(
     env: rustler::Env<'a>,
+    card_path: String,
     pixel_format: rustler::Atom,
 ) -> NifResult<ResourceArc<DisplayResource>> {
     let pf_str = pixel_format
@@ -689,7 +690,7 @@ fn init_display<'a>(
         .atom_to_string()
         .map_err(|e| nif_error(format!("{e:?}")))?;
     let pf = PixelFormat::from_str(&pf_str).ok_or_else(|| nif_error("unknown pixel format"))?;
-    let (display, _w, _h) = Display::new("/dev/dri/card0", pf).map_err(nif_error)?;
+    let (display, _w, _h) = Display::new(&card_path, pf).map_err(nif_error)?;
     Ok(ResourceArc::new(DisplayResource(std::sync::Mutex::new(
         Some(display),
     ))))

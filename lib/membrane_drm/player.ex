@@ -4,6 +4,11 @@ defmodule Membrane.DRM.Player do
 
   The sink supports a range of pixel formats and uses a native NIF implemented
   in `DrmSink` to present frames on screen.
+
+  ## Options
+
+    * `:pixel_format` - raw video format to expect (defaults to `:I420`)
+    * `:card` - path to the DRM card device (defaults to `"/dev/dri/card0"`)
   """
 
   use Membrane.Sink
@@ -38,14 +43,21 @@ defmodule Membrane.DRM.Player do
   @impl true
   def handle_init(opts, _ctx) do
     pixel_format = opts[:pixel_format] || :I420
+    card = opts[:card] || "/dev/dri/card0"
 
     {[latency: @latency],
-     %{display: nil, last_pts: nil, last_payload: nil, pixel_format: pixel_format}}
+     %{
+       display: nil,
+       last_pts: nil,
+       last_payload: nil,
+       pixel_format: pixel_format,
+       card: card
+     }}
   end
 
   @impl true
-  def handle_setup(_ctx, %{pixel_format: pixel_format} = state) do
-    {:ok, display} = DrmSink.init_display(pixel_format)
+  def handle_setup(_ctx, %{pixel_format: pixel_format, card: card} = state) do
+    {:ok, display} = DrmSink.init_display(card, pixel_format)
     {[], %{state | display: display}}
   end
 
