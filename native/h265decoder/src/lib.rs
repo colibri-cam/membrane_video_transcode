@@ -264,6 +264,8 @@ fn flush<'a>(
             Err(_) => return Err(Error::Atom("decode")),
         }
     }
+    inner.decoder.flush();
+    inner.scaler.take();
 
     Ok((atoms::ok(), pts_list, frames))
 }
