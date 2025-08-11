@@ -13,7 +13,20 @@ defmodule Membrane.H265Decoder do
   @typedoc """
   Supported output pixel formats.
   """
-  @type pixel_format :: :NV12 | :yuv420p | :rgb24
+  @type pixel_format ::
+          :I420
+          | :I422
+          | :I444
+          | :RGB
+          | :BGRA
+          | :RGBA
+          | :NV12
+          | :NV21
+          | :YV12
+          | :AYUV
+          | :YUY2
+
+  @formats [:I420, :I422, :I444, :RGB, :BGRA, :RGBA, :NV12, :NV21, :YV12, :AYUV, :YUY2]
 
   def_options(
     output_format: [
@@ -30,8 +43,7 @@ defmodule Membrane.H265Decoder do
 
   def_output_pad(:output,
     flow_control: :auto,
-    accepted_format:
-      %RawVideo{pixel_format: format, aligned: true} when format in [:NV12, :yuv420p, :rgb24]
+    accepted_format: %RawVideo{pixel_format: format, aligned: true} when format in @formats
   )
 
   @impl true

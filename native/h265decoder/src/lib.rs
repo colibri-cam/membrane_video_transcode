@@ -16,6 +16,7 @@ use rustler::{Atom, Binary, Env, Error, NifResult, OwnedBinary, ResourceArc, Ter
 struct DecoderInner {
     decoder: codec::decoder::Video,
     target: format::Pixel,
+    target_atom: Atom,
     scaler: Option<Scaler>,
 }
 
@@ -26,7 +27,7 @@ pub struct Decoder {
 unsafe impl Send for Decoder {}
 unsafe impl Sync for Decoder {}
 
-fn init_decoder(target: format::Pixel) -> Result<Decoder> {
+fn init_decoder(target: format::Pixel, atom: Atom) -> Result<Decoder> {
     ffmpeg::init().context("ffmpeg init failed")?;
     let hevc = codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?;
     let mut decoder = codec::decoder::new();
@@ -50,6 +51,7 @@ fn init_decoder(target: format::Pixel) -> Result<Decoder> {
         inner: Mutex::new(DecoderInner {
             decoder: video,
             target,
+            target_atom: atom,
             scaler: None,
         }),
     })
@@ -58,7 +60,7 @@ fn init_decoder(target: format::Pixel) -> Result<Decoder> {
 #[rustler::nif]
 fn create(format: Atom) -> NifResult<ResourceArc<Decoder>> {
     let pix = pixel_from_atom(format).ok_or(Error::Atom("bad_pixel_format"))?;
-    init_decoder(pix)
+    init_decoder(pix, format)
         .map(ResourceArc::new)
         .map_err(|_| Error::Atom("create_failed"))
 }
@@ -173,38 +175,50 @@ fn get_metadata(state: ResourceArc<Decoder>) -> NifResult<(Atom, u32, u32, Atom)
     let inner = state.inner.lock().map_err(|_| Error::Atom("lock"))?;
     let width = inner.decoder.width();
     let height = inner.decoder.height();
-    let atom = atom_from_pixel(inner.target).ok_or(Error::Atom("pixel_format"))?;
-    Ok((atoms::ok(), width, height, atom))
+    Ok((atoms::ok(), width, height, inner.target_atom))
 }
 
+#[allow(non_snake_case)]
 mod atoms {
     rustler::atoms! {
         ok,
+        I420,
+        I422,
+        I444,
+        RGB,
+        BGRA,
+        RGBA,
         NV12,
-        yuv420p,
-        rgb24
+        NV21,
+        YV12,
+        AYUV,
+        YUY2
     }
 }
 
 fn pixel_from_atom(atom: Atom) -> Option<format::Pixel> {
-    if atom == atoms::NV12() {
-        Some(format::Pixel::NV12)
-    } else if atom == atoms::yuv420p() {
+    if atom == atoms::I420() {
         Some(format::Pixel::YUV420P)
-    } else if atom == atoms::rgb24() {
+    } else if atom == atoms::I422() {
+        Some(format::Pixel::YUV422P)
+    } else if atom == atoms::I444() {
+        Some(format::Pixel::YUV444P)
+    } else if atom == atoms::RGB() {
         Some(format::Pixel::RGB24)
-    } else {
-        None
-    }
-}
-
-fn atom_from_pixel(pix: format::Pixel) -> Option<Atom> {
-    if pix == format::Pixel::NV12 {
-        Some(atoms::NV12())
-    } else if pix == format::Pixel::YUV420P {
-        Some(atoms::yuv420p())
-    } else if pix == format::Pixel::RGB24 {
-        Some(atoms::rgb24())
+    } else if atom == atoms::BGRA() {
+        Some(format::Pixel::BGRA)
+    } else if atom == atoms::RGBA() {
+        Some(format::Pixel::RGBA)
+    } else if atom == atoms::NV12() {
+        Some(format::Pixel::NV12)
+    } else if atom == atoms::NV21() {
+        Some(format::Pixel::NV21)
+    } else if atom == atoms::YV12() {
+        Some(format::Pixel::YUV420P)
+    } else if atom == atoms::AYUV() {
+        Some(format::Pixel::AYUV64LE)
+    } else if atom == atoms::YUY2() {
+        Some(format::Pixel::YUYV422)
     } else {
         None
     }
