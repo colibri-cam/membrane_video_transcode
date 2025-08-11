@@ -70,7 +70,7 @@ fn decode<'a>(
     data: Binary<'a>,
     pts: i64,
     dts: i64,
-) -> NifResult<(Vec<i64>, Vec<Binary<'a>>)> {
+) -> NifResult<(Atom, Vec<i64>, Vec<Binary<'a>>)> {
     let mut packet = Packet::copy(data.as_slice());
     packet.set_pts(Some(pts));
     packet.set_dts(Some(dts));
@@ -165,7 +165,7 @@ fn decode<'a>(
         }
     }
 
-    Ok((pts_list, frames))
+    Ok((atoms::ok(), pts_list, frames))
 }
 
 #[rustler::nif]
@@ -179,6 +179,7 @@ fn get_metadata(state: ResourceArc<Decoder>) -> NifResult<(u32, u32, Atom)> {
 
 mod atoms {
     rustler::atoms! {
+        ok,
         nv12,
         yuv420p,
         rgb24

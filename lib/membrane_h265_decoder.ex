@@ -42,10 +42,12 @@ defmodule Membrane.H265Decoder do
 
   @impl true
   def handle_setup(_ctx, %{output_format: fmt} = state) do
-    decoder = case Native.create(fmt) do
-      {:error, reason} -> raise "Error creating decoder #{inspect reason}" 
-      decoder -> decoder
-    end
+    decoder =
+      case Native.create(fmt) do
+        {:error, reason} -> raise "Error creating decoder #{inspect(reason)}"
+        decoder -> decoder
+      end
+
     {[], %{state | decoder_ref: decoder}}
   end
 
@@ -56,16 +58,19 @@ defmodule Membrane.H265Decoder do
 
     case Native.decode(decoder, buffer.payload, pts, dts) do
       {:ok, pts_list, frames} ->
-        {actions, state} = maybe_send_stream_format(state)
+        if frames == [] do
+          {[], state}
+        else
+          {actions, state} = maybe_send_stream_format(state)
 
-        bufs =
-          Enum.zip(pts_list, frames)
-          |> Enum.map(fn {p, payload} ->
-            %Buffer{pts: p, payload: payload}
-          end)
-          |> then(&[buffer: {:output, &1}])
+          bufs =
+            Enum.zip(pts_list, frames)
+            |> Enum.map(fn {p, payload} ->
+              %Buffer{pts: p, payload: payload}
+            end)
 
-        {actions ++ bufs, state}
+          {actions ++ [buffer: {:output, bufs}], state}
+        end
 
       {:error, reason} ->
         raise "Failed to decode frame: #{inspect(reason)}"
