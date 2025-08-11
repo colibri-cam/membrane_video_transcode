@@ -6,12 +6,112 @@ use drm::control::FbCmd2Flags;
 use drm::control::atomic::AtomicModeReq;
 use drm::control::dumbbuffer as dumbbuf;
 use drm::control::{AtomicCommitFlags, Device as _, connector, crtc, encoder, plane, property};
-use rustler::{Binary, NifResult, ResourceArc};
+use rustler::{Atom, Binary, NifResult, ResourceArc};
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io::Error;
 use std::os::fd::AsFd;
 use std::sync::Arc;
+
+rustler::atoms! {
+    ok,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::upper_case_acronyms)]
+enum PixelFormat {
+    I420,
+    I422,
+    I444,
+    RGB,
+    BGRA,
+    RGBA,
+    NV12,
+    NV21,
+    YV12,
+    AYUV,
+    YUY2,
+}
+
+impl PixelFormat {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "I420" => Some(Self::I420),
+            "I422" => Some(Self::I422),
+            "I444" => Some(Self::I444),
+            "RGB" => Some(Self::RGB),
+            "BGRA" => Some(Self::BGRA),
+            "RGBA" => Some(Self::RGBA),
+            "NV12" => Some(Self::NV12),
+            "NV21" => Some(Self::NV21),
+            "YV12" => Some(Self::YV12),
+            "AYUV" => Some(Self::AYUV),
+            "YUY2" => Some(Self::YUY2),
+            _ => None,
+        }
+    }
+
+    fn fourcc(self) -> drm::buffer::DrmFourcc {
+        use drm::buffer::DrmFourcc as F;
+        match self {
+            Self::I420 => F::Yuv420,
+            Self::I422 => F::Yuv422,
+            Self::I444 => F::Yuv444,
+            Self::RGB => F::Rgb888,
+            Self::BGRA => F::Bgra8888,
+            Self::RGBA => F::Rgba8888,
+            Self::NV12 => F::Nv12,
+            Self::NV21 => F::Nv21,
+            Self::YV12 => F::Yvu420,
+            Self::AYUV => F::Ayuv,
+            Self::YUY2 => F::Yuyv,
+        }
+    }
+
+    fn bpp(self) -> u32 {
+        match self {
+            Self::RGB => 24,
+            Self::BGRA | Self::RGBA | Self::AYUV => 32,
+            Self::YUY2 => 16,
+            _ => 8,
+        }
+    }
+
+    fn buffer_height(self, h: u32) -> u32 {
+        match self {
+            Self::I420 | Self::YV12 => h * 2,
+            Self::NV12 | Self::NV21 => h * 3 / 2,
+            Self::I422 | Self::I444 => h * 3,
+            _ => h,
+        }
+    }
+
+    fn frame_size(self, w: u32, h: u32) -> usize {
+        let w = w as usize;
+        let h = h as usize;
+        match self {
+            Self::I420 | Self::NV12 | Self::NV21 | Self::YV12 => w * h * 3 / 2,
+            Self::I422 | Self::YUY2 => w * h * 2,
+            Self::I444 | Self::RGB => w * h * 3,
+            Self::BGRA | Self::RGBA | Self::AYUV => w * h * 4,
+        }
+    }
+
+    fn num_planes(self) -> usize {
+        match self {
+            Self::I420 | Self::I422 | Self::I444 | Self::YV12 => 3,
+            Self::NV12 | Self::NV21 => 2,
+            _ => 1,
+        }
+    }
+
+    fn fb_format(self) -> Self {
+        match self {
+            Self::I420 => Self::NV12,
+            other => other,
+        }
+    }
+}
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -120,66 +220,207 @@ struct FbBundle {
     fb: dc::framebuffer::Handle,
 }
 
-/// Wrapper implementing `PlanarBuffer` for an NV12 dumb buffer.
-struct Nv12Dumb<'a> {
+/// Wrapper implementing `PlanarBuffer` for a dumb buffer with arbitrary format.
+struct DumbWrapper<'a> {
     db: &'a dumbbuf::DumbBuffer,
     w: u32,
     h: u32,
+    fmt: PixelFormat,
 }
 
-impl<'a> drm::buffer::PlanarBuffer for Nv12Dumb<'a> {
+impl<'a> drm::buffer::PlanarBuffer for DumbWrapper<'a> {
     fn size(&self) -> (u32, u32) {
         (self.w, self.h)
     }
     fn format(&self) -> drm::buffer::DrmFourcc {
-        drm::buffer::DrmFourcc::Nv12
+        self.fmt.fourcc()
     }
     fn modifier(&self) -> Option<drm::buffer::DrmModifier> {
         None
     }
     fn pitches(&self) -> [u32; 4] {
-        [self.db.pitch(), self.db.pitch(), 0, 0]
+        let pitch = self.db.pitch();
+        match self.fmt {
+            PixelFormat::I420 | PixelFormat::I422 | PixelFormat::I444 | PixelFormat::YV12 => {
+                [pitch, pitch, pitch, 0]
+            }
+            PixelFormat::NV12 | PixelFormat::NV21 => [pitch, pitch, 0, 0],
+            _ => [pitch, 0, 0, 0],
+        }
     }
     fn handles(&self) -> [Option<drm::buffer::Handle>; 4] {
-        [Some(self.db.handle()), Some(self.db.handle()), None, None]
+        let handle = self.db.handle();
+        match self.fmt.num_planes() {
+            3 => [Some(handle), Some(handle), Some(handle), None],
+            2 => [Some(handle), Some(handle), None, None],
+            _ => [Some(handle), None, None, None],
+        }
     }
     fn offsets(&self) -> [u32; 4] {
-        [0, self.db.pitch() * self.h, 0, 0]
+        let pitch = self.db.pitch();
+        match self.fmt {
+            PixelFormat::I420 => [0, pitch * self.h, pitch * self.h + pitch * (self.h / 2), 0],
+            PixelFormat::YV12 => [0, pitch * self.h, pitch * self.h + pitch * (self.h / 2), 0],
+            PixelFormat::I422 | PixelFormat::I444 => [0, pitch * self.h, pitch * self.h * 2, 0],
+            PixelFormat::NV12 | PixelFormat::NV21 => [0, pitch * self.h, 0, 0],
+            _ => [0, 0, 0, 0],
+        }
     }
 }
 
-/// Copy a single NV12 frame into a mapped dumb buffer.
-fn copy_nv12_frame(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize) {
-    let mut off = 0;
+fn copy_plane(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize) {
     for y in 0..h {
         let dst_off = y * pitch;
-        dst[dst_off..dst_off + w].copy_from_slice(&src[off..off + w]);
-        off += w;
+        let src_off = y * w;
+        dst[dst_off..dst_off + w].copy_from_slice(&src[src_off..src_off + w]);
     }
+}
+
+fn copy_i420_frame(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize) {
+    let mut off = 0;
+    copy_plane(&src[off..off + w * h], &mut dst[0..], pitch, w, h);
+    off += w * h;
+    let u_base = pitch * h;
+    let u_size = (w / 2) * (h / 2);
+    copy_plane(
+        &src[off..off + u_size],
+        &mut dst[u_base..],
+        pitch,
+        w / 2,
+        h / 2,
+    );
+    off += u_size;
+    let v_base = u_base + pitch * (h / 2);
+    copy_plane(
+        &src[off..off + u_size],
+        &mut dst[v_base..],
+        pitch,
+        w / 2,
+        h / 2,
+    );
+}
+
+fn copy_i422_frame(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize) {
+    let mut off = 0;
+    copy_plane(&src[off..off + w * h], &mut dst[0..], pitch, w, h);
+    off += w * h;
+    let u_base = pitch * h;
+    let c_size = (w / 2) * h;
+    copy_plane(&src[off..off + c_size], &mut dst[u_base..], pitch, w / 2, h);
+    off += c_size;
+    let v_base = u_base + pitch * h;
+    copy_plane(&src[off..off + c_size], &mut dst[v_base..], pitch, w / 2, h);
+}
+
+fn copy_i444_frame(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize) {
+    let mut off = 0;
+    copy_plane(&src[off..off + w * h], &mut dst[0..], pitch, w, h);
+    off += w * h;
+    let u_base = pitch * h;
+    copy_plane(&src[off..off + w * h], &mut dst[u_base..], pitch, w, h);
+    off += w * h;
+    let v_base = u_base + pitch * h;
+    copy_plane(&src[off..off + w * h], &mut dst[v_base..], pitch, w, h);
+}
+
+fn copy_nv12_frame(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize) {
+    let mut off = 0;
+    copy_plane(&src[off..off + w * h], &mut dst[0..], pitch, w, h);
+    off += w * h;
+    let uv_base = pitch * h;
+    let uv_size = w * (h / 2);
+    copy_plane(
+        &src[off..off + uv_size],
+        &mut dst[uv_base..],
+        pitch,
+        w,
+        h / 2,
+    );
+}
+
+fn copy_yv12_frame(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize) {
+    let mut off = 0;
+    copy_plane(&src[off..off + w * h], &mut dst[0..], pitch, w, h);
+    off += w * h;
+    let v_base = pitch * h;
+    let c_size = (w / 2) * (h / 2);
+    copy_plane(
+        &src[off..off + c_size],
+        &mut dst[v_base..],
+        pitch,
+        w / 2,
+        h / 2,
+    );
+    off += c_size;
+    let u_base = v_base + pitch * (h / 2);
+    copy_plane(
+        &src[off..off + c_size],
+        &mut dst[u_base..],
+        pitch,
+        w / 2,
+        h / 2,
+    );
+}
+
+fn copy_i420_to_nv12(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize) {
+    let mut off = 0;
+    copy_plane(&src[off..off + w * h], &mut dst[0..], pitch, w, h);
+    off += w * h;
+    let u_size = (w / 2) * (h / 2);
+    let u_plane = &src[off..off + u_size];
+    off += u_size;
+    let v_plane = &src[off..off + u_size];
     let uv_base = pitch * h;
     for y in 0..(h / 2) {
         let dst_off = uv_base + y * pitch;
-        dst[dst_off..dst_off + w].copy_from_slice(&src[off..off + w]);
-        off += w;
+        for x in 0..(w / 2) {
+            let u = u_plane[y * (w / 2) + x];
+            let v = v_plane[y * (w / 2) + x];
+            let dst_idx = dst_off + 2 * x;
+            dst[dst_idx] = u;
+            dst[dst_idx + 1] = v;
+        }
     }
 }
 
-/// Create an NV12 dumb buffer, initialize it to zero, and register a framebuffer.
-fn create_dumb_and_fb(card: &Card, w: u32, h: u32) -> Result<FbBundle> {
-    // Allocate space for Y and interleaved UV planes.
-    let db_height = h + h / 2;
-    let mut db = card.create_dumb_buffer((w, db_height), drm::buffer::DrmFourcc::Nv12, 8)?;
+fn copy_packed_frame(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize, bpp: usize) {
+    let row = w * bpp;
+    for y in 0..h {
+        let dst_off = y * pitch;
+        let src_off = y * row;
+        dst[dst_off..dst_off + row].copy_from_slice(&src[src_off..src_off + row]);
+    }
+}
+
+fn copy_frame(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize, fmt: PixelFormat) {
+    match fmt {
+        PixelFormat::I420 => copy_i420_frame(src, dst, pitch, w, h),
+        PixelFormat::I422 => copy_i422_frame(src, dst, pitch, w, h),
+        PixelFormat::I444 => copy_i444_frame(src, dst, pitch, w, h),
+        PixelFormat::NV12 | PixelFormat::NV21 => copy_nv12_frame(src, dst, pitch, w, h),
+        PixelFormat::YV12 => copy_yv12_frame(src, dst, pitch, w, h),
+        PixelFormat::RGB => copy_packed_frame(src, dst, pitch, w, h, 3),
+        PixelFormat::BGRA | PixelFormat::RGBA | PixelFormat::AYUV => {
+            copy_packed_frame(src, dst, pitch, w, h, 4)
+        }
+        PixelFormat::YUY2 => copy_packed_frame(src, dst, pitch, w, h, 2),
+    }
+}
+
+/// Create a dumb buffer for the given pixel format, zero it, and register a framebuffer.
+fn create_dumb_and_fb(card: &Card, w: u32, h: u32, fmt: PixelFormat) -> Result<FbBundle> {
+    let db_height = fmt.buffer_height(h);
+    let mut db = card.create_dumb_buffer((w, db_height), fmt.fourcc(), fmt.bpp())?;
 
     let pitch = db.pitch() as usize;
-    let frame_size = (w as usize * h as usize * 3) / 2;
+    let frame_size = fmt.frame_size(w, h);
     {
         let frame = vec![0u8; frame_size];
         let mut mapping = card.map_dumb_buffer(&mut db)?;
-        copy_nv12_frame(&frame, mapping.as_mut(), pitch, w as usize, h as usize);
-        // mapping dropped here
+        copy_frame(&frame, mapping.as_mut(), pitch, w as usize, h as usize, fmt);
     }
 
-    let wrapper = Nv12Dumb { db: &db, w, h };
+    let wrapper = DumbWrapper { db: &db, w, h, fmt };
     let fb = card.add_planar_framebuffer(&wrapper, FbCmd2Flags::empty())?;
     log!("Created framebuffer id={}", u32::from(fb));
 
@@ -314,10 +555,12 @@ struct Display {
     w: u32,
     h: u32,
     cur: usize,
+    fmt: PixelFormat,
+    fb_fmt: PixelFormat,
 }
 
 impl Display {
-    fn new(card_path: &str) -> Result<(Self, u32, u32)> {
+    fn new(card_path: &str, fmt: PixelFormat) -> Result<(Self, u32, u32)> {
         let card = Arc::new(open_card(card_path)?);
         enable_atomic_caps(&card)?;
         let res = get_resources(&card)?;
@@ -327,10 +570,12 @@ impl Display {
         let (w16, h16) = mode.size();
         let (w, h) = (w16 as u32, h16 as u32);
 
+        let fb_fmt = fmt.fb_format();
+
         // Create three framebuffers for triple buffering.
         let mut buffers = Vec::with_capacity(3);
         for _ in 0..3 {
-            buffers.push(create_dumb_and_fb(&card, w, h)?);
+            buffers.push(create_dumb_and_fb(&card, w, h, fb_fmt)?);
         }
 
         let plane_h = find_plane_for_crtc(&card, &res, crtc_h)?;
@@ -362,6 +607,8 @@ impl Display {
                 w,
                 h,
                 cur: 0,
+                fmt,
+                fb_fmt,
             },
             w,
             h,
@@ -369,7 +616,7 @@ impl Display {
     }
 
     fn display_frame(&mut self, frame: &[u8]) -> Result<()> {
-        let frame_size = (self.w as usize * self.h as usize * 3) / 2;
+        let frame_size = self.fmt.frame_size(self.w, self.h);
         if frame.len() != frame_size {
             return Err(err("invalid frame size"));
         }
@@ -378,13 +625,26 @@ impl Display {
         let pitch = buf.db.pitch() as usize;
         {
             let mut mapping = self.card.map_dumb_buffer(&mut buf.db)?;
-            copy_nv12_frame(
-                frame,
-                mapping.as_mut(),
-                pitch,
-                self.w as usize,
-                self.h as usize,
-            );
+            if self.fmt == self.fb_fmt {
+                copy_frame(
+                    frame,
+                    mapping.as_mut(),
+                    pitch,
+                    self.w as usize,
+                    self.h as usize,
+                    self.fmt,
+                );
+            } else if self.fmt == PixelFormat::I420 && self.fb_fmt == PixelFormat::NV12 {
+                copy_i420_to_nv12(
+                    frame,
+                    mapping.as_mut(),
+                    pitch,
+                    self.w as usize,
+                    self.h as usize,
+                );
+            } else {
+                return Err(err("unsupported format conversion"));
+            }
         }
         let mut req = AtomicModeReq::new();
         req.add_property(
@@ -414,7 +674,7 @@ impl Drop for Display {
     }
 }
 
-struct DisplayResource(std::sync::Mutex<Display>);
+struct DisplayResource(std::sync::Mutex<Option<Display>>);
 
 unsafe impl Send for DisplayResource {}
 unsafe impl Sync for DisplayResource {}
@@ -424,18 +684,42 @@ fn nif_error<E: std::fmt::Display>(e: E) -> rustler::Error {
 }
 
 #[rustler::nif]
-fn init_display(card_path: Option<String>) -> NifResult<ResourceArc<DisplayResource>> {
-    let path = card_path.unwrap_or_else(|| "/dev/dri/card0".to_string());
-    let (display, _w, _h) = Display::new(&path).map_err(nif_error)?;
+fn init_display<'a>(
+    env: rustler::Env<'a>,
+    card_path: String,
+    pixel_format: rustler::Atom,
+) -> NifResult<ResourceArc<DisplayResource>> {
+    let pf_str = pixel_format
+        .to_term(env)
+        .atom_to_string()
+        .map_err(|e| nif_error(format!("{e:?}")))?;
+    let pf = PixelFormat::from_str(&pf_str).ok_or_else(|| nif_error("unknown pixel format"))?;
+    let (display, _w, _h) = Display::new(&card_path, pf).map_err(nif_error)?;
     Ok(ResourceArc::new(DisplayResource(std::sync::Mutex::new(
-        display,
+        Some(display),
     ))))
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn display_frame(res: ResourceArc<DisplayResource>, frame: Binary) -> NifResult<()> {
+fn display_frame(res: ResourceArc<DisplayResource>, frame: Binary) -> NifResult<Atom> {
     let mut guard = res.0.lock().map_err(|_| nif_error("lock poisoned"))?;
-    guard.display_frame(frame.as_slice()).map_err(nif_error)
+    if let Some(display) = guard.as_mut() {
+        if let Err(err) = display.display_frame(frame.as_slice()) {
+            let _ = guard.take();
+            Err(nif_error(err))
+        } else {
+            Ok(ok())
+        }
+    } else {
+        Err(nif_error("display closed"))
+    }
+}
+
+#[rustler::nif]
+fn close_display(res: ResourceArc<DisplayResource>) -> NifResult<Atom> {
+    let mut guard = res.0.lock().map_err(|_| nif_error("lock poisoned"))?;
+    let _ = guard.take();
+    Ok(ok())
 }
 
 #[allow(non_local_definitions)]
@@ -443,4 +727,4 @@ fn load(env: rustler::Env, _info: rustler::Term) -> bool {
     rustler::resource!(DisplayResource, env)
 }
 
-rustler::init!("Elixir.DrmSink", load = load);
+rustler::init!("Elixir.DrmSink.Native", load = load);
