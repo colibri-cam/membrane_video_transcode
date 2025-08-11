@@ -637,6 +637,14 @@ struct DisplayInner {
     plane_h: plane::Handle,
     prop_fb: property::Handle,
     prop_crtc: property::Handle,
+    prop_src_x: property::Handle,
+    prop_src_y: property::Handle,
+    prop_src_w: property::Handle,
+    prop_src_h: property::Handle,
+    prop_crtc_x: property::Handle,
+    prop_crtc_y: property::Handle,
+    prop_crtc_w: property::Handle,
+    prop_crtc_h: property::Handle,
     crtc_h: crtc::Handle,
     w: u32,
     h: u32,
@@ -677,6 +685,14 @@ impl Display {
         let name = |s: &str| CString::new(s).unwrap();
         let prop_fb = find_prop(&card, plane_h, &name("FB_ID"))?;
         let prop_crtc = find_prop(&card, plane_h, &name("CRTC_ID"))?;
+        let prop_src_x = find_prop(&card, plane_h, &name("SRC_X"))?;
+        let prop_src_y = find_prop(&card, plane_h, &name("SRC_Y"))?;
+        let prop_src_w = find_prop(&card, plane_h, &name("SRC_W"))?;
+        let prop_src_h = find_prop(&card, plane_h, &name("SRC_H"))?;
+        let prop_crtc_x = find_prop(&card, plane_h, &name("CRTC_X"))?;
+        let prop_crtc_y = find_prop(&card, plane_h, &name("CRTC_Y"))?;
+        let prop_crtc_w = find_prop(&card, plane_h, &name("CRTC_W"))?;
+        let prop_crtc_h = find_prop(&card, plane_h, &name("CRTC_H"))?;
 
         let (tx, rx) = mpsc::channel::<Arc<[u8]>>();
         let frame_size = fmt.frame_size(w, h);
@@ -687,6 +703,14 @@ impl Display {
             plane_h,
             prop_fb,
             prop_crtc,
+            prop_src_x,
+            prop_src_y,
+            prop_src_w,
+            prop_src_h,
+            prop_crtc_x,
+            prop_crtc_y,
+            prop_crtc_w,
+            prop_crtc_h,
             crtc_h,
             w,
             h,
@@ -752,6 +776,46 @@ impl DisplayInner {
                     self.plane_h,
                     self.prop_fb,
                     property::Value::Framebuffer(Some(fb)),
+                );
+                req.add_property(
+                    self.plane_h,
+                    self.prop_src_x,
+                    property::Value::UnsignedRange(0),
+                );
+                req.add_property(
+                    self.plane_h,
+                    self.prop_src_y,
+                    property::Value::UnsignedRange(0),
+                );
+                req.add_property(
+                    self.plane_h,
+                    self.prop_src_w,
+                    property::Value::UnsignedRange((self.w as u64) << 16),
+                );
+                req.add_property(
+                    self.plane_h,
+                    self.prop_src_h,
+                    property::Value::UnsignedRange((self.h as u64) << 16),
+                );
+                req.add_property(
+                    self.plane_h,
+                    self.prop_crtc_x,
+                    property::Value::SignedRange(0),
+                );
+                req.add_property(
+                    self.plane_h,
+                    self.prop_crtc_y,
+                    property::Value::SignedRange(0),
+                );
+                req.add_property(
+                    self.plane_h,
+                    self.prop_crtc_w,
+                    property::Value::UnsignedRange(self.w as u64),
+                );
+                req.add_property(
+                    self.plane_h,
+                    self.prop_crtc_h,
+                    property::Value::UnsignedRange(self.h as u64),
                 );
                 let _ = self.card.atomic_commit(AtomicCommitFlags::empty(), req);
                 self.card.destroy_framebuffer(fb).ok();
