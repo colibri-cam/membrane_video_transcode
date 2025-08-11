@@ -169,25 +169,25 @@ fn decode<'a>(
 }
 
 #[rustler::nif]
-fn get_metadata(state: ResourceArc<Decoder>) -> NifResult<(u32, u32, Atom)> {
+fn get_metadata(state: ResourceArc<Decoder>) -> NifResult<(Atom, u32, u32, Atom)> {
     let inner = state.inner.lock().map_err(|_| Error::Atom("lock"))?;
     let width = inner.decoder.width();
     let height = inner.decoder.height();
     let atom = atom_from_pixel(inner.target).ok_or(Error::Atom("pixel_format"))?;
-    Ok((width, height, atom))
+    Ok((atoms::ok(), width, height, atom))
 }
 
 mod atoms {
     rustler::atoms! {
         ok,
-        nv12,
+        NV12,
         yuv420p,
         rgb24
     }
 }
 
 fn pixel_from_atom(atom: Atom) -> Option<format::Pixel> {
-    if atom == atoms::nv12() {
+    if atom == atoms::NV12() {
         Some(format::Pixel::NV12)
     } else if atom == atoms::yuv420p() {
         Some(format::Pixel::YUV420P)
@@ -200,7 +200,7 @@ fn pixel_from_atom(atom: Atom) -> Option<format::Pixel> {
 
 fn atom_from_pixel(pix: format::Pixel) -> Option<Atom> {
     if pix == format::Pixel::NV12 {
-        Some(atoms::nv12())
+        Some(atoms::NV12())
     } else if pix == format::Pixel::YUV420P {
         Some(atoms::yuv420p())
     } else if pix == format::Pixel::RGB24 {

@@ -13,12 +13,12 @@ defmodule Membrane.H265Decoder do
   @typedoc """
   Supported output pixel formats.
   """
-  @type pixel_format :: :nv12 | :yuv420p | :rgb24
+  @type pixel_format :: :NV12 | :yuv420p | :rgb24
 
   def_options(
     output_format: [
       spec: pixel_format(),
-      default: :nv12,
+      default: :NV12,
       description: "Pixel format to use for decoded frames"
     ]
   )
@@ -31,7 +31,7 @@ defmodule Membrane.H265Decoder do
   def_output_pad(:output,
     flow_control: :auto,
     accepted_format:
-      %RawVideo{pixel_format: format, aligned: true} when format in [:nv12, :yuv420p, :rgb24]
+      %RawVideo{pixel_format: format, aligned: true} when format in [:NV12, :yuv420p, :rgb24]
   )
 
   @impl true
@@ -58,19 +58,15 @@ defmodule Membrane.H265Decoder do
 
     case Native.decode(decoder, buffer.payload, pts, dts) do
       {:ok, pts_list, frames} ->
-        if frames == [] do
-          {[], state}
-        else
-          {actions, state} = maybe_send_stream_format(state)
+        {actions, state} = maybe_send_stream_format(state)
 
-          bufs =
-            Enum.zip(pts_list, frames)
-            |> Enum.map(fn {p, payload} ->
-              %Buffer{pts: p, payload: payload}
-            end)
+        bufs =
+          Enum.zip(pts_list, frames)
+          |> Enum.map(fn {p, payload} ->
+            %Buffer{pts: p, payload: payload}
+          end)
 
-          {actions ++ [buffer: {:output, bufs}], state}
-        end
+        {actions ++ [buffer: {:output, bufs}], state}
 
       {:error, reason} ->
         raise "Failed to decode frame: #{inspect(reason)}"
