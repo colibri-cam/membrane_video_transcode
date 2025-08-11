@@ -727,4 +727,4 @@ fn load(env: rustler::Env, _info: rustler::Term) -> bool {
     rustler::resource!(DisplayResource, env)
 }
 
-rustler::init!("Elixir.DrmSink", load = load);
+rustler::init!("Elixir.DrmSink.Native", load = load);
