@@ -6,12 +6,16 @@ use drm::control::FbCmd2Flags;
 use drm::control::atomic::AtomicModeReq;
 use drm::control::dumbbuffer as dumbbuf;
 use drm::control::{AtomicCommitFlags, Device as _, connector, crtc, encoder, plane, property};
-use rustler::{Binary, NifResult, ResourceArc};
+use rustler::{Atom, Binary, NifResult, ResourceArc};
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io::Error;
 use std::os::fd::AsFd;
 use std::sync::Arc;
+
+rustler::atoms! {
+    ok,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::upper_case_acronyms)]
@@ -697,14 +701,14 @@ fn init_display<'a>(
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn display_frame(res: ResourceArc<DisplayResource>, frame: Binary) -> NifResult<()> {
+fn display_frame(res: ResourceArc<DisplayResource>, frame: Binary) -> NifResult<Atom> {
     let mut guard = res.0.lock().map_err(|_| nif_error("lock poisoned"))?;
     if let Some(display) = guard.as_mut() {
         if let Err(err) = display.display_frame(frame.as_slice()) {
             let _ = guard.take();
             Err(nif_error(err))
         } else {
-            Ok(())
+            Ok(ok())
         }
     } else {
         Err(nif_error("display closed"))
@@ -712,10 +716,10 @@ fn display_frame(res: ResourceArc<DisplayResource>, frame: Binary) -> NifResult<
 }
 
 #[rustler::nif]
-fn close_display(res: ResourceArc<DisplayResource>) -> NifResult<()> {
+fn close_display(res: ResourceArc<DisplayResource>) -> NifResult<Atom> {
     let mut guard = res.0.lock().map_err(|_| nif_error("lock poisoned"))?;
     let _ = guard.take();
-    Ok(())
+    Ok(ok())
 }
 
 #[allow(non_local_definitions)]
