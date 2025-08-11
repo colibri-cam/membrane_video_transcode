@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1"
-ffmpeg-next = { version = "6", features = ["codec", "format", "software-scaling"] }
+ffmpeg-next = { version = "7.1", features = ["codec", "format", "software-scaling"] }
 rustler = "0.36"
 libc = "0.2"
 

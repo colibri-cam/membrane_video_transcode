@@ -112,36 +112,6 @@ impl PixelFormat {
             other => other,
         }
     }
-
-    fn pitches(self, w: u32) -> [u32; 4] {
-        let pitch = match self {
-            Self::RGB => w * 3,
-            Self::BGRA | Self::RGBA | Self::AYUV => w * 4,
-            Self::YUY2 => w * 2,
-            _ => w,
-        };
-        match self {
-            Self::I420 | Self::I422 | Self::I444 | Self::YV12 => [pitch, pitch, pitch, 0],
-            Self::NV12 | Self::NV21 => [pitch, pitch, 0, 0],
-            _ => [pitch, 0, 0, 0],
-        }
-    }
-
-    fn offsets(self, w: u32, h: u32) -> [u32; 4] {
-        let pitch = match self {
-            Self::RGB => w * 3,
-            Self::BGRA | Self::RGBA | Self::AYUV => w * 4,
-            Self::YUY2 => w * 2,
-            _ => w,
-        };
-        match self {
-            Self::I420 => [0, pitch * h, pitch * h + pitch * (h / 2), 0],
-            Self::YV12 => [0, pitch * h, pitch * h + pitch * (h / 2), 0],
-            Self::I422 | Self::I444 => [0, pitch * h, pitch * h * 2, 0],
-            Self::NV12 | Self::NV21 => [0, pitch * h, 0, 0],
-            _ => [0, 0, 0, 0],
-        }
-    }
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -458,36 +428,6 @@ fn create_dumb_and_fb(card: &Card, w: u32, h: u32, fmt: PixelFormat) -> Result<F
     Ok(FbBundle { db, fb })
 }
 
-fn create_fb_from_slice(
-    card: &Card,
-    frame: &[u8],
-    w: u32,
-    h: u32,
-    fmt: PixelFormat,
-) -> Result<dc::framebuffer::Handle> {
-    use drm::control::from_u32;
-    use drm_ffi as ffi;
-
-    let ptr = frame.as_ptr() as u64;
-    let handles = [ptr as u32, (ptr >> 32) as u32, 0, 0];
-    let pitches = fmt.pitches(w);
-    let offsets = fmt.offsets(w, h);
-    let modifiers = [0u64; 4];
-    let info = ffi::mode::add_fb2(
-        card.as_fd(),
-        w,
-        h,
-        fmt.fourcc() as u32,
-        &handles,
-        &pitches,
-        &offsets,
-        &modifiers,
-        0,
-    )?;
-    let fb = from_u32(info.fb_id).ok_or_else(|| err("invalid fb"))?;
-    Ok(fb)
-}
-
 /// Find the first plane compatible with the target CRTC.
 fn find_plane_for_crtc(
     card: &Card,
@@ -623,7 +563,7 @@ fn commit_atomic(card: &Card, req: AtomicModeReq) -> Result<()> {
 
 // ---------- NIF bindings ----------
 
-/// Holds DRM state and triple framebuffers for atomic flips.
+/// Holds DRM state and double framebuffers for atomic flips.
 struct Display {
     tx: Option<mpsc::Sender<Arc<[u8]>>>,
     handle: Option<thread::JoinHandle<()>>,
@@ -643,7 +583,6 @@ struct DisplayInner {
     cur: usize,
     fmt: PixelFormat,
     fb_fmt: PixelFormat,
-    direct: bool,
 }
 
 impl Display {
@@ -659,16 +598,10 @@ impl Display {
 
         let (plane_h, fb_fmt) = find_plane_for_crtc(&card, &res, crtc_h, fmt)?;
 
-        let direct = fmt == fb_fmt;
-        let buffers = if direct {
-            Vec::new()
-        } else {
-            let mut bufs = Vec::with_capacity(3);
-            for _ in 0..3 {
-                bufs.push(create_dumb_and_fb(&card, w, h, fb_fmt)?);
-            }
-            bufs
-        };
+        let mut buffers = Vec::with_capacity(2);
+        for _ in 0..2 {
+            buffers.push(create_dumb_and_fb(&card, w, h, fb_fmt)?);
+        }
         let (mode_blob, blob_id) = create_mode_blob(&card, &mode)?;
         let fb = buffers.first().map(|b| b.fb);
         let req = build_atomic_request(&card, &conn, crtc_h, plane_h, fb, &mode, mode_blob)?;
@@ -693,7 +626,6 @@ impl Display {
             cur: 0,
             fmt,
             fb_fmt,
-            direct,
         };
 
         let handle = thread::spawn(move || inner.run(rx));
@@ -736,70 +668,49 @@ impl DisplayInner {
                     frame = f;
                 }
             }
-            if self.direct {
-                let fb = match create_fb_from_slice(&self.card, &frame, self.w, self.h, self.fb_fmt)
-                {
-                    Ok(fb) => fb,
-                    Err(_) => continue,
-                };
-                let mut req = AtomicModeReq::new();
-                req.add_property(
-                    self.plane_h,
-                    self.prop_crtc,
-                    property::Value::CRTC(Some(self.crtc_h)),
-                );
-                req.add_property(
-                    self.plane_h,
-                    self.prop_fb,
-                    property::Value::Framebuffer(Some(fb)),
-                );
-                let _ = self.card.atomic_commit(AtomicCommitFlags::empty(), req);
-                self.card.destroy_framebuffer(fb).ok();
-            } else {
-                let next = (self.cur + 1) % self.buffers.len();
-                let buf = &mut self.buffers[next];
-                let pitch = buf.db.pitch() as usize;
-                if let Ok(mut mapping) = self.card.map_dumb_buffer(&mut buf.db) {
-                    if self.fmt == self.fb_fmt {
-                        copy_frame(
-                            &frame,
-                            mapping.as_mut(),
-                            pitch,
-                            self.w as usize,
-                            self.h as usize,
-                            self.fmt,
-                        );
-                    } else if self.fmt == PixelFormat::I420 && self.fb_fmt == PixelFormat::NV12 {
-                        copy_i420_to_nv12(
-                            &frame,
-                            mapping.as_mut(),
-                            pitch,
-                            self.w as usize,
-                            self.h as usize,
-                        );
-                    } else {
-                        continue;
-                    }
+            let next = (self.cur + 1) % self.buffers.len();
+            let buf = &mut self.buffers[next];
+            let pitch = buf.db.pitch() as usize;
+            if let Ok(mut mapping) = self.card.map_dumb_buffer(&mut buf.db) {
+                if self.fmt == self.fb_fmt {
+                    copy_frame(
+                        &frame,
+                        mapping.as_mut(),
+                        pitch,
+                        self.w as usize,
+                        self.h as usize,
+                        self.fmt,
+                    );
+                } else if self.fmt == PixelFormat::I420 && self.fb_fmt == PixelFormat::NV12 {
+                    copy_i420_to_nv12(
+                        &frame,
+                        mapping.as_mut(),
+                        pitch,
+                        self.w as usize,
+                        self.h as usize,
+                    );
+                } else {
+                    continue;
                 }
+            }
 
-                let mut req = AtomicModeReq::new();
-                req.add_property(
-                    self.plane_h,
-                    self.prop_crtc,
-                    property::Value::CRTC(Some(self.crtc_h)),
-                );
-                req.add_property(
-                    self.plane_h,
-                    self.prop_fb,
-                    property::Value::Framebuffer(Some(buf.fb)),
-                );
-                if self
-                    .card
-                    .atomic_commit(AtomicCommitFlags::empty(), req)
-                    .is_ok()
-                {
-                    self.cur = next;
-                }
+            let mut req = AtomicModeReq::new();
+            req.add_property(
+                self.plane_h,
+                self.prop_crtc,
+                property::Value::CRTC(Some(self.crtc_h)),
+            );
+            req.add_property(
+                self.plane_h,
+                self.prop_fb,
+                property::Value::Framebuffer(Some(buf.fb)),
+            );
+            if self
+                .card
+                .atomic_commit(AtomicCommitFlags::empty(), req)
+                .is_ok()
+            {
+                self.cur = next;
             }
         }
         // dropping self cleans up resources via Drop
