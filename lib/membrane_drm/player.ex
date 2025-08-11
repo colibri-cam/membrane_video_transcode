@@ -84,8 +84,10 @@ defmodule Membrane.DRM.Player do
     actions =
       case state do
         %{last_pts: nil, last_payload: nil} ->
-          :ok = DrmSink.display_frame(state.display, payload)
-          [demand: :input]
+          case DrmSink.display_frame(state.display, payload) do
+            :ok -> [demand: :input]
+            {:error, reason} -> raise "Failed to display frame: #{inspect(reason)}"
+          end
 
         %{last_pts: last_pts} ->
           [timer_interval: {:demand_timer, pts - last_pts}]
@@ -96,14 +98,25 @@ defmodule Membrane.DRM.Player do
 
   @impl true
   def handle_tick(:demand_timer, _ctx, state) do
-    :ok = DrmSink.display_frame(state.display, state.last_payload)
-    {[timer_interval: {:demand_timer, :no_interval}, demand: :input], state}
+    case DrmSink.display_frame(state.display, state.last_payload) do
+      :ok ->
+        {[timer_interval: {:demand_timer, :no_interval}, demand: :input], state}
+
+      {:error, reason} ->
+        raise "Failed to display frame: #{inspect(reason)}"
+    end
   end
 
   @impl true
   def handle_terminate_request(_ctx, %{display: display} = state) do
     if display do
-      :ok = DrmSink.close_display(display)
+      case DrmSink.close_display(display) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Membrane.Logger.warning("Failed to close display: #{inspect(reason)}")
+      end
     end
 
     {[terminate: :normal], %{state | display: nil}}
