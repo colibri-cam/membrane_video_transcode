@@ -18,8 +18,6 @@ defmodule Membrane.DRM.Player do
   alias Membrane.{Buffer, Time}
   alias Membrane.RawVideo
 
-  @latency 20 |> Time.milliseconds()
-
   @formats [
     :I420,
     :I422,
@@ -45,7 +43,7 @@ defmodule Membrane.DRM.Player do
     pixel_format = opts[:pixel_format] || :I420
     card = opts[:card] || "/dev/dri/card0"
 
-    {[latency: @latency],
+    {[],
      %{
        display: nil,
        last_pts: nil,
@@ -73,6 +71,21 @@ defmodule Membrane.DRM.Player do
   end
 
   @impl true
+  def handle_end_of_stream(:input, _ctx, %{display: display} = state) do
+    if display do
+      case DrmSink.close_display(display) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Membrane.Logger.warning("Failed to close display: #{inspect(reason)}")
+      end
+    end
+
+    {[], %{state | display: nil}}
+  end
+
+  @impl true
   def handle_start_of_stream(:input, _ctx, state) do
     {[demand: :input, start_timer: {:demand_timer, :no_interval}], state}
   end
@@ -97,6 +110,10 @@ defmodule Membrane.DRM.Player do
   end
 
   @impl true
+  def handle_tick(:demand_timer, _ctx, %{display: nil} = state) do
+    {[], state}
+  end
+
   def handle_tick(:demand_timer, _ctx, state) do
     case DrmSink.display_frame(state.display, state.last_payload) do
       :ok ->
