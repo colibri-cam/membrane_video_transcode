@@ -86,7 +86,7 @@ defmodule Membrane.DRM.Player do
       end
     end
 
-    {[], %{state | display: nil}}
+    {[timer_interval: {:demand_timer, :no_interval}], %{state | display: nil}}
   end
 
   @impl true
@@ -115,7 +115,7 @@ defmodule Membrane.DRM.Player do
 
   @impl true
   def handle_tick(:demand_timer, _ctx, %{display: nil} = state) do
-    {[], state}
+    {[timer_interval: {:demand_timer, :no_interval}], state}
   end
 
   def handle_tick(:demand_timer, _ctx, state) do
