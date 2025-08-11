@@ -71,14 +71,8 @@ defmodule Membrane.H265Decoder do
     case Native.decode(decoder, buffer.payload, pts, dts) do
       {:ok, pts_list, frames} ->
         {actions, state} = maybe_send_stream_format(state)
-
-        bufs =
-          Enum.zip(pts_list, frames)
-          |> Enum.map(fn {p, payload} ->
-            %Buffer{pts: p, payload: payload}
-          end)
-
-        {actions ++ [buffer: {:output, bufs}], state}
+        bufs = wrap_frames(pts_list, frames)
+        {actions ++ bufs, state}
 
       {:error, reason} ->
         raise "Failed to decode frame: #{inspect(reason)}"
@@ -91,8 +85,25 @@ defmodule Membrane.H265Decoder do
   end
 
   @impl true
-  def handle_end_of_stream(:input, _ctx, state) do
-    {[end_of_stream: :output], state}
+  def handle_end_of_stream(:input, _ctx, %{decoder_ref: decoder} = state) do
+    with {:ok, pts_list, frames} <- Native.flush(decoder),
+         bufs <- wrap_frames(pts_list, frames) do
+      new_state = %{state | decoder_ref: nil}
+      {bufs ++ [end_of_stream: :output], new_state}
+    else
+      {:error, reason} ->
+        raise "Native decoder failed to flush: #{inspect(reason)}"
+    end
+  end
+
+  defp wrap_frames([], []), do: []
+
+  defp wrap_frames(pts_list, frames) do
+    Enum.zip(pts_list, frames)
+    |> Enum.map(fn {p, payload} ->
+      %Buffer{pts: p, payload: payload}
+    end)
+    |> then(&[buffer: {:output, &1}])
   end
 
   defp maybe_send_stream_format(%{stream_format_sent?: true} = state), do: {[], state}

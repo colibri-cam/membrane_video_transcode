@@ -27,6 +27,15 @@ pub struct Decoder {
 unsafe impl Send for Decoder {}
 unsafe impl Sync for Decoder {}
 
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.decoder.flush();
+            inner.scaler.take();
+        }
+    }
+}
+
 fn init_decoder(target: format::Pixel, atom: Atom) -> Result<Decoder> {
     ffmpeg::init().context("ffmpeg init failed")?;
     let hevc = codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?;
@@ -43,6 +52,7 @@ fn init_decoder(target: format::Pixel, atom: Atom) -> Result<Decoder> {
         ) >= 0
         {
             (*decoder.as_mut_ptr()).hw_device_ctx = sys::av_buffer_ref(hw_device_ctx);
+            sys::av_buffer_unref(&mut hw_device_ctx);
         }
     }
     let opened = decoder.open_as(hevc).context("open codec")?;
@@ -166,6 +176,106 @@ fn decode<'a>(
             Err(_) => return Err(Error::Atom("decode")),
         }
     }
+
+    Ok((atoms::ok(), pts_list, frames))
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn flush<'a>(
+    env: Env<'a>,
+    state: ResourceArc<Decoder>,
+) -> NifResult<(Atom, Vec<i64>, Vec<Binary<'a>>)> {
+    let mut inner = state.inner.lock().map_err(|_| Error::Atom("lock"))?;
+    inner
+        .decoder
+        .send_eof()
+        .map_err(|_| Error::Atom("send_eof"))?;
+
+    let mut frames = Vec::new();
+    let mut pts_list = Vec::new();
+    let mut decoded = Video::empty();
+    let mut mapped = Video::empty();
+    let mut converted = Video::empty();
+
+    loop {
+        match inner.decoder.receive_frame(&mut decoded) {
+            Ok(_) => {
+                let mut src_ref: &Video = &decoded;
+                if decoded.format() == format::Pixel::VAAPI {
+                    let res = unsafe {
+                        sys::av_hwframe_transfer_data(mapped.as_mut_ptr(), decoded.as_ptr(), 0)
+                    };
+                    if res < 0 {
+                        return Err(Error::Atom("map_frame"));
+                    }
+                    src_ref = &mapped;
+                }
+
+                if src_ref.format() != inner.target {
+                    if inner.scaler.is_none() {
+                        let scaler = Scaler::get(
+                            src_ref.format(),
+                            src_ref.width(),
+                            src_ref.height(),
+                            inner.target,
+                            src_ref.width(),
+                            src_ref.height(),
+                            Flags::FAST_BILINEAR,
+                        )
+                        .map_err(|_| Error::Atom("scaler"))?;
+                        inner.scaler = Some(scaler);
+                    }
+                    let scaler = inner.scaler.as_mut().unwrap();
+                    scaler
+                        .run(src_ref, &mut converted)
+                        .map_err(|_| Error::Atom("scale"))?;
+                    src_ref = &converted;
+                }
+
+                let format: sys::AVPixelFormat = inner.target.into();
+                let buf_size = unsafe {
+                    sys::av_image_get_buffer_size(
+                        format,
+                        src_ref.width() as i32,
+                        src_ref.height() as i32,
+                        1,
+                    )
+                };
+                if buf_size < 0 {
+                    return Err(Error::Atom("buffer_size"));
+                }
+                let mut out =
+                    OwnedBinary::new(buf_size as usize).ok_or(Error::Atom("alloc_binary"))?;
+                let copy_res = unsafe {
+                    sys::av_image_copy_to_buffer(
+                        out.as_mut_slice().as_mut_ptr(),
+                        buf_size,
+                        (*src_ref.as_ptr()).data.as_ptr() as *const *const u8,
+                        (*src_ref.as_ptr()).linesize.as_ptr(),
+                        format,
+                        src_ref.width() as i32,
+                        src_ref.height() as i32,
+                        1,
+                    )
+                };
+                if copy_res < 0 {
+                    return Err(Error::Atom("copy"));
+                }
+                pts_list.push(src_ref.timestamp().unwrap_or(0));
+                frames.push(out.release(env));
+                unsafe {
+                    sys::av_frame_unref(decoded.as_mut_ptr());
+                    sys::av_frame_unref(mapped.as_mut_ptr());
+                    sys::av_frame_unref(converted.as_mut_ptr());
+                }
+            }
+            Err(ffmpeg::Error::Eof) => break,
+            Err(ffmpeg::Error::Other { errno }) if errno == EAGAIN => break,
+            Err(_) => return Err(Error::Atom("decode")),
+        }
+    }
+    inner.decoder.flush();
+    inner.scaler.take();
 
     Ok((atoms::ok(), pts_list, frames))
 }
