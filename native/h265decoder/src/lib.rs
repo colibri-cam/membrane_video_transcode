@@ -112,6 +112,7 @@ fn decode<'a>(
                     if res < 0 {
                         return Err(Error::Atom("map_frame"));
                     }
+                    mapped.set_pts(decoded.pts());
                     src_ref = &mapped;
                 }
 
@@ -133,6 +134,7 @@ fn decode<'a>(
                     scaler
                         .run(src_ref, &mut converted)
                         .map_err(|_| Error::Atom("scale"))?;
+                    converted.set_pts(src_ref.pts());
                     src_ref = &converted;
                 }
 
@@ -165,7 +167,7 @@ fn decode<'a>(
                 if copy_res < 0 {
                     return Err(Error::Atom("copy"));
                 }
-                pts_list.push(src_ref.timestamp().unwrap_or(NO_PTS));
+                pts_list.push(src_ref.pts().unwrap_or(NO_PTS));
                 frames.push(out.release(env));
                 unsafe {
                     sys::av_frame_unref(decoded.as_mut_ptr());
@@ -210,6 +212,7 @@ fn flush<'a>(
                     if res < 0 {
                         return Err(Error::Atom("map_frame"));
                     }
+                    mapped.set_pts(decoded.pts());
                     src_ref = &mapped;
                 }
 
@@ -231,6 +234,7 @@ fn flush<'a>(
                     scaler
                         .run(src_ref, &mut converted)
                         .map_err(|_| Error::Atom("scale"))?;
+                    converted.set_pts(src_ref.pts());
                     src_ref = &converted;
                 }
 
@@ -263,7 +267,7 @@ fn flush<'a>(
                 if copy_res < 0 {
                     return Err(Error::Atom("copy"));
                 }
-                pts_list.push(src_ref.timestamp().unwrap_or(NO_PTS));
+                pts_list.push(src_ref.pts().unwrap_or(NO_PTS));
                 frames.push(out.release(env));
                 unsafe {
                     sys::av_frame_unref(decoded.as_mut_ptr());
