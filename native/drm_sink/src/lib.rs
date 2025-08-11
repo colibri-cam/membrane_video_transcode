@@ -112,36 +112,6 @@ impl PixelFormat {
             other => other,
         }
     }
-
-    fn pitches(self, w: u32) -> [u32; 4] {
-        let pitch = match self {
-            Self::RGB => w * 3,
-            Self::BGRA | Self::RGBA | Self::AYUV => w * 4,
-            Self::YUY2 => w * 2,
-            _ => w,
-        };
-        match self {
-            Self::I420 | Self::I422 | Self::I444 | Self::YV12 => [pitch, pitch, pitch, 0],
-            Self::NV12 | Self::NV21 => [pitch, pitch, 0, 0],
-            _ => [pitch, 0, 0, 0],
-        }
-    }
-
-    fn offsets(self, w: u32, h: u32) -> [u32; 4] {
-        let pitch = match self {
-            Self::RGB => w * 3,
-            Self::BGRA | Self::RGBA | Self::AYUV => w * 4,
-            Self::YUY2 => w * 2,
-            _ => w,
-        };
-        match self {
-            Self::I420 => [0, pitch * h, pitch * h + pitch * (h / 2), 0],
-            Self::YV12 => [0, pitch * h, pitch * h + pitch * (h / 2), 0],
-            Self::I422 | Self::I444 => [0, pitch * h, pitch * h * 2, 0],
-            Self::NV12 | Self::NV21 => [0, pitch * h, 0, 0],
-            _ => [0, 0, 0, 0],
-        }
-    }
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -464,28 +434,19 @@ fn create_fb_from_slice(
     w: u32,
     h: u32,
     fmt: PixelFormat,
-) -> Result<dc::framebuffer::Handle> {
-    use drm::control::from_u32;
-    use drm_ffi as ffi;
+) -> Result<FbBundle> {
+    let db_height = fmt.buffer_height(h);
+    let mut db = card.create_dumb_buffer((w, db_height), fmt.fourcc(), fmt.bpp())?;
 
-    let ptr = frame.as_ptr() as u64;
-    let handles = [ptr as u32, (ptr >> 32) as u32, 0, 0];
-    let pitches = fmt.pitches(w);
-    let offsets = fmt.offsets(w, h);
-    let modifiers = [0u64; 4];
-    let info = ffi::mode::add_fb2(
-        card.as_fd(),
-        w,
-        h,
-        fmt.fourcc() as u32,
-        &handles,
-        &pitches,
-        &offsets,
-        &modifiers,
-        0,
-    )?;
-    let fb = from_u32(info.fb_id).ok_or_else(|| err("invalid fb"))?;
-    Ok(fb)
+    let pitch = db.pitch() as usize;
+    {
+        let mut mapping = card.map_dumb_buffer(&mut db)?;
+        copy_frame(frame, mapping.as_mut(), pitch, w as usize, h as usize, fmt);
+    }
+
+    let wrapper = DumbWrapper { db: &db, w, h, fmt };
+    let fb = card.add_planar_framebuffer(&wrapper, FbCmd2Flags::empty())?;
+    Ok(FbBundle { db, fb })
 }
 
 /// Find the first plane compatible with the target CRTC.
@@ -761,11 +722,11 @@ impl DisplayInner {
                 }
             }
             if self.direct {
-                let fb = match create_fb_from_slice(&self.card, &frame, self.w, self.h, self.fb_fmt)
-                {
-                    Ok(fb) => fb,
-                    Err(_) => continue,
-                };
+                let bundle =
+                    match create_fb_from_slice(&self.card, &frame, self.w, self.h, self.fb_fmt) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
                 let mut req = AtomicModeReq::new();
                 req.add_property(
                     self.plane_h,
@@ -775,7 +736,7 @@ impl DisplayInner {
                 req.add_property(
                     self.plane_h,
                     self.prop_fb,
-                    property::Value::Framebuffer(Some(fb)),
+                    property::Value::Framebuffer(Some(bundle.fb)),
                 );
                 req.add_property(
                     self.plane_h,
@@ -818,7 +779,8 @@ impl DisplayInner {
                     property::Value::UnsignedRange(self.h as u64),
                 );
                 let _ = self.card.atomic_commit(AtomicCommitFlags::empty(), req);
-                self.card.destroy_framebuffer(fb).ok();
+                self.card.destroy_framebuffer(bundle.fb).ok();
+                self.card.destroy_dumb_buffer(bundle.db).ok();
             } else {
                 let next = (self.cur + 1) % self.buffers.len();
                 let buf = &mut self.buffers[next];
