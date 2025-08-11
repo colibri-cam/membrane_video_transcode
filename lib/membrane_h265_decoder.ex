@@ -8,6 +8,7 @@ defmodule Membrane.H265Decoder do
   alias __MODULE__.Native
   alias Membrane.Buffer
   alias Membrane.H265
+  alias Membrane.H265Decoder.Common
   alias Membrane.RawVideo
 
   @typedoc """
@@ -64,13 +65,14 @@ defmodule Membrane.H265Decoder do
   end
 
   @impl true
-  def handle_buffer(:input, buffer, _ctx, %{decoder_ref: decoder} = state) do
-    pts = buffer.pts || 0
-    dts = buffer.dts || 0
+  def handle_buffer(:input, buffer, ctx, %{decoder_ref: decoder} = state) do
+    dts = Common.to_h265_time_base_truncated(buffer.dts)
+    pts = Common.to_h265_time_base_truncated(buffer.pts)
 
     case Native.decode(decoder, buffer.payload, pts, dts) do
       {:ok, pts_list, frames} ->
-        {actions, state} = maybe_send_stream_format(state)
+        in_stream_format = ctx.pads.input.stream_format
+        {actions, state} = maybe_send_stream_format(state, in_stream_format)
         bufs = wrap_frames(pts_list, frames)
         {actions ++ bufs, state}
 
@@ -101,22 +103,28 @@ defmodule Membrane.H265Decoder do
   defp wrap_frames(pts_list, frames) do
     Enum.zip(pts_list, frames)
     |> Enum.map(fn {p, payload} ->
-      %Buffer{pts: p, payload: payload}
+      %Buffer{pts: Common.to_membrane_time_base_truncated(p), payload: payload}
     end)
     |> then(&[buffer: {:output, &1}])
   end
 
-  defp maybe_send_stream_format(%{stream_format_sent?: true} = state), do: {[], state}
+  defp maybe_send_stream_format(%{stream_format_sent?: true} = state, _in_sf), do: {[], state}
 
-  defp maybe_send_stream_format(%{decoder_ref: decoder} = state) do
+  defp maybe_send_stream_format(%{decoder_ref: decoder} = state, in_sf) do
     {:ok, width, height, pix_fmt} = Native.get_metadata(decoder)
+
+    framerate =
+      case in_sf do
+        %H265{framerate: in_framerate} -> in_framerate
+        _ -> {0, 1}
+      end
 
     sf =
       %RawVideo{
         pixel_format: pix_fmt,
         width: width,
         height: height,
-        framerate: {0, 1},
+        framerate: framerate,
         aligned: true
       }
 
