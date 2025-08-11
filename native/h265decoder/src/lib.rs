@@ -27,6 +27,15 @@ pub struct Decoder {
 unsafe impl Send for Decoder {}
 unsafe impl Sync for Decoder {}
 
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.decoder.flush();
+            inner.scaler.take();
+        }
+    }
+}
+
 fn init_decoder(target: format::Pixel, atom: Atom) -> Result<Decoder> {
     ffmpeg::init().context("ffmpeg init failed")?;
     let hevc = codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?;
@@ -43,6 +52,7 @@ fn init_decoder(target: format::Pixel, atom: Atom) -> Result<Decoder> {
         ) >= 0
         {
             (*decoder.as_mut_ptr()).hw_device_ctx = sys::av_buffer_ref(hw_device_ctx);
+            sys::av_buffer_unref(&mut hw_device_ctx);
         }
     }
     let opened = decoder.open_as(hevc).context("open codec")?;
