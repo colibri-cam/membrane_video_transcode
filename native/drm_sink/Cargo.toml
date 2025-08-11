@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 drm = "0.14"  # aka "drm-rs"
 rustler = "0.36.2"
+drm-ffi = "0.9"
 
 [features]
 default = []

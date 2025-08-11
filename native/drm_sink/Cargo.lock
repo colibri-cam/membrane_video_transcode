@@ -79,6 +79,7 @@ name = "drm_sink"
 version = "0.1.0"
 dependencies = [
  "drm",
+ "drm-ffi",
  "rustler",
 ]
 
