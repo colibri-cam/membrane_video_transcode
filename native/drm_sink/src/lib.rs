@@ -11,7 +11,8 @@ use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io::Error;
 use std::os::fd::AsFd;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::thread;
 
 rustler::atoms! {
     ok,
@@ -545,6 +546,12 @@ fn commit_atomic(card: &Card, req: AtomicModeReq) -> Result<()> {
 
 /// Holds DRM state and triple framebuffers for atomic flips.
 struct Display {
+    tx: Option<mpsc::Sender<Arc<[u8]>>>,
+    handle: Option<thread::JoinHandle<()>>,
+    frame_size: usize,
+}
+
+struct DisplayInner {
     card: Arc<Card>,
     blob_id: u64,
     buffers: Vec<FbBundle>,
@@ -595,81 +602,128 @@ impl Display {
         let prop_fb = find_prop(&card, plane_h, &name("FB_ID"))?;
         let prop_crtc = find_prop(&card, plane_h, &name("CRTC_ID"))?;
 
+        let (tx, rx) = mpsc::channel::<Arc<[u8]>>();
+        let frame_size = fmt.frame_size(w, h);
+        let inner = DisplayInner {
+            card,
+            blob_id,
+            buffers,
+            plane_h,
+            prop_fb,
+            prop_crtc,
+            crtc_h,
+            w,
+            h,
+            cur: 0,
+            fmt,
+            fb_fmt,
+        };
+
+        let handle = thread::spawn(move || inner.run(rx));
+
         Ok((
             Self {
-                card,
-                blob_id,
-                buffers,
-                plane_h,
-                prop_fb,
-                prop_crtc,
-                crtc_h,
-                w,
-                h,
-                cur: 0,
-                fmt,
-                fb_fmt,
+                tx: Some(tx),
+                handle: Some(handle),
+                frame_size,
             },
             w,
             h,
         ))
     }
 
-    fn display_frame(&mut self, frame: &[u8]) -> Result<()> {
-        let frame_size = self.fmt.frame_size(self.w, self.h);
-        if frame.len() != frame_size {
+    fn display_frame(&self, frame: &[u8]) -> Result<()> {
+        let tx = self.tx.as_ref().ok_or_else(|| err("display closed"))?;
+        if frame.len() != self.frame_size {
             return Err(err("invalid frame size"));
         }
-        let next = (self.cur + 1) % self.buffers.len();
-        let buf = &mut self.buffers[next];
-        let pitch = buf.db.pitch() as usize;
-        {
-            let mut mapping = self.card.map_dumb_buffer(&mut buf.db)?;
-            if self.fmt == self.fb_fmt {
-                copy_frame(
-                    frame,
-                    mapping.as_mut(),
-                    pitch,
-                    self.w as usize,
-                    self.h as usize,
-                    self.fmt,
-                );
-            } else if self.fmt == PixelFormat::I420 && self.fb_fmt == PixelFormat::NV12 {
-                copy_i420_to_nv12(
-                    frame,
-                    mapping.as_mut(),
-                    pitch,
-                    self.w as usize,
-                    self.h as usize,
-                );
-            } else {
-                return Err(err("unsupported format conversion"));
-            }
-        }
-        let mut req = AtomicModeReq::new();
-        req.add_property(
-            self.plane_h,
-            self.prop_crtc,
-            property::Value::CRTC(Some(self.crtc_h)),
-        );
-        req.add_property(
-            self.plane_h,
-            self.prop_fb,
-            property::Value::Framebuffer(Some(buf.fb)),
-        );
-        // Commit asynchronously so the caller isn't blocked waiting for vblank.
-        self.card.atomic_commit(AtomicCommitFlags::NONBLOCK, req)?;
-        self.cur = next;
-        Ok(())
+        // Transfer ownership of the frame to the worker thread without
+        // additional copies. `Arc::from` allocates once and the channel moves
+        // the pointer by value.
+        let data = Arc::<[u8]>::from(frame);
+        tx.send(data).map_err(|_| err("display closed"))
     }
 }
 
-impl Drop for Display {
+impl DisplayInner {
+    fn run(mut self, rx: mpsc::Receiver<Arc<[u8]>>) {
+        let frame_size = self.fmt.frame_size(self.w, self.h);
+        while let Ok(mut frame) = rx.recv() {
+            if frame.len() != frame_size {
+                continue;
+            }
+            // Drain the queue so the most recent frame is displayed even if
+            // multiple frames were enqueued before the next vblank.
+            while let Ok(f) = rx.try_recv() {
+                if f.len() == frame_size {
+                    frame = f;
+                }
+            }
+            let next = (self.cur + 1) % self.buffers.len();
+            let buf = &mut self.buffers[next];
+            let pitch = buf.db.pitch() as usize;
+            if let Ok(mut mapping) = self.card.map_dumb_buffer(&mut buf.db) {
+                if self.fmt == self.fb_fmt {
+                    copy_frame(
+                        &frame,
+                        mapping.as_mut(),
+                        pitch,
+                        self.w as usize,
+                        self.h as usize,
+                        self.fmt,
+                    );
+                } else if self.fmt == PixelFormat::I420 && self.fb_fmt == PixelFormat::NV12 {
+                    copy_i420_to_nv12(
+                        &frame,
+                        mapping.as_mut(),
+                        pitch,
+                        self.w as usize,
+                        self.h as usize,
+                    );
+                } else {
+                    continue;
+                }
+            }
+
+            let mut req = AtomicModeReq::new();
+            req.add_property(
+                self.plane_h,
+                self.prop_crtc,
+                property::Value::CRTC(Some(self.crtc_h)),
+            );
+            req.add_property(
+                self.plane_h,
+                self.prop_fb,
+                property::Value::Framebuffer(Some(buf.fb)),
+            );
+            // Block until the hardware is ready for the next frame.
+            if self
+                .card
+                .atomic_commit(AtomicCommitFlags::empty(), req)
+                .is_ok()
+            {
+                self.cur = next;
+            }
+        }
+        // dropping self cleans up resources via Drop
+    }
+}
+
+impl Drop for DisplayInner {
     fn drop(&mut self) {
         self.card.destroy_property_blob(self.blob_id).ok();
         for FbBundle { db, fb } in self.buffers.drain(..) {
             self.card.destroy_framebuffer(fb).ok();
             self.card.destroy_dumb_buffer(db).ok();
+        }
+    }
+}
+
+impl Drop for Display {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -703,8 +757,9 @@ fn init_display<'a>(
 #[rustler::nif(schedule = "DirtyCpu")]
 fn display_frame(res: ResourceArc<DisplayResource>, frame: Binary) -> NifResult<Atom> {
     let mut guard = res.0.lock().map_err(|_| nif_error("lock poisoned"))?;
-    if let Some(display) = guard.as_mut() {
-        if let Err(err) = display.display_frame(frame.as_slice()) {
+    if let Some(display) = guard.as_ref() {
+        let res = display.display_frame(frame.as_slice());
+        if let Err(err) = res {
             let _ = guard.take();
             Err(nif_error(err))
         } else {
