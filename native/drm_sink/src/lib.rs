@@ -18,7 +18,7 @@ rustler::atoms! {
     ok,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(clippy::upper_case_acronyms)]
 enum PixelFormat {
     I420,
@@ -110,6 +110,36 @@ impl PixelFormat {
         match self {
             Self::I420 => Self::NV12,
             other => other,
+        }
+    }
+
+    fn pitches(self, w: u32) -> [u32; 4] {
+        let pitch = match self {
+            Self::RGB => w * 3,
+            Self::BGRA | Self::RGBA | Self::AYUV => w * 4,
+            Self::YUY2 => w * 2,
+            _ => w,
+        };
+        match self {
+            Self::I420 | Self::I422 | Self::I444 | Self::YV12 => [pitch, pitch, pitch, 0],
+            Self::NV12 | Self::NV21 => [pitch, pitch, 0, 0],
+            _ => [pitch, 0, 0, 0],
+        }
+    }
+
+    fn offsets(self, w: u32, h: u32) -> [u32; 4] {
+        let pitch = match self {
+            Self::RGB => w * 3,
+            Self::BGRA | Self::RGBA | Self::AYUV => w * 4,
+            Self::YUY2 => w * 2,
+            _ => w,
+        };
+        match self {
+            Self::I420 => [0, pitch * h, pitch * h + pitch * (h / 2), 0],
+            Self::YV12 => [0, pitch * h, pitch * h + pitch * (h / 2), 0],
+            Self::I422 | Self::I444 => [0, pitch * h, pitch * h * 2, 0],
+            Self::NV12 | Self::NV21 => [0, pitch * h, 0, 0],
+            _ => [0, 0, 0, 0],
         }
     }
 }
@@ -428,23 +458,71 @@ fn create_dumb_and_fb(card: &Card, w: u32, h: u32, fmt: PixelFormat) -> Result<F
     Ok(FbBundle { db, fb })
 }
 
+fn create_fb_from_slice(
+    card: &Card,
+    frame: &[u8],
+    w: u32,
+    h: u32,
+    fmt: PixelFormat,
+) -> Result<dc::framebuffer::Handle> {
+    use drm::control::from_u32;
+    use drm_ffi as ffi;
+
+    let ptr = frame.as_ptr() as u64;
+    let handles = [ptr as u32, (ptr >> 32) as u32, 0, 0];
+    let pitches = fmt.pitches(w);
+    let offsets = fmt.offsets(w, h);
+    let modifiers = [0u64; 4];
+    let info = ffi::mode::add_fb2(
+        card.as_fd(),
+        w,
+        h,
+        fmt.fourcc() as u32,
+        &handles,
+        &pitches,
+        &offsets,
+        &modifiers,
+        0,
+    )?;
+    let fb = from_u32(info.fb_id).ok_or_else(|| err("invalid fb"))?;
+    Ok(fb)
+}
+
 /// Find the first plane compatible with the target CRTC.
 fn find_plane_for_crtc(
     card: &Card,
     res: &dc::ResourceHandles,
     crtc_h: crtc::Handle,
-) -> Result<plane::Handle> {
+    fmt: PixelFormat,
+) -> Result<(plane::Handle, PixelFormat)> {
     let planes = card.plane_handles()?;
+    let mut fallback = None;
     for &ph in planes.as_slice() {
         let pinfo = card.get_plane(ph)?;
         // Use helper to turn filter into a list of allowed CRTCs.
         let allowed = res.filter_crtcs(pinfo.possible_crtcs());
         if allowed.contains(&crtc_h) {
-            log!("Selected plane id={}", u32::from(ph));
-            return Ok(ph);
+            let fourcc = fmt.fourcc() as u32;
+            if pinfo.formats().contains(&fourcc) {
+                log!("Selected plane id={} with format {:?}", u32::from(ph), fmt);
+                return Ok((ph, fmt));
+            }
+            if fallback.is_none() {
+                fallback = Some(ph);
+            }
         }
     }
-    Err(err("No compatible plane found"))
+    if let Some(ph) = fallback {
+        let fb_fmt = fmt.fb_format();
+        log!(
+            "Selected plane id={} with fallback format {:?}",
+            u32::from(ph),
+            fb_fmt
+        );
+        Ok((ph, fb_fmt))
+    } else {
+        Err(err("No compatible plane found"))
+    }
 }
 
 /// Create a property blob encapsulating the chosen mode.
@@ -476,7 +554,7 @@ fn build_atomic_request(
     conn: &connector::Info,
     crtc_h: crtc::Handle,
     plane_h: plane::Handle,
-    fb_h: dc::framebuffer::Handle,
+    fb_h: Option<dc::framebuffer::Handle>,
     mode: &dc::Mode,
     mode_blob: property::Value<'static>,
 ) -> Result<AtomicModeReq> {
@@ -497,39 +575,40 @@ fn build_atomic_request(
     req.add_property(crtc_h, crtc_mode, mode_blob);
     req.add_property(crtc_h, crtc_active, property::Value::Boolean(true));
 
-    // Plane: hook it up to CRTC+FB and set src/crtc rectangles
-    let p_crtc = find_prop(card, plane_h, &name("CRTC_ID"))?;
-    let p_fb = find_prop(card, plane_h, &name("FB_ID"))?;
-    let p_src_x = find_prop(card, plane_h, &name("SRC_X"))?;
-    let p_src_y = find_prop(card, plane_h, &name("SRC_Y"))?;
-    let p_src_w = find_prop(card, plane_h, &name("SRC_W"))?;
-    let p_src_h = find_prop(card, plane_h, &name("SRC_H"))?;
-    let p_crtc_x = find_prop(card, plane_h, &name("CRTC_X"))?;
-    let p_crtc_y = find_prop(card, plane_h, &name("CRTC_Y"))?;
-    let p_crtc_w = find_prop(card, plane_h, &name("CRTC_W"))?;
-    let p_crtc_h = find_prop(card, plane_h, &name("CRTC_H"))?;
+    if let Some(fb_h) = fb_h {
+        let p_crtc = find_prop(card, plane_h, &name("CRTC_ID"))?;
+        let p_fb = find_prop(card, plane_h, &name("FB_ID"))?;
+        let p_src_x = find_prop(card, plane_h, &name("SRC_X"))?;
+        let p_src_y = find_prop(card, plane_h, &name("SRC_Y"))?;
+        let p_src_w = find_prop(card, plane_h, &name("SRC_W"))?;
+        let p_src_h = find_prop(card, plane_h, &name("SRC_H"))?;
+        let p_crtc_x = find_prop(card, plane_h, &name("CRTC_X"))?;
+        let p_crtc_y = find_prop(card, plane_h, &name("CRTC_Y"))?;
+        let p_crtc_w = find_prop(card, plane_h, &name("CRTC_W"))?;
+        let p_crtc_h = find_prop(card, plane_h, &name("CRTC_H"))?;
 
-    req.add_property(plane_h, p_crtc, property::Value::CRTC(Some(crtc_h)));
-    req.add_property(plane_h, p_fb, property::Value::Framebuffer(Some(fb_h)));
+        req.add_property(plane_h, p_crtc, property::Value::CRTC(Some(crtc_h)));
+        req.add_property(plane_h, p_fb, property::Value::Framebuffer(Some(fb_h)));
 
-    let (w16, h16) = mode.size();
-    let (w, h) = (w16 as u32, h16 as u32);
-    req.add_property(plane_h, p_src_x, property::Value::UnsignedRange(0));
-    req.add_property(plane_h, p_src_y, property::Value::UnsignedRange(0));
-    req.add_property(
-        plane_h,
-        p_src_w,
-        property::Value::UnsignedRange((w as u64) << 16),
-    );
-    req.add_property(
-        plane_h,
-        p_src_h,
-        property::Value::UnsignedRange((h as u64) << 16),
-    );
-    req.add_property(plane_h, p_crtc_x, property::Value::SignedRange(0));
-    req.add_property(plane_h, p_crtc_y, property::Value::SignedRange(0));
-    req.add_property(plane_h, p_crtc_w, property::Value::UnsignedRange(w as u64));
-    req.add_property(plane_h, p_crtc_h, property::Value::UnsignedRange(h as u64));
+        let (w16, h16) = mode.size();
+        let (w, h) = (w16 as u32, h16 as u32);
+        req.add_property(plane_h, p_src_x, property::Value::UnsignedRange(0));
+        req.add_property(plane_h, p_src_y, property::Value::UnsignedRange(0));
+        req.add_property(
+            plane_h,
+            p_src_w,
+            property::Value::UnsignedRange((w as u64) << 16),
+        );
+        req.add_property(
+            plane_h,
+            p_src_h,
+            property::Value::UnsignedRange((h as u64) << 16),
+        );
+        req.add_property(plane_h, p_crtc_x, property::Value::SignedRange(0));
+        req.add_property(plane_h, p_crtc_y, property::Value::SignedRange(0));
+        req.add_property(plane_h, p_crtc_w, property::Value::UnsignedRange(w as u64));
+        req.add_property(plane_h, p_crtc_h, property::Value::UnsignedRange(h as u64));
+    }
 
     Ok(req)
 }
@@ -564,6 +643,7 @@ struct DisplayInner {
     cur: usize,
     fmt: PixelFormat,
     fb_fmt: PixelFormat,
+    direct: bool,
 }
 
 impl Display {
@@ -577,25 +657,21 @@ impl Display {
         let (w16, h16) = mode.size();
         let (w, h) = (w16 as u32, h16 as u32);
 
-        let fb_fmt = fmt.fb_format();
+        let (plane_h, fb_fmt) = find_plane_for_crtc(&card, &res, crtc_h, fmt)?;
 
-        // Create three framebuffers for triple buffering.
-        let mut buffers = Vec::with_capacity(3);
-        for _ in 0..3 {
-            buffers.push(create_dumb_and_fb(&card, w, h, fb_fmt)?);
-        }
-
-        let plane_h = find_plane_for_crtc(&card, &res, crtc_h)?;
+        let direct = fmt == fb_fmt;
+        let buffers = if direct {
+            Vec::new()
+        } else {
+            let mut bufs = Vec::with_capacity(3);
+            for _ in 0..3 {
+                bufs.push(create_dumb_and_fb(&card, w, h, fb_fmt)?);
+            }
+            bufs
+        };
         let (mode_blob, blob_id) = create_mode_blob(&card, &mode)?;
-        let req = build_atomic_request(
-            &card,
-            &conn,
-            crtc_h,
-            plane_h,
-            buffers[0].fb,
-            &mode,
-            mode_blob,
-        )?;
+        let fb = buffers.first().map(|b| b.fb);
+        let req = build_atomic_request(&card, &conn, crtc_h, plane_h, fb, &mode, mode_blob)?;
         commit_atomic(&card, req)?;
 
         let name = |s: &str| CString::new(s).unwrap();
@@ -617,6 +693,7 @@ impl Display {
             cur: 0,
             fmt,
             fb_fmt,
+            direct,
         };
 
         let handle = thread::spawn(move || inner.run(rx));
@@ -659,50 +736,70 @@ impl DisplayInner {
                     frame = f;
                 }
             }
-            let next = (self.cur + 1) % self.buffers.len();
-            let buf = &mut self.buffers[next];
-            let pitch = buf.db.pitch() as usize;
-            if let Ok(mut mapping) = self.card.map_dumb_buffer(&mut buf.db) {
-                if self.fmt == self.fb_fmt {
-                    copy_frame(
-                        &frame,
-                        mapping.as_mut(),
-                        pitch,
-                        self.w as usize,
-                        self.h as usize,
-                        self.fmt,
-                    );
-                } else if self.fmt == PixelFormat::I420 && self.fb_fmt == PixelFormat::NV12 {
-                    copy_i420_to_nv12(
-                        &frame,
-                        mapping.as_mut(),
-                        pitch,
-                        self.w as usize,
-                        self.h as usize,
-                    );
-                } else {
-                    continue;
+            if self.direct {
+                let fb = match create_fb_from_slice(&self.card, &frame, self.w, self.h, self.fb_fmt)
+                {
+                    Ok(fb) => fb,
+                    Err(_) => continue,
+                };
+                let mut req = AtomicModeReq::new();
+                req.add_property(
+                    self.plane_h,
+                    self.prop_crtc,
+                    property::Value::CRTC(Some(self.crtc_h)),
+                );
+                req.add_property(
+                    self.plane_h,
+                    self.prop_fb,
+                    property::Value::Framebuffer(Some(fb)),
+                );
+                let _ = self.card.atomic_commit(AtomicCommitFlags::empty(), req);
+                self.card.destroy_framebuffer(fb).ok();
+            } else {
+                let next = (self.cur + 1) % self.buffers.len();
+                let buf = &mut self.buffers[next];
+                let pitch = buf.db.pitch() as usize;
+                if let Ok(mut mapping) = self.card.map_dumb_buffer(&mut buf.db) {
+                    if self.fmt == self.fb_fmt {
+                        copy_frame(
+                            &frame,
+                            mapping.as_mut(),
+                            pitch,
+                            self.w as usize,
+                            self.h as usize,
+                            self.fmt,
+                        );
+                    } else if self.fmt == PixelFormat::I420 && self.fb_fmt == PixelFormat::NV12 {
+                        copy_i420_to_nv12(
+                            &frame,
+                            mapping.as_mut(),
+                            pitch,
+                            self.w as usize,
+                            self.h as usize,
+                        );
+                    } else {
+                        continue;
+                    }
                 }
-            }
 
-            let mut req = AtomicModeReq::new();
-            req.add_property(
-                self.plane_h,
-                self.prop_crtc,
-                property::Value::CRTC(Some(self.crtc_h)),
-            );
-            req.add_property(
-                self.plane_h,
-                self.prop_fb,
-                property::Value::Framebuffer(Some(buf.fb)),
-            );
-            // Block until the hardware is ready for the next frame.
-            if self
-                .card
-                .atomic_commit(AtomicCommitFlags::empty(), req)
-                .is_ok()
-            {
-                self.cur = next;
+                let mut req = AtomicModeReq::new();
+                req.add_property(
+                    self.plane_h,
+                    self.prop_crtc,
+                    property::Value::CRTC(Some(self.crtc_h)),
+                );
+                req.add_property(
+                    self.plane_h,
+                    self.prop_fb,
+                    property::Value::Framebuffer(Some(buf.fb)),
+                );
+                if self
+                    .card
+                    .atomic_commit(AtomicCommitFlags::empty(), req)
+                    .is_ok()
+                {
+                    self.cur = next;
+                }
             }
         }
         // dropping self cleans up resources via Drop
