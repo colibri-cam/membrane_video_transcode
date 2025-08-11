@@ -700,7 +700,8 @@ fn init_display<'a>(
 fn display_frame(res: ResourceArc<DisplayResource>, frame: Binary) -> NifResult<()> {
     let mut guard = res.0.lock().map_err(|_| nif_error("lock poisoned"))?;
     if let Some(display) = guard.as_mut() {
-        display.display_frame(frame.as_slice()).map_err(nif_error)
+        display.display_frame(frame.as_slice()).map_err(nif_error)?;
+        Ok(())
     } else {
         Err(nif_error("display closed"))
     }
