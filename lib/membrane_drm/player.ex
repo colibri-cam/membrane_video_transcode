@@ -74,25 +74,12 @@ defmodule Membrane.DRM.Player do
     end
   end
 
-  @impl true
-  def handle_end_of_stream(:input, _ctx, %{display: display} = state) do
-    if display do
-      case DrmSink.close_display(display) do
-        :ok ->
-          :ok
-
-        {:error, reason} ->
-          Membrane.Logger.warning("Failed to close display: #{inspect(reason)}")
-      end
-    end
-
-    {[timer_interval: {:demand_timer, :no_interval}], %{state | display: nil}}
-  end
 
   @impl true
   def handle_start_of_stream(:input, _ctx, state) do
     {[demand: :input, start_timer: {:demand_timer, :no_interval}], state}
   end
+
 
   @impl true
   def handle_buffer(:input, %Buffer{payload: payload, pts: pts}, _ctx, state) do
@@ -114,8 +101,23 @@ defmodule Membrane.DRM.Player do
   end
 
   @impl true
+  def handle_end_of_stream(:input, _ctx, %{display: display} = state) do
+    if display do
+      case DrmSink.close_display(display) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Membrane.Logger.warning("Failed to close display: #{inspect(reason)}")
+      end
+    end
+
+    {[stop_timer: :demand_timer], %{state | display: nil}}
+  end
+
+  @impl true
   def handle_tick(:demand_timer, _ctx, %{display: nil} = state) do
-    {[timer_interval: {:demand_timer, :no_interval}], state}
+    {[], state}
   end
 
   def handle_tick(:demand_timer, _ctx, state) do
