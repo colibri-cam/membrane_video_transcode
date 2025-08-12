@@ -252,7 +252,12 @@ impl DisplayInner {
 
     fn display(&mut self, desc: PrimeDesc) -> std::io::Result<()> {
         let borrowed = unsafe { BorrowedFd::borrow_raw(desc.fd) };
-        let handle = self.card.prime_fd_to_buffer(borrowed)?;
+        let handle = self.card.prime_fd_to_buffer(borrowed).map_err(|e| {
+            unsafe {
+                libc::close(desc.fd);
+            }
+            std::io::Error::new(e.kind(), format!("prime fd to buffer: {e}"))
+        })?;
         unsafe { libc::close(desc.fd) };
         let mut pitches = [0u32; 4];
         let mut offsets = [0u32; 4];
@@ -267,11 +272,15 @@ impl DisplayInner {
             h: desc.height,
             pitches,
             offsets,
-            handles: [Some(handle), None, None, None],
+            handles: [Some(handle), Some(handle), None, None],
         };
         let fb = self
             .card
-            .add_planar_framebuffer(&buffer, control::FbCmd2Flags::empty())?;
+            .add_planar_framebuffer(&buffer, control::FbCmd2Flags::empty())
+            .map_err(|e| {
+                let _ = self.card.close_buffer(handle);
+                std::io::Error::new(e.kind(), format!("add framebuffer: {e}"))
+            })?;
 
         let mut req = AtomicModeReq::new();
         if !self.setup {
@@ -343,7 +352,11 @@ impl DisplayInner {
         } else {
             control::AtomicCommitFlags::empty()
         };
-        self.card.atomic_commit(flags, req)?;
+        if let Err(e) = self.card.atomic_commit(flags, req) {
+            let _ = self.card.destroy_framebuffer(fb);
+            let _ = self.card.close_buffer(handle);
+            return Err(std::io::Error::new(e.kind(), format!("atomic commit: {e}")));
+        }
 
         if let Some((old_fb, old_handle)) = self.last.take() {
             let _ = self.card.destroy_framebuffer(old_fb);
