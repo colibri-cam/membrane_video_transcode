@@ -45,7 +45,7 @@ defmodule Membrane.DRM.PrimePlayer do
 
   @impl true
   def handle_start_of_stream(:input, _ctx, state) do
-    {[demand: :input, start_timer: {:demand_timer, :no_interval}], state}
+    {[demand: :input], state}
   end
 
   @impl true
@@ -54,7 +54,7 @@ defmodule Membrane.DRM.PrimePlayer do
       case state do
         %{last_pts: nil, last_desc: nil} ->
           case DrmPrime.display_prime(state.display, desc) do
-            :ok -> [demand: :input]
+            :ok -> [demand: :input, start_timer: {:demand_timer, :no_interval}]
             {:error, reason} -> raise "Failed to display frame: #{inspect(reason)}"
           end
 
