@@ -107,7 +107,7 @@ fn init_decoder() -> Result<Decoder> {
     let mut decoder = codec::decoder::new();
     unsafe {
         let mut hw_device_ctx = std::ptr::null_mut();
-        let path = CString::new("/dev/dri/renderD128").context("device path")?;
+        let path = CString::new("/dev/dri/renderD129").context("device path")?;
         if sys::av_hwdevice_ctx_create(
             &mut hw_device_ctx,
             sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
