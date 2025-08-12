@@ -8,6 +8,15 @@ use drm::control::{Device as _, atomic::AtomicModeReq, connector, crtc, plane, p
 use drm::{ClientCapability, Device as _, buffer, control};
 use rustler::{Atom, NifResult, ResourceArc};
 
+#[cfg(feature = "verbose")]
+macro_rules! log {
+    ($($t:tt)*) => { println!($($t)*); };
+}
+#[cfg(not(feature = "verbose"))]
+macro_rules! log {
+    ($($t:tt)*) => {};
+}
+
 rustler::atoms! {
     ok
 }
@@ -84,13 +93,15 @@ struct DisplayInner {
 }
 
 fn open_card(path: &str) -> std::io::Result<Card> {
+    log!("Opening DRM device: {path}");
     let file = OpenOptions::new().read(true).write(true).open(path)?;
     Ok(Card(file))
 }
 
 fn enable_atomic(card: &Card) -> std::io::Result<()> {
-    card.set_client_capability(ClientCapability::Atomic, true)?;
     card.set_client_capability(ClientCapability::UniversalPlanes, true)?;
+    card.set_client_capability(ClientCapability::Atomic, true)?;
+    log!("Enabled client caps: UNIVERSAL_PLANES + ATOMIC");
     Ok(())
 }
 
@@ -106,14 +117,21 @@ fn find_prop(
             return Ok(*handle);
         }
     }
-    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("property {} not found", name.to_string_lossy()),
+    ))
 }
 
 impl DisplayInner {
     fn new(card_path: &str) -> std::io::Result<Self> {
-        let card = open_card(card_path)?;
-        enable_atomic(&card)?;
-        let res = card.resource_handles()?;
+        let card = open_card(card_path)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("open card: {e}")))?;
+        enable_atomic(&card)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("enable atomic: {e}")))?;
+        let res = card
+            .resource_handles()
+            .map_err(|e| std::io::Error::new(e.kind(), format!("get resources: {e}")))?;
         let conn = res
             .connectors()
             .iter()
@@ -125,22 +143,45 @@ impl DisplayInner {
                     None
                 }
             })
-            .ok_or(std::io::Error::from(std::io::ErrorKind::NotFound))?;
-        let enc = conn
-            .encoders()
-            .first()
-            .copied()
-            .ok_or(std::io::Error::from(std::io::ErrorKind::NotFound))?;
-        let enc_info = card.get_encoder(enc)?;
-        let crtc = enc_info
-            .crtc()
-            .ok_or(std::io::Error::from(std::io::ErrorKind::NotFound))?;
-        let mode = conn
-            .modes()
-            .first()
-            .copied()
-            .ok_or(std::io::Error::from(std::io::ErrorKind::NotFound))?;
-        let planes = card.plane_handles()?;
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no connected connector with modes",
+                )
+            })?;
+        log!(
+            "Selected connector: id={}, type={:?}, modes={}",
+            u32::from(conn.handle()),
+            conn.interface(),
+            conn.modes().len()
+        );
+        let enc = conn.encoders().first().copied().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "connector has no encoders")
+        })?;
+        let enc_info = card
+            .get_encoder(enc)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("get encoder: {e}")))?;
+        log!(
+            "Selected encoder: id={}, type={:?}",
+            u32::from(enc_info.handle()),
+            enc_info.kind()
+        );
+        let crtc = enc_info.crtc().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "encoder has no crtc")
+        })?;
+        log!("Selected CRTC: id={}", u32::from(crtc));
+        let mode = conn.modes().first().copied().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "connector has no modes")
+        })?;
+        log!(
+            "Selected mode: {}x{}@{}",
+            mode.size().0,
+            mode.size().1,
+            mode.vrefresh()
+        );
+        let planes = card
+            .plane_handles()
+            .map_err(|e| std::io::Error::new(e.kind(), format!("plane handles: {e}")))?;
         let plane = planes
             .as_slice()
             .iter()
@@ -155,14 +196,20 @@ impl DisplayInner {
                     None
                 }
             })
-            .ok_or(std::io::Error::from(std::io::ErrorKind::NotFound))?;
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no suitable NV12 plane")
+            })?;
+        log!("Selected plane: id={}", u32::from(plane));
 
-        let mode_blob_val = card.create_property_blob(&mode)?;
+        let mode_blob_val = card
+            .create_property_blob(&mode)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("create mode blob: {e}")))?;
         let blob_id = if let property::Value::Blob(id) = mode_blob_val {
             id
         } else {
             0
         };
+        log!("Created mode blob id={}", blob_id);
 
         let name = |s: &str| CString::new(s).unwrap();
         let prop_fb = find_prop(&card, plane, &name("FB_ID"))?;

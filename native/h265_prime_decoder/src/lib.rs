@@ -94,22 +94,28 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
         (*drm.as_mut_ptr()).format = sys::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
         (*drm.as_mut_ptr()).width = frame.width() as i32;
         (*drm.as_mut_ptr()).height = frame.height() as i32;
+        (*drm.as_mut_ptr()).hw_frames_ctx = sys::av_buffer_ref((*frame.as_ptr()).hw_frames_ctx);
     }
-    let res = unsafe { sys::av_hwframe_transfer_data(drm.as_mut_ptr(), frame.as_ptr(), 0) };
+    const AV_HWFRAME_MAP_DRM_PRIME: i32 = 0x0002_0000;
+    let flags = (sys::AV_HWFRAME_MAP_READ as i32) | AV_HWFRAME_MAP_DRM_PRIME;
+    let res = unsafe { sys::av_hwframe_map(drm.as_mut_ptr(), frame.as_ptr(), flags) };
     if res < 0 {
-        return Err(anyhow!("transfer"));
+        return Err(anyhow!("av_hwframe_map failed: {res}"));
     }
     let desc_ptr = unsafe { (*drm.as_ptr()).data[0] as *const sys::AVDRMFrameDescriptor };
     if desc_ptr.is_null() {
-        return Err(anyhow!("no_desc"));
+        unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
+        return Err(anyhow!("no drm descriptor"));
     }
     let desc = unsafe { &*desc_ptr };
     if desc.nb_objects == 0 || desc.nb_layers == 0 {
-        return Err(anyhow!("empty_desc"));
+        unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
+        return Err(anyhow!("empty drm descriptor"));
     }
     let fd = unsafe { libc::dup(desc.objects[0].fd) };
     if fd < 0 {
-        return Err(anyhow!("dup"));
+        unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
+        return Err(anyhow!("dup failed"));
     }
     let layer = &desc.layers[0];
     let mut pitches = Vec::new();
@@ -119,6 +125,7 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
         pitches.push(p.pitch as u32);
         offsets.push(p.offset as u32);
     }
+    unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
     Ok(PrimeDesc {
         fd,
         width: frame.width(),
