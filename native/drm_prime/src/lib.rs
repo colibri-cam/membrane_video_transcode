@@ -341,7 +341,7 @@ impl DisplayInner {
         let flags = if self.last.is_none() {
             control::AtomicCommitFlags::ALLOW_MODESET
         } else {
-            control::AtomicCommitFlags::PAGE_FLIP_EVENT
+            control::AtomicCommitFlags::empty()
         };
         self.card.atomic_commit(flags, req)?;
 

@@ -9,8 +9,9 @@ defmodule Membrane.H265.PrimeDecoder do
 
   alias __MODULE__.Native
   alias Membrane.Buffer
-  alias Membrane.H265
   alias Membrane.DRM.Prime
+  alias Membrane.H265
+  alias Membrane.Time
 
   def_input_pad(:input,
     flow_control: :auto,
@@ -41,8 +42,8 @@ defmodule Membrane.H265.PrimeDecoder do
 
   @impl true
   def handle_buffer(:input, buffer, _ctx, %{decoder_ref: decoder} = state) do
-    pts = buffer.pts || 0
-    dts = buffer.dts || 0
+    pts = to_us(buffer.pts)
+    dts = to_us(buffer.dts)
 
     case Native.decode(decoder, buffer.payload, pts, dts) do
       {:ok, pts_list, descs} ->
@@ -77,10 +78,13 @@ defmodule Membrane.H265.PrimeDecoder do
   defp wrap_descriptors(pts_list, descs) do
     Enum.zip(pts_list, descs)
     |> Enum.map(fn {p, desc} ->
-      %Buffer{pts: p, payload: <<>>, metadata: %{drm_prime: desc}}
+      %Buffer{pts: Time.microseconds(p), payload: <<>>, metadata: %{drm_prime: desc}}
     end)
     |> then(&[buffer: {:output, &1}])
   end
+
+  defp to_us(nil), do: 0
+  defp to_us(time), do: Time.as_microseconds(time, :round)
 
   defp maybe_send_stream_format(%{stream_format_sent?: true} = state), do: {[], state}
 
