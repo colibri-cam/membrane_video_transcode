@@ -1,0 +1,25 @@
+[package]
+name = "drm_prime"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "drm_prime"
+crate-type = ["cdylib"]
+
+[dependencies]
+drm = "0.14"  # aka "drm-rs"
+rustler = "0.36.2"
+drm-ffi = "0.9"
+libc = "0.2"
+
+[features]
+default = []
+verbose = []          # enable to keep println-style logs
+
+[profile.release]
+opt-level = "z"       # optimize for size
+lto = "fat"           # best size (slower build)
+codegen-units = 1
+panic = "abort"
+strip = "symbols"     # strip in Cargo (or run `strip -s` afterwards)

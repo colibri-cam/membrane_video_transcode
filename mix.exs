@@ -21,6 +21,14 @@ defmodule DrmExperiments.MixProject do
           path: "native/drm_sink",
           mode: if(Mix.env() == :prod, do: :release, else: :debug)
         ],
+        drm_prime: [
+          path: "native/drm_prime",
+          mode: if(Mix.env() == :prod, do: :release, else: :debug)
+        ],
+        h265_prime_decoder: [
+          path: "native/h265_prime_decoder",
+          mode: if(Mix.env() == :prod, do: :release, else: :debug)
+        ],
         h265decoder: [
           path: "native/h265decoder",
           mode: if(Mix.env() == :prod, do: :release, else: :debug)
