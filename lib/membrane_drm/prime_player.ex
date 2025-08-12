@@ -10,9 +10,10 @@ defmodule Membrane.DRM.PrimePlayer do
 
   alias Membrane.Buffer
   alias Membrane.DRM.Prime
+  alias Membrane.DRM.PrimeFormat
 
   def_input_pad(:input,
-    accepted_format: %Prime{},
+    accepted_format: %PrimeFormat{},
     flow_control: :manual,
     demand_unit: :buffers
   )
@@ -34,7 +35,7 @@ defmodule Membrane.DRM.PrimePlayer do
   def handle_setup(_ctx, state), do: {[], state}
 
   @impl true
-  def handle_stream_format(:input, %Prime{}, _ctx, state) do
+  def handle_stream_format(:input, %PrimeFormat{}, _ctx, state) do
     if state.display do
       {[], state}
     else

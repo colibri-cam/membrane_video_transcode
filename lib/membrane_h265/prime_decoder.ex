@@ -9,9 +9,9 @@ defmodule Membrane.H265.PrimeDecoder do
 
   alias __MODULE__.Native
   alias Membrane.Buffer
-  alias Membrane.DRM.Prime
+  alias Membrane.DRM.PrimeFormat
   alias Membrane.H265
-  alias Membrane.Time
+  alias Membrane.H265Decoder.Common
 
   def_input_pad(:input,
     flow_control: :auto,
@@ -20,7 +20,7 @@ defmodule Membrane.H265.PrimeDecoder do
 
   def_output_pad(:output,
     flow_control: :auto,
-    accepted_format: %Prime{}
+    accepted_format: %PrimeFormat{}
   )
 
   @impl true
@@ -41,13 +41,14 @@ defmodule Membrane.H265.PrimeDecoder do
   end
 
   @impl true
-  def handle_buffer(:input, buffer, _ctx, %{decoder_ref: decoder} = state) do
-    pts = to_us(buffer.pts)
-    dts = to_us(buffer.dts)
+  def handle_buffer(:input, buffer, ctx, %{decoder_ref: decoder} = state) do
+    dts = Common.to_h265_time_base_truncated(buffer.dts)
+    pts = Common.to_h265_time_base_truncated(buffer.pts)
 
     case Native.decode(decoder, buffer.payload, pts, dts) do
       {:ok, pts_list, descs} ->
-        {actions, state} = maybe_send_stream_format(state)
+        in_stream_format = ctx.pads.input.stream_format
+        {actions, state} = maybe_send_stream_format(state, in_stream_format)
         bufs = wrap_descriptors(pts_list, descs)
         {actions ++ bufs, state}
 
@@ -78,25 +79,26 @@ defmodule Membrane.H265.PrimeDecoder do
   defp wrap_descriptors(pts_list, descs) do
     Enum.zip(pts_list, descs)
     |> Enum.map(fn {p, desc} ->
-      %Buffer{pts: Time.microseconds(p), payload: <<>>, metadata: %{drm_prime: desc}}
+      %Buffer{pts: Common.to_membrane_time_base_truncated(p), payload: <<>>, metadata: %{drm_prime: desc}}
     end)
     |> then(&[buffer: {:output, &1}])
   end
 
-  defp to_us(nil), do: 0
-  defp to_us(time), do: Time.as_microseconds(time, :round)
+  defp maybe_send_stream_format(%{stream_format_sent?: true} = state, _in_sf), do: {[], state}
 
-  defp maybe_send_stream_format(%{stream_format_sent?: true} = state), do: {[], state}
-
-  defp maybe_send_stream_format(%{decoder_ref: decoder} = state) do
+  defp maybe_send_stream_format(%{decoder_ref: decoder} = state, in_sf) do
     {:ok, width, height} = Native.get_metadata(decoder)
 
-    sf = %Prime{
+    framerate =
+      case in_sf do
+        %H265{framerate: in_framerate} -> in_framerate
+        _ -> {0, 1}
+      end
+
+    sf = %PrimeFormat{
       width: width,
       height: height,
-      fd: -1,
-      pitches: [],
-      offsets: []
+      framerate: framerate,
     }
 
     {[stream_format: {:output, sf}], %{state | stream_format_sent?: true}}
