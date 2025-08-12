@@ -9,7 +9,6 @@ defmodule Membrane.DRM.PrimePlayer do
   require Membrane.Logger
 
   alias Membrane.Buffer
-  alias Membrane.DRM.Prime
   alias Membrane.DRM.PrimeFormat
 
   def_input_pad(:input,
@@ -55,8 +54,12 @@ defmodule Membrane.DRM.PrimePlayer do
       case state do
         %{last_pts: nil, last_desc: nil} ->
           case DrmPrime.display_prime(state.display, desc) do
-            :ok -> [demand: :input, start_timer: {:demand_timer, :no_interval}]
-            {:error, reason} -> raise "Failed to display frame: #{inspect(reason)}"
+            :ok ->
+              [demand: :input, start_timer: {:demand_timer, :no_interval}]
+
+            {:error, reason} ->
+              Membrane.Logger.error("Failed to display frame: #{inspect(reason)}")
+              raise "Failed to display frame: #{inspect(reason)}"
           end
 
         %{last_pts: last_pts} ->
@@ -85,8 +88,12 @@ defmodule Membrane.DRM.PrimePlayer do
 
   def handle_tick(:demand_timer, _ctx, state) do
     case DrmPrime.display_prime(state.display, state.last_desc) do
-      :ok -> {[timer_interval: {:demand_timer, :no_interval}, demand: :input], state}
-      {:error, reason} -> raise "Failed to display frame: #{inspect(reason)}"
+      :ok ->
+        {[timer_interval: {:demand_timer, :no_interval}, demand: :input], state}
+
+      {:error, reason} ->
+        Membrane.Logger.error("Failed to display frame: #{inspect(reason)}")
+        raise "Failed to display frame: #{inspect(reason)}"
     end
   end
 

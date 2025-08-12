@@ -1,7 +1,7 @@
 use std::ffi::{CStr, CString};
 use std::fs::OpenOptions;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use drm::control::{Device as _, atomic::AtomicModeReq, connector, crtc, plane, property};
@@ -365,7 +365,7 @@ impl Drop for DisplayInner {
 }
 
 impl DisplayInner {
-    fn run(mut self, rx: mpsc::Receiver<PrimeDesc>) {
+    fn run(mut self, rx: mpsc::Receiver<PrimeDesc>, err: Arc<Mutex<Option<String>>>) {
         while let Ok(mut desc) = rx.recv() {
             while let Ok(d) = rx.try_recv() {
                 unsafe {
@@ -373,7 +373,10 @@ impl DisplayInner {
                 }
                 desc = d;
             }
-            if self.display(desc).is_err() {
+            if let Err(e) = self.display(desc) {
+                let msg = e.to_string();
+                let _ = err.lock().map(|mut g| *g = Some(msg.clone()));
+                log!("Display failed: {msg}");
                 break;
             }
         }
@@ -384,29 +387,40 @@ impl DisplayInner {
 struct Display {
     tx: Option<mpsc::Sender<PrimeDesc>>,
     handle: Option<thread::JoinHandle<()>>,
+    err: Arc<Mutex<Option<String>>>,
 }
 
 impl Display {
     fn new(card_path: &str) -> std::io::Result<Self> {
         let inner = DisplayInner::new(card_path)?;
         let (tx, rx) = mpsc::channel();
-        let handle = thread::spawn(move || inner.run(rx));
+        let err = Arc::new(Mutex::new(None));
+        let err_clone = Arc::clone(&err);
+        let handle = thread::spawn(move || inner.run(rx, err_clone));
         Ok(Self {
             tx: Some(tx),
             handle: Some(handle),
+            err,
         })
     }
 
     fn display(&self, desc: PrimeDesc) -> std::io::Result<()> {
-        let tx = self
-            .tx
-            .as_ref()
-            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+        let tx = self.tx.as_ref().ok_or_else(|| {
+            log!("Display channel missing");
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe)
+        })?;
         tx.send(desc).map_err(|e| {
             unsafe {
                 libc::close(e.0.fd);
             }
-            std::io::Error::from(std::io::ErrorKind::BrokenPipe)
+            let msg = self
+                .err
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take())
+                .unwrap_or_else(|| "broken pipe".to_string());
+            log!("Display thread disconnected: {msg}");
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, msg)
         })
     }
 }
