@@ -12,32 +12,6 @@ defmodule Membrane.H265.PrimeDecoder do
   alias Membrane.H265
   alias Membrane.DRM.Prime
 
-  @typedoc """
-  Supported output pixel formats.
-  """
-  @type pixel_format ::
-          :I420
-          | :I422
-          | :I444
-          | :RGB
-          | :BGRA
-          | :RGBA
-          | :NV12
-          | :NV21
-          | :YV12
-          | :AYUV
-          | :YUY2
-
-  @formats [:I420, :I422, :I444, :RGB, :BGRA, :RGBA, :NV12, :NV21, :YV12, :AYUV, :YUY2]
-
-  def_options(
-    output_format: [
-      spec: pixel_format(),
-      default: :NV12,
-      description: "Pixel format to use for decoded frames"
-    ]
-  )
-
   def_input_pad(:input,
     flow_control: :auto,
     accepted_format: %H265{alignment: :au}
@@ -49,15 +23,15 @@ defmodule Membrane.H265.PrimeDecoder do
   )
 
   @impl true
-  def handle_init(_ctx, opts) do
-    state = %{decoder_ref: nil, stream_format_sent?: false, output_format: opts.output_format}
+  def handle_init(_ctx, _opts) do
+    state = %{decoder_ref: nil, stream_format_sent?: false}
     {[], state}
   end
 
   @impl true
-  def handle_setup(_ctx, %{output_format: fmt} = state) do
+  def handle_setup(_ctx, state) do
     decoder =
-      case Native.create(fmt) do
+      case Native.create() do
         {:error, reason} -> raise "Error creating decoder #{inspect(reason)}"
         decoder -> decoder
       end
@@ -111,10 +85,9 @@ defmodule Membrane.H265.PrimeDecoder do
   defp maybe_send_stream_format(%{stream_format_sent?: true} = state), do: {[], state}
 
   defp maybe_send_stream_format(%{decoder_ref: decoder} = state) do
-    {:ok, width, height, pix_fmt} = Native.get_metadata(decoder)
+    {:ok, width, height} = Native.get_metadata(decoder)
 
     sf = %Prime{
-      pixel_format: pix_fmt,
       width: width,
       height: height,
       fd: -1,

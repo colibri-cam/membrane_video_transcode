@@ -5,9 +5,8 @@ use std::sync::{Mutex, mpsc};
 use std::thread;
 
 use drm::control::{Device as _, atomic::AtomicModeReq, connector, crtc, plane, property};
-use drm::{ClientCapability, Device as _};
-use drm::{buffer, control};
-use rustler::{Atom, Env, NifResult, ResourceArc};
+use drm::{ClientCapability, Device as _, buffer, control};
+use rustler::{Atom, NifResult, ResourceArc};
 
 rustler::atoms! {
     ok
@@ -19,67 +18,13 @@ struct PrimeDesc {
     fd: i32,
     width: u32,
     height: u32,
-    pixel_format: Atom,
     pitches: Vec<u32>,
     offsets: Vec<u32>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(clippy::upper_case_acronyms)]
-enum PixelFormat {
-    I420,
-    I422,
-    I444,
-    RGB,
-    BGRA,
-    RGBA,
-    NV12,
-    NV21,
-    YV12,
-    AYUV,
-    YUY2,
-}
-
-impl PixelFormat {
-    fn from_str(s: &str) -> Option<Self> {
-        match s.to_uppercase().as_str() {
-            "I420" => Some(Self::I420),
-            "I422" => Some(Self::I422),
-            "I444" => Some(Self::I444),
-            "RGB" => Some(Self::RGB),
-            "BGRA" => Some(Self::BGRA),
-            "RGBA" => Some(Self::RGBA),
-            "NV12" => Some(Self::NV12),
-            "NV21" => Some(Self::NV21),
-            "YV12" => Some(Self::YV12),
-            "AYUV" => Some(Self::AYUV),
-            "YUY2" => Some(Self::YUY2),
-            _ => None,
-        }
-    }
-
-    fn fourcc(self) -> buffer::DrmFourcc {
-        use buffer::DrmFourcc as F;
-        match self {
-            Self::I420 => F::Yuv420,
-            Self::I422 => F::Yuv422,
-            Self::I444 => F::Yuv444,
-            Self::RGB => F::Rgb888,
-            Self::BGRA => F::Bgra8888,
-            Self::RGBA => F::Rgba8888,
-            Self::NV12 => F::Nv12,
-            Self::NV21 => F::Nv21,
-            Self::YV12 => F::Yvu420,
-            Self::AYUV => F::Ayuv,
-            Self::YUY2 => F::Yuyv,
-        }
-    }
 }
 
 struct ImportedBuffer {
     w: u32,
     h: u32,
-    fmt: buffer::DrmFourcc,
     pitches: [u32; 4],
     offsets: [u32; 4],
     handles: [Option<buffer::Handle>; 4],
@@ -90,7 +35,7 @@ impl buffer::PlanarBuffer for ImportedBuffer {
         (self.w, self.h)
     }
     fn format(&self) -> buffer::DrmFourcc {
-        self.fmt
+        buffer::DrmFourcc::Nv12
     }
     fn modifier(&self) -> Option<buffer::DrmModifier> {
         None
@@ -117,7 +62,6 @@ impl control::Device for Card {}
 
 struct DisplayInner {
     card: Card,
-    fmt: PixelFormat,
     conn: connector::Handle,
     crtc: crtc::Handle,
     plane: plane::Handle,
@@ -166,7 +110,7 @@ fn find_prop(
 }
 
 impl DisplayInner {
-    fn new(card_path: &str, fmt: PixelFormat) -> std::io::Result<Self> {
+    fn new(card_path: &str) -> std::io::Result<Self> {
         let card = open_card(card_path)?;
         enable_atomic(&card)?;
         let res = card.resource_handles()?;
@@ -203,7 +147,9 @@ impl DisplayInner {
             .find_map(|p| {
                 let info = card.get_plane(*p).ok()?;
                 let allowed = res.filter_crtcs(info.possible_crtcs());
-                if allowed.contains(&crtc) && info.formats().contains(&(fmt.fourcc() as u32)) {
+                if allowed.contains(&crtc)
+                    && info.formats().contains(&(buffer::DrmFourcc::Nv12 as u32))
+                {
                     Some(*p)
                 } else {
                     None
@@ -235,7 +181,6 @@ impl DisplayInner {
 
         Ok(Self {
             card,
-            fmt,
             conn: conn.handle(),
             crtc,
             plane,
@@ -273,7 +218,6 @@ impl DisplayInner {
         let buffer = ImportedBuffer {
             w: desc.width,
             h: desc.height,
-            fmt: self.fmt.fourcc(),
             pitches,
             offsets,
             handles: [Some(handle), None, None, None],
@@ -396,8 +340,8 @@ struct Display {
 }
 
 impl Display {
-    fn new(card_path: &str, fmt: PixelFormat) -> std::io::Result<Self> {
-        let inner = DisplayInner::new(card_path, fmt)?;
+    fn new(card_path: &str) -> std::io::Result<Self> {
+        let inner = DisplayInner::new(card_path)?;
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || inner.run(rx));
         Ok(Self {
@@ -444,17 +388,8 @@ fn load(env: rustler::Env, _info: rustler::Term) -> bool {
 }
 
 #[rustler::nif]
-fn init_display<'a>(
-    env: Env<'a>,
-    card_path: String,
-    pixel_format: Atom,
-) -> NifResult<ResourceArc<DisplayRes>> {
-    let pf_str = pixel_format
-        .to_term(env)
-        .atom_to_string()
-        .map_err(|e| nif_err(format!("{e:?}")))?;
-    let pf = PixelFormat::from_str(&pf_str).ok_or_else(|| nif_err("unknown pixel format"))?;
-    let display = Display::new(&card_path, pf).map_err(nif_err)?;
+fn init_display(card_path: String) -> NifResult<ResourceArc<DisplayRes>> {
+    let display = Display::new(&card_path).map_err(nif_err)?;
     Ok(ResourceArc::new(DisplayRes(Mutex::new(Some(display)))))
 }
 

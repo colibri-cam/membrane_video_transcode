@@ -34,17 +34,12 @@ defmodule Membrane.DRM.PrimePlayer do
   def handle_setup(_ctx, state), do: {[], state}
 
   @impl true
-  def handle_stream_format(:input, %Prime{pixel_format: fmt}, _ctx, state) do
-    cond do
-      state.display && fmt != state.pixel_format ->
-        raise "Stream pixel format changed while playing. This is not supported."
-
-      state.display ->
-        {[], state}
-
-      true ->
-        {:ok, display} = DrmPrime.init_display(state.card, fmt)
-        {[], %{state | display: display, pixel_format: fmt}}
+  def handle_stream_format(:input, %Prime{}, _ctx, state) do
+    if state.display do
+      {[], state}
+    else
+      {:ok, display} = DrmPrime.init_display(state.card)
+      {[], %{state | display: display}}
     end
   end
 

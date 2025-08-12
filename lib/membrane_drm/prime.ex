@@ -7,6 +7,6 @@ defmodule Membrane.DRM.Prime do
   `Membrane.Buffer` metadata under the `:drm_prime` key.
   """
 
-  @enforce_keys [:fd, :width, :height, :pixel_format, :pitches, :offsets]
-  defstruct [:fd, :width, :height, :pixel_format, :pitches, :offsets]
+  @enforce_keys [:fd, :width, :height, :pitches, :offsets]
+  defstruct [:fd, :width, :height, :pitches, :offsets]
 end

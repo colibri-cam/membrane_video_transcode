@@ -6,13 +6,13 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg_next::codec::packet::Packet;
 use ffmpeg_next::sys;
 use ffmpeg_next::{
-    codec, format,
+    codec,
     util::{error::EAGAIN, frame::Video},
 };
 use rustler::{Atom, Binary, Encoder, Env, NifResult, ResourceArc, Term};
 
 rustler::atoms! {
-    nv12
+    ok
 }
 
 #[derive(rustler::NifStruct)]
@@ -21,7 +21,6 @@ struct PrimeDesc {
     fd: i32,
     width: u32,
     height: u32,
-    pixel_format: Atom,
     pitches: Vec<u32>,
     offsets: Vec<u32>,
 }
@@ -83,14 +82,19 @@ fn load(env: rustler::Env, _info: rustler::Term) -> bool {
 }
 
 #[rustler::nif]
-fn create(_format: Atom) -> NifResult<ResourceArc<Decoder>> {
+fn create() -> NifResult<ResourceArc<Decoder>> {
     init_decoder()
         .map(ResourceArc::new)
         .map_err(|_| rustler::Error::Atom("create_failed"))
 }
 
 fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
-    let mut drm = Video::new(format::Pixel::DRM_PRIME, frame.width(), frame.height());
+    let mut drm = Video::empty();
+    unsafe {
+        (*drm.as_mut_ptr()).format = sys::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+        (*drm.as_mut_ptr()).width = frame.width() as i32;
+        (*drm.as_mut_ptr()).height = frame.height() as i32;
+    }
     let res = unsafe { sys::av_hwframe_transfer_data(drm.as_mut_ptr(), frame.as_ptr(), 0) };
     if res < 0 {
         return Err(anyhow!("transfer"));
@@ -119,7 +123,6 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
         fd,
         width: frame.width(),
         height: frame.height(),
-        pixel_format: nv12(),
         pitches,
         offsets,
     })
@@ -158,7 +161,7 @@ fn decode<'a>(
     data: Binary<'a>,
     pts: i64,
     dts: i64,
-) -> NifResult<(Vec<i64>, Vec<Term<'a>>)> {
+) -> NifResult<(Atom, Vec<i64>, Vec<Term<'a>>)> {
     let mut packet = Packet::copy(data.as_slice());
     packet.set_pts(Some(pts));
     packet.set_dts(Some(dts));
@@ -171,11 +174,15 @@ fn decode<'a>(
         .decoder
         .send_packet(&packet)
         .map_err(|_| rustler::Error::Atom("send_packet"))?;
-    decode_frames(env, &mut inner)
+    let (pts_list, frames) = decode_frames(env, &mut inner)?;
+    Ok((ok(), pts_list, frames))
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn flush<'a>(env: Env<'a>, state: ResourceArc<Decoder>) -> NifResult<(Vec<i64>, Vec<Term<'a>>)> {
+fn flush<'a>(
+    env: Env<'a>,
+    state: ResourceArc<Decoder>,
+) -> NifResult<(Atom, Vec<i64>, Vec<Term<'a>>)> {
     let mut inner = state
         .inner
         .lock()
@@ -184,16 +191,17 @@ fn flush<'a>(env: Env<'a>, state: ResourceArc<Decoder>) -> NifResult<(Vec<i64>, 
         .decoder
         .send_eof()
         .map_err(|_| rustler::Error::Atom("send_eof"))?;
-    decode_frames(env, &mut inner)
+    let (pts_list, frames) = decode_frames(env, &mut inner)?;
+    Ok((ok(), pts_list, frames))
 }
 
 #[rustler::nif]
-fn get_metadata(state: ResourceArc<Decoder>) -> NifResult<(u32, u32, Atom)> {
+fn get_metadata(state: ResourceArc<Decoder>) -> NifResult<(Atom, u32, u32)> {
     let inner = state
         .inner
         .lock()
         .map_err(|_| rustler::Error::Atom("lock"))?;
-    Ok((inner.width, inner.height, nv12()))
+    Ok((ok(), inner.width, inner.height))
 }
 
 rustler::init!("Elixir.Membrane.H265.PrimeDecoder.Native", load = load);
