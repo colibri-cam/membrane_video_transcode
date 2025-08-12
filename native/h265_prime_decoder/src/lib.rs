@@ -18,7 +18,7 @@ rustler::atoms! {
 #[derive(rustler::NifStruct)]
 #[module = "Membrane.DRM.Prime"]
 struct PrimeDesc {
-    fd: i32,
+    fds: Vec<i32>,
     width: u32,
     height: u32,
     pitches: Vec<u32>,
@@ -112,22 +112,35 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
         unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
         return Err(anyhow!("empty drm descriptor"));
     }
-    let fd = unsafe { libc::dup(desc.objects[0].fd) };
-    if fd < 0 {
-        unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
-        return Err(anyhow!("dup failed"));
-    }
     let layer = &desc.layers[0];
+    let mut fds = Vec::new();
     let mut pitches = Vec::new();
     let mut offsets = Vec::new();
     for i in 0..layer.nb_planes as usize {
         let p = layer.planes[i];
+        let obj = p.object_index as usize;
+        if obj >= desc.nb_objects as usize {
+            for fd in &fds {
+                unsafe { libc::close(*fd) };
+            }
+            unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
+            return Err(anyhow!("invalid object index"));
+        }
+        let fd = unsafe { libc::dup(desc.objects[obj].fd) };
+        if fd < 0 {
+            for fd2 in &fds {
+                unsafe { libc::close(*fd2) };
+            }
+            unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
+            return Err(anyhow!("dup failed"));
+        }
+        fds.push(fd);
         pitches.push(p.pitch as u32);
         offsets.push(p.offset as u32);
     }
     unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
     Ok(PrimeDesc {
-        fd,
+        fds,
         width: frame.width(),
         height: frame.height(),
         pitches,

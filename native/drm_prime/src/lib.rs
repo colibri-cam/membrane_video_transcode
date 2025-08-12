@@ -24,7 +24,7 @@ rustler::atoms! {
 #[derive(rustler::NifStruct)]
 #[module = "Membrane.DRM.Prime"]
 struct PrimeDesc {
-    fd: i32,
+    fds: Vec<i32>,
     width: u32,
     height: u32,
     pitches: Vec<u32>,
@@ -89,7 +89,7 @@ struct DisplayInner {
     prop_crtc_h: property::Handle,
     mode_blob: u64,
     setup: bool,
-    last: Option<(control::framebuffer::Handle, buffer::Handle)>,
+    last: Option<(control::framebuffer::Handle, Vec<buffer::Handle>)>,
 }
 
 fn open_card(path: &str) -> std::io::Result<Card> {
@@ -251,14 +251,6 @@ impl DisplayInner {
     }
 
     fn display(&mut self, desc: PrimeDesc) -> std::io::Result<()> {
-        let borrowed = unsafe { BorrowedFd::borrow_raw(desc.fd) };
-        let handle = self.card.prime_fd_to_buffer(borrowed).map_err(|e| {
-            unsafe {
-                libc::close(desc.fd);
-            }
-            std::io::Error::new(e.kind(), format!("prime fd to buffer: {e}"))
-        })?;
-        unsafe { libc::close(desc.fd) };
         let mut pitches = [0u32; 4];
         let mut offsets = [0u32; 4];
         for (i, p) in desc.pitches.iter().enumerate().take(4) {
@@ -267,18 +259,41 @@ impl DisplayInner {
         for (i, o) in desc.offsets.iter().enumerate().take(4) {
             offsets[i] = *o;
         }
+        let mut handles = [None; 4];
+        let mut imported = Vec::new();
+        for (i, fd) in desc.fds.iter().copied().enumerate().take(4) {
+            let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+            let handle = self.card.prime_fd_to_buffer(borrowed).map_err(|e| {
+                unsafe { libc::close(fd) };
+                for h in imported.iter() {
+                    let _ = self.card.close_buffer(*h);
+                }
+                for fd2 in desc.fds.iter().skip(i + 1) {
+                    unsafe { libc::close(*fd2) };
+                }
+                std::io::Error::new(e.kind(), format!("prime fd to buffer: {e}"))
+            })?;
+            unsafe { libc::close(fd) };
+            handles[i] = Some(handle);
+            imported.push(handle);
+        }
+        for fd in desc.fds.iter().skip(4) {
+            unsafe { libc::close(*fd) };
+        }
         let buffer = ImportedBuffer {
             w: desc.width,
             h: desc.height,
             pitches,
             offsets,
-            handles: [Some(handle), Some(handle), None, None],
+            handles,
         };
         let fb = self
             .card
             .add_planar_framebuffer(&buffer, control::FbCmd2Flags::empty())
             .map_err(|e| {
-                let _ = self.card.close_buffer(handle);
+                for h in imported.iter() {
+                    let _ = self.card.close_buffer(*h);
+                }
                 std::io::Error::new(e.kind(), format!("add framebuffer: {e}"))
             })?;
 
@@ -354,24 +369,30 @@ impl DisplayInner {
         };
         if let Err(e) = self.card.atomic_commit(flags, req) {
             let _ = self.card.destroy_framebuffer(fb);
-            let _ = self.card.close_buffer(handle);
+            for h in imported.iter() {
+                let _ = self.card.close_buffer(*h);
+            }
             return Err(std::io::Error::new(e.kind(), format!("atomic commit: {e}")));
         }
 
-        if let Some((old_fb, old_handle)) = self.last.take() {
+        if let Some((old_fb, old_handles)) = self.last.take() {
             let _ = self.card.destroy_framebuffer(old_fb);
-            let _ = self.card.close_buffer(old_handle);
+            for h in old_handles {
+                let _ = self.card.close_buffer(h);
+            }
         }
-        self.last = Some((fb, handle));
+        self.last = Some((fb, imported));
         Ok(())
     }
 }
 
 impl Drop for DisplayInner {
     fn drop(&mut self) {
-        if let Some((fb, handle)) = self.last.take() {
+        if let Some((fb, handles)) = self.last.take() {
             let _ = self.card.destroy_framebuffer(fb);
-            let _ = self.card.close_buffer(handle);
+            for h in handles {
+                let _ = self.card.close_buffer(h);
+            }
         }
         let _ = self.card.destroy_property_blob(self.mode_blob);
     }
@@ -381,8 +402,8 @@ impl DisplayInner {
     fn run(mut self, rx: mpsc::Receiver<PrimeDesc>, err: Arc<Mutex<Option<String>>>) {
         while let Ok(mut desc) = rx.recv() {
             while let Ok(d) = rx.try_recv() {
-                unsafe {
-                    libc::close(d.fd);
+                for fd in desc.fds.drain(..) {
+                    unsafe { libc::close(fd) };
                 }
                 desc = d;
             }
@@ -423,8 +444,8 @@ impl Display {
             std::io::Error::from(std::io::ErrorKind::BrokenPipe)
         })?;
         tx.send(desc).map_err(|e| {
-            unsafe {
-                libc::close(e.0.fd);
+            for fd in e.0.fds {
+                unsafe { libc::close(fd) };
             }
             let msg = self
                 .err
