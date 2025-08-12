@@ -167,34 +167,43 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
         unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
         return Err(anyhow!("empty drm descriptor"));
     }
-    let layer = &desc.layers[0];
-    let format = DrmFourcc::try_from(layer.format)
-        .map_err(|_| anyhow!("unknown fourcc {}", layer.format))?;
     let mut planes = Vec::new();
-    for i in 0..layer.nb_planes as usize {
-        let p = layer.planes[i];
-        let obj = p.object_index as usize;
-        if obj >= desc.nb_objects as usize {
-            unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
-            return Err(anyhow!("invalid object index"));
+    for l in 0..desc.nb_layers as usize {
+        let layer = &desc.layers[l];
+        for i in 0..layer.nb_planes as usize {
+            let p = layer.planes[i];
+            let obj = p.object_index as usize;
+            if obj >= desc.nb_objects as usize {
+                unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
+                return Err(anyhow!("invalid object index"));
+            }
+            let fd = unsafe { libc::dup(desc.objects[obj].fd) };
+            if fd < 0 {
+                unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
+                return Err(anyhow!("dup failed"));
+            }
+            let obj_desc = desc.objects[obj];
+            planes.push(PrimePlane {
+                fd: Fd(unsafe { OwnedFd::from_raw_fd(fd) }),
+                pitch: p.pitch as u32,
+                offset: p.offset as u32,
+                modifier: if obj_desc.format_modifier != 0 {
+                    Some(obj_desc.format_modifier)
+                } else {
+                    None
+                },
+            });
         }
-        let fd = unsafe { libc::dup(desc.objects[obj].fd) };
-        if fd < 0 {
-            unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
-            return Err(anyhow!("dup failed"));
-        }
-        let obj_desc = desc.objects[obj];
-        planes.push(PrimePlane {
-            fd: Fd(unsafe { OwnedFd::from_raw_fd(fd) }),
-            pitch: p.pitch as u32,
-            offset: p.offset as u32,
-            modifier: if obj_desc.format_modifier != 0 {
-                Some(obj_desc.format_modifier)
-            } else {
-                None
-            },
-        });
     }
+    let format = if desc.nb_layers == 1 {
+        let layer = &desc.layers[0];
+        DrmFourcc::try_from(layer.format).map_err(|_| anyhow!("unknown fourcc {}", layer.format))?
+    } else if desc.nb_layers == 2 && planes.len() == 2 {
+        DrmFourcc::Nv12
+    } else {
+        unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
+        return Err(anyhow!("unsupported drm descriptor"));
+    };
     unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
     Ok(PrimeDesc {
         width: frame.width(),
