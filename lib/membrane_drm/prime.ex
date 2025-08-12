@@ -20,6 +20,13 @@ defmodule Membrane.DRM.Prime do
   `Membrane.Buffer` metadata under the `:drm_prime` key.
   """
 
-  @enforce_keys [:fds, :width, :height, :pitches, :offsets]
-  defstruct [:fds, :width, :height, :pitches, :offsets]
+  @enforce_keys [:planes, :width, :height, :format]
+  defstruct [:planes, :width, :height, :format]
+end
+
+defmodule Membrane.DRM.PrimePlane do
+  @moduledoc false
+
+  @enforce_keys [:fd, :pitch, :offset]
+  defstruct [:fd, :pitch, :offset, :modifier]
 end

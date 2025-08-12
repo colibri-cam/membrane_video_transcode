@@ -1,12 +1,14 @@
 use std::ffi::{CStr, CString};
 use std::fs::OpenOptions;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use drm::control::{Device as _, atomic::AtomicModeReq, connector, crtc, plane, property};
 use drm::{ClientCapability, Device as _, buffer, control};
-use rustler::{Atom, NifResult, ResourceArc};
+use drm_ffi::mode;
+use drm_fourcc::DrmFourcc;
+use rustler::{Atom, Decoder, Encoder, NifResult, ResourceArc};
 
 #[cfg(feature = "verbose")]
 macro_rules! log {
@@ -21,42 +23,66 @@ rustler::atoms! {
     ok
 }
 
+#[derive(Debug)]
+struct Fd(OwnedFd);
+
+impl AsFd for Fd {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+#[derive(rustler::NifStruct)]
+#[module = "Membrane.DRM.PrimePlane"]
+struct PrimePlane {
+    fd: Fd,
+    pitch: u32,
+    offset: u32,
+    modifier: Option<u64>,
+}
+
 #[derive(rustler::NifStruct)]
 #[module = "Membrane.DRM.Prime"]
 struct PrimeDesc {
-    fds: Vec<i32>,
     width: u32,
     height: u32,
-    pitches: Vec<u32>,
-    offsets: Vec<u32>,
+    format: Fourcc,
+    planes: Vec<PrimePlane>,
 }
 
-struct ImportedBuffer {
-    w: u32,
-    h: u32,
-    pitches: [u32; 4],
-    offsets: [u32; 4],
-    handles: [Option<buffer::Handle>; 4],
+impl Encoder for Fd {
+    fn encode<'a>(&self, env: rustler::Env<'a>) -> rustler::Term<'a> {
+        let dup_fd = unsafe { libc::dup(self.0.as_raw_fd()) };
+        dup_fd.encode(env)
+    }
 }
 
-impl buffer::PlanarBuffer for ImportedBuffer {
-    fn size(&self) -> (u32, u32) {
-        (self.w, self.h)
+impl<'a> Decoder<'a> for Fd {
+    fn decode(term: rustler::Term<'a>) -> NifResult<Self> {
+        let fd: i32 = term.decode()?;
+        if fd < 0 {
+            Err(rustler::Error::BadArg)
+        } else {
+            Ok(Fd(unsafe { OwnedFd::from_raw_fd(fd) }))
+        }
     }
-    fn format(&self) -> buffer::DrmFourcc {
-        buffer::DrmFourcc::Nv12
+}
+
+#[derive(Debug)]
+struct Fourcc(DrmFourcc);
+
+impl Encoder for Fourcc {
+    fn encode<'a>(&self, env: rustler::Env<'a>) -> rustler::Term<'a> {
+        (self.0 as u32).encode(env)
     }
-    fn modifier(&self) -> Option<buffer::DrmModifier> {
-        None
-    }
-    fn pitches(&self) -> [u32; 4] {
-        self.pitches
-    }
-    fn handles(&self) -> [Option<buffer::Handle>; 4] {
-        self.handles
-    }
-    fn offsets(&self) -> [u32; 4] {
-        self.offsets
+}
+
+impl<'a> Decoder<'a> for Fourcc {
+    fn decode(term: rustler::Term<'a>) -> NifResult<Self> {
+        let val: u32 = term.decode()?;
+        Ok(Fourcc(
+            DrmFourcc::try_from(val).map_err(|_| rustler::Error::BadArg)?,
+        ))
     }
 }
 
@@ -251,51 +277,56 @@ impl DisplayInner {
     }
 
     fn display(&mut self, desc: PrimeDesc) -> std::io::Result<()> {
+        let width = desc.width;
+        let height = desc.height;
+        let format = desc.format.0;
         let mut pitches = [0u32; 4];
         let mut offsets = [0u32; 4];
-        for (i, p) in desc.pitches.iter().enumerate().take(4) {
-            pitches[i] = *p;
+        let mut mods = [0u64; 4];
+        let mut handles_u32 = [0u32; 4];
+        let mut handles = Vec::new();
+        let use_mods = desc.planes.iter().any(|p| p.modifier.is_some());
+        for (i, plane) in desc.planes.into_iter().take(4).enumerate() {
+            pitches[i] = plane.pitch;
+            offsets[i] = plane.offset;
+            if let Some(m) = plane.modifier {
+                mods[i] = m;
+            }
+            let handle = self
+                .card
+                .prime_fd_to_buffer(plane.fd.as_fd())
+                .map_err(|e| {
+                    for h in &handles {
+                        let _ = self.card.close_buffer(*h);
+                    }
+                    std::io::Error::new(e.kind(), format!("prime fd to buffer: {e}"))
+                })?;
+            handles_u32[i] = handle.into();
+            handles.push(handle);
         }
-        for (i, o) in desc.offsets.iter().enumerate().take(4) {
-            offsets[i] = *o;
+        let mut flags = control::FbCmd2Flags::empty();
+        if use_mods {
+            flags |= control::FbCmd2Flags::MODIFIERS;
         }
-        let mut handles = [None; 4];
-        let mut imported = Vec::new();
-        for (i, fd) in desc.fds.iter().copied().enumerate().take(4) {
-            let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-            let handle = self.card.prime_fd_to_buffer(borrowed).map_err(|e| {
-                unsafe { libc::close(fd) };
-                for h in imported.iter() {
-                    let _ = self.card.close_buffer(*h);
-                }
-                for fd2 in desc.fds.iter().skip(i + 1) {
-                    unsafe { libc::close(*fd2) };
-                }
-                std::io::Error::new(e.kind(), format!("prime fd to buffer: {e}"))
-            })?;
-            unsafe { libc::close(fd) };
-            handles[i] = Some(handle);
-            imported.push(handle);
-        }
-        for fd in desc.fds.iter().skip(4) {
-            unsafe { libc::close(*fd) };
-        }
-        let buffer = ImportedBuffer {
-            w: desc.width,
-            h: desc.height,
-            pitches,
-            offsets,
-            handles,
-        };
-        let fb = self
-            .card
-            .add_planar_framebuffer(&buffer, control::FbCmd2Flags::empty())
-            .map_err(|e| {
-                for h in imported.iter() {
-                    let _ = self.card.close_buffer(*h);
-                }
-                std::io::Error::new(e.kind(), format!("add framebuffer: {e}"))
-            })?;
+        let fb_info = mode::add_fb2(
+            self.card.as_fd(),
+            width,
+            height,
+            format as u32,
+            &handles_u32,
+            &pitches,
+            &offsets,
+            &mods,
+            flags.bits(),
+        )
+        .map_err(|e| {
+            for h in &handles {
+                let _ = self.card.close_buffer(*h);
+            }
+            std::io::Error::new(e.kind(), format!("add framebuffer: {e}"))
+        })?;
+        let fb = control::from_u32::<control::framebuffer::Handle>(fb_info.fb_id)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::Other))?;
 
         let mut req = AtomicModeReq::new();
         if !self.setup {
@@ -369,7 +400,7 @@ impl DisplayInner {
         };
         if let Err(e) = self.card.atomic_commit(flags, req) {
             let _ = self.card.destroy_framebuffer(fb);
-            for h in imported.iter() {
+            for h in &handles {
                 let _ = self.card.close_buffer(*h);
             }
             return Err(std::io::Error::new(e.kind(), format!("atomic commit: {e}")));
@@ -381,7 +412,7 @@ impl DisplayInner {
                 let _ = self.card.close_buffer(h);
             }
         }
-        self.last = Some((fb, imported));
+        self.last = Some((fb, handles));
         Ok(())
     }
 }
@@ -402,9 +433,6 @@ impl DisplayInner {
     fn run(mut self, rx: mpsc::Receiver<PrimeDesc>, err: Arc<Mutex<Option<String>>>) {
         while let Ok(mut desc) = rx.recv() {
             while let Ok(d) = rx.try_recv() {
-                for fd in desc.fds.drain(..) {
-                    unsafe { libc::close(fd) };
-                }
                 desc = d;
             }
             if let Err(e) = self.display(desc) {
@@ -443,10 +471,7 @@ impl Display {
             log!("Display channel missing");
             std::io::Error::from(std::io::ErrorKind::BrokenPipe)
         })?;
-        tx.send(desc).map_err(|e| {
-            for fd in e.0.fds {
-                unsafe { libc::close(fd) };
-            }
+        tx.send(desc).map_err(|_| {
             let msg = self
                 .err
                 .lock()

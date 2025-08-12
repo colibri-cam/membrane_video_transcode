@@ -2,6 +2,7 @@ use std::ffi::CString;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
+use drm_fourcc::DrmFourcc;
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::codec::packet::Packet;
 use ffmpeg_next::sys;
@@ -10,19 +11,73 @@ use ffmpeg_next::{
     util::{error::EAGAIN, frame::Video},
 };
 use rustler::{Atom, Binary, Encoder, Env, NifResult, ResourceArc, Term};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
 rustler::atoms! {
     ok
 }
 
+#[derive(Debug)]
+struct Fd(OwnedFd);
+
+impl AsFd for Fd {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+#[derive(rustler::NifStruct)]
+#[module = "Membrane.DRM.PrimePlane"]
+struct PrimePlane {
+    fd: Fd,
+    pitch: u32,
+    offset: u32,
+    modifier: Option<u64>,
+}
+
+#[derive(Debug)]
+struct Fourcc(DrmFourcc);
+
+impl Encoder for Fourcc {
+    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
+        (self.0 as u32).encode(env)
+    }
+}
+
+impl<'a> rustler::Decoder<'a> for Fourcc {
+    fn decode(term: Term<'a>) -> NifResult<Self> {
+        let val: u32 = term.decode()?;
+        Ok(Fourcc(
+            DrmFourcc::try_from(val).map_err(|_| rustler::Error::BadArg)?,
+        ))
+    }
+}
+
 #[derive(rustler::NifStruct)]
 #[module = "Membrane.DRM.Prime"]
 struct PrimeDesc {
-    fds: Vec<i32>,
     width: u32,
     height: u32,
-    pitches: Vec<u32>,
-    offsets: Vec<u32>,
+    format: Fourcc,
+    planes: Vec<PrimePlane>,
+}
+
+impl Encoder for Fd {
+    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
+        let dup_fd = unsafe { libc::dup(self.0.as_raw_fd()) };
+        dup_fd.encode(env)
+    }
+}
+
+impl<'a> rustler::Decoder<'a> for Fd {
+    fn decode(term: Term<'a>) -> NifResult<Self> {
+        let fd: i32 = term.decode()?;
+        if fd < 0 {
+            Err(rustler::Error::BadArg)
+        } else {
+            Ok(Fd(unsafe { OwnedFd::from_raw_fd(fd) }))
+        }
+    }
 }
 
 struct DecoderInner {
@@ -113,38 +168,39 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
         return Err(anyhow!("empty drm descriptor"));
     }
     let layer = &desc.layers[0];
-    let mut fds = Vec::new();
-    let mut pitches = Vec::new();
-    let mut offsets = Vec::new();
+    let format = DrmFourcc::try_from(layer.format)
+        .map_err(|_| anyhow!("unknown fourcc {}", layer.format))?;
+    let mut planes = Vec::new();
     for i in 0..layer.nb_planes as usize {
         let p = layer.planes[i];
         let obj = p.object_index as usize;
         if obj >= desc.nb_objects as usize {
-            for fd in &fds {
-                unsafe { libc::close(*fd) };
-            }
             unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
             return Err(anyhow!("invalid object index"));
         }
         let fd = unsafe { libc::dup(desc.objects[obj].fd) };
         if fd < 0 {
-            for fd2 in &fds {
-                unsafe { libc::close(*fd2) };
-            }
             unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
             return Err(anyhow!("dup failed"));
         }
-        fds.push(fd);
-        pitches.push(p.pitch as u32);
-        offsets.push(p.offset as u32);
+        let obj_desc = desc.objects[obj];
+        planes.push(PrimePlane {
+            fd: Fd(unsafe { OwnedFd::from_raw_fd(fd) }),
+            pitch: p.pitch as u32,
+            offset: p.offset as u32,
+            modifier: if obj_desc.format_modifier != 0 {
+                Some(obj_desc.format_modifier)
+            } else {
+                None
+            },
+        });
     }
     unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
     Ok(PrimeDesc {
-        fds,
         width: frame.width(),
         height: frame.height(),
-        pitches,
-        offsets,
+        format: Fourcc(format),
+        planes,
     })
 }
 
