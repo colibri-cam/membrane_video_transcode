@@ -1,6 +1,6 @@
 defmodule Membrane.H265.PrimeDecoder do
   @moduledoc """
-  Variant of `Membrane.H265Decoder` that returns DRM Prime descriptors instead of
+  Variant of `Membrane.H265.Decoder` that returns DRM Prime descriptors instead of
   raw frame payloads. Each decoded frame is sent downstream as an empty buffer
   with the descriptor attached under the `:drm_prime` metadata key.
   """
@@ -11,7 +11,7 @@ defmodule Membrane.H265.PrimeDecoder do
   alias Membrane.Buffer
   alias Membrane.DRM.PrimeFormat
   alias Membrane.H265
-  alias Membrane.H265Decoder.Common
+  alias Membrane.H265.Common
 
   def_input_pad(:input,
     flow_control: :auto,

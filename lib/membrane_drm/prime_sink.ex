@@ -1,7 +1,7 @@
-defmodule Membrane.DRM.PrimePlayer do
+defmodule Membrane.DRM.PrimeSink do
   @moduledoc """
   Sink that receives DRM Prime descriptors and scans them out directly using a
-  native NIF without copying frame data.
+  native NIF (`Membrane.DRM.PrimeSink.Native`) without copying frame data.
   """
 
   use Membrane.Sink
@@ -10,6 +10,7 @@ defmodule Membrane.DRM.PrimePlayer do
 
   alias Membrane.Buffer
   alias Membrane.DRM.PrimeFormat
+  alias Membrane.DRM.PrimeSink.Native
 
   def_input_pad(:input,
     accepted_format: %PrimeFormat{},
@@ -39,7 +40,7 @@ defmodule Membrane.DRM.PrimePlayer do
     if state.display do
       {[], state}
     else
-      {:ok, display} = DrmPrime.init_display(state.card)
+      {:ok, display} = Native.init_display(state.card)
       {[], %{state | display: display}}
     end
   end
@@ -59,7 +60,7 @@ defmodule Membrane.DRM.PrimePlayer do
     actions =
       case state do
         %{last_pts: nil, last_desc: nil} ->
-          case DrmPrime.display_prime(state.display, desc) do
+          case Native.display_prime(state.display, desc) do
             :ok ->
               [demand: :input, start_timer: {:demand_timer, :no_interval}]
 
@@ -81,7 +82,7 @@ defmodule Membrane.DRM.PrimePlayer do
   end
 
   def handle_tick(:demand_timer, _ctx, state) do
-    case DrmPrime.display_prime(state.display, state.last_desc) do
+    case Native.display_prime(state.display, state.last_desc) do
       :ok ->
         {[timer_interval: {:demand_timer, :no_interval}, demand: :input], state}
 
@@ -94,7 +95,7 @@ defmodule Membrane.DRM.PrimePlayer do
   @impl true
   def handle_end_of_stream(:input, _ctx, %{display: display} = state) do
     if display do
-      case DrmPrime.close_display(display) do
+      case Native.close_display(display) do
         :ok -> :ok
         {:error, reason} -> Membrane.Logger.warning("Failed to close display: #{inspect(reason)}")
       end
@@ -106,7 +107,7 @@ defmodule Membrane.DRM.PrimePlayer do
   @impl true
   def handle_terminate_request(_ctx, %{display: display} = state) do
     if display do
-      case DrmPrime.close_display(display) do
+      case Native.close_display(display) do
         :ok -> :ok
         {:error, reason} -> Membrane.Logger.warning("Failed to close display: #{inspect(reason)}")
       end

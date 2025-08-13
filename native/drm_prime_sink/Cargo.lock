@@ -81,7 +81,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "drm_prime"
+name = "drm_prime_sink"
 version = "0.1.0"
 dependencies = [
  "anyhow",

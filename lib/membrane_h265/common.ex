@@ -1,4 +1,4 @@
-defmodule Membrane.H265Decoder.Common do
+defmodule Membrane.H265.Common do
   @moduledoc false
 
   @h265_time_base 90_000

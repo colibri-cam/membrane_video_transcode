@@ -92,6 +92,7 @@ struct Decoder {
     inner: Mutex<DecoderInner>,
 }
 
+#[allow(dead_code)]
 struct Keepalive {
     resource: Video,
 }
@@ -143,7 +144,10 @@ fn init_decoder() -> Result<Decoder> {
 
 #[allow(non_local_definitions)]
 fn load(env: rustler::Env, _info: rustler::Term) -> bool {
-    assert!(rustler::resource!(Keepalive, env), "regisetr Keepalive resource failed");
+    assert!(
+        rustler::resource!(Keepalive, env),
+        "regisetr Keepalive resource failed"
+    );
     rustler::resource!(Decoder, env)
 }
 
@@ -212,10 +216,9 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
     })
 }
 
-fn decode_frames<'a>(
-    env: Env<'a>,
-    inner: &mut DecoderInner,
-) -> NifResult<(Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>)> {
+type DecodeResult<'a> = (Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>);
+
+fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> NifResult<DecodeResult<'a>> {
     let mut frames = Vec::new();
     let mut pts_list = Vec::new();
     let mut decoded = Video::empty();
@@ -247,6 +250,8 @@ fn decode_frames<'a>(
     Ok((pts_list, frames, keepalives))
 }
 
+type DecodeResultWithOk<'a> = (Atom, Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>);
+
 #[rustler::nif(schedule = "DirtyCpu")]
 fn decode<'a>(
     env: Env<'a>,
@@ -254,7 +259,7 @@ fn decode<'a>(
     data: Binary<'a>,
     pts: i64,
     dts: i64,
-) -> NifResult<(Atom, Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>)> {
+) -> NifResult<DecodeResultWithOk<'a>> {
     let mut packet = Packet::copy(data.as_slice());
     packet.set_pts((pts != NO_PTS).then_some(pts));
     packet.set_dts((dts != NO_PTS).then_some(dts));
@@ -272,10 +277,7 @@ fn decode<'a>(
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn flush<'a>(
-    env: Env<'a>,
-    state: ResourceArc<Decoder>,
-) -> NifResult<(Atom, Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>)> {
+fn flush<'a>(env: Env<'a>, state: ResourceArc<Decoder>) -> NifResult<DecodeResultWithOk<'a>> {
     let mut inner = state
         .inner
         .lock()

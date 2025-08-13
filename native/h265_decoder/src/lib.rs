@@ -346,4 +346,4 @@ fn on_load(env: Env, _info: Term) -> bool {
     true
 }
 
-rustler::init!("Elixir.Membrane.H265Decoder.Native", load = on_load);
+rustler::init!("Elixir.Membrane.H265.Decoder.Native", load = on_load);
