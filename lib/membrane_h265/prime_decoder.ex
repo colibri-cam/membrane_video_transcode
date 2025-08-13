@@ -46,10 +46,10 @@ defmodule Membrane.H265.PrimeDecoder do
     pts = Common.to_h265_time_base_truncated(buffer.pts)
 
     case Native.decode(decoder, buffer.payload, pts, dts) do
-      {:ok, pts_list, descs} ->
+      {:ok, pts_list, descs, keepalives} ->
         in_stream_format = ctx.pads.input.stream_format
         {actions, state} = maybe_send_stream_format(state, in_stream_format)
-        bufs = wrap_descriptors(pts_list, descs)
+        bufs = wrap_descriptors(pts_list, descs, keepalives)
         {actions ++ bufs, state}
 
       {:error, reason} ->
@@ -64,8 +64,8 @@ defmodule Membrane.H265.PrimeDecoder do
 
   @impl true
   def handle_end_of_stream(:input, _ctx, %{decoder_ref: decoder} = state) do
-    with {:ok, pts_list, descs} <- Native.flush(decoder),
-         bufs <- wrap_descriptors(pts_list, descs) do
+    with {:ok, pts_list, descs, keepalives} <- Native.flush(decoder),
+         bufs <- wrap_descriptors(pts_list, descs, keepalives) do
       new_state = %{state | decoder_ref: nil}
       {bufs ++ [end_of_stream: :output], new_state}
     else
@@ -74,12 +74,16 @@ defmodule Membrane.H265.PrimeDecoder do
     end
   end
 
-  defp wrap_descriptors([], []), do: []
+  defp wrap_descriptors([], [], []), do: []
 
-  defp wrap_descriptors(pts_list, descs) do
-    Enum.zip(pts_list, descs)
-    |> Enum.map(fn {p, desc} ->
-      %Buffer{pts: Common.to_membrane_time_base_truncated(p), payload: <<>>, metadata: %{drm_prime: desc}}
+  defp wrap_descriptors(pts_list, descs, keepalives) do
+    Enum.zip([pts_list, descs, keepalives])
+    |> Enum.map(fn {p, desc, keepalive} ->
+      %Buffer{
+        pts: Common.to_membrane_time_base_truncated(p),
+        payload: <<>>,
+        metadata: %{drm_prime: desc, keepalive: keepalive}
+      }
     end)
     |> then(&[buffer: {:output, &1}])
   end
@@ -98,7 +102,7 @@ defmodule Membrane.H265.PrimeDecoder do
     sf = %PrimeFormat{
       width: width,
       height: height,
-      framerate: framerate,
+      framerate: framerate
     }
 
     {[stream_format: {:output, sf}], %{state | stream_format_sent?: true}}

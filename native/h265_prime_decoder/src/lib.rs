@@ -17,6 +17,8 @@ rustler::atoms! {
     ok
 }
 
+const NO_PTS: i64 = i64::MIN;
+
 #[derive(Debug)]
 struct Fd(OwnedFd);
 
@@ -90,6 +92,13 @@ struct Decoder {
     inner: Mutex<DecoderInner>,
 }
 
+struct Keepalive {
+    resource: Video,
+}
+
+unsafe impl Send for Keepalive {}
+unsafe impl Sync for Keepalive {}
+
 unsafe impl Send for Decoder {}
 unsafe impl Sync for Decoder {}
 
@@ -105,6 +114,7 @@ fn init_decoder() -> Result<Decoder> {
     ffmpeg::init().context("ffmpeg init failed")?;
     let hevc = codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?;
     let mut decoder = codec::decoder::new();
+
     unsafe {
         let mut hw_device_ctx = std::ptr::null_mut();
         let path = CString::new("/dev/dri/renderD129").context("device path")?;
@@ -133,6 +143,7 @@ fn init_decoder() -> Result<Decoder> {
 
 #[allow(non_local_definitions)]
 fn load(env: rustler::Env, _info: rustler::Term) -> bool {
+    assert!(rustler::resource!(Keepalive, env), "regisetr Keepalive resource failed");
     rustler::resource!(Decoder, env)
 }
 
@@ -187,28 +198,16 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
                 fd: Fd(unsafe { OwnedFd::from_raw_fd(fd) }),
                 pitch: p.pitch as u32,
                 offset: p.offset as u32,
-                modifier: if obj_desc.format_modifier != 0 {
-                    Some(obj_desc.format_modifier)
-                } else {
-                    None
-                },
+                modifier: Some(obj_desc.format_modifier),
             });
         }
     }
-    let format = if desc.nb_layers == 1 {
-        let layer = &desc.layers[0];
-        DrmFourcc::try_from(layer.format).map_err(|_| anyhow!("unknown fourcc {}", layer.format))?
-    } else if desc.nb_layers == 2 && planes.len() == 2 {
-        DrmFourcc::Nv12
-    } else {
-        unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
-        return Err(anyhow!("unsupported drm descriptor"));
-    };
+
     unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
     Ok(PrimeDesc {
         width: frame.width(),
         height: frame.height(),
-        format: Fourcc(format),
+        format: Fourcc(DrmFourcc::Nv12),
         planes,
     })
 }
@@ -216,10 +215,12 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
 fn decode_frames<'a>(
     env: Env<'a>,
     inner: &mut DecoderInner,
-) -> NifResult<(Vec<i64>, Vec<Term<'a>>)> {
+) -> NifResult<(Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>)> {
     let mut frames = Vec::new();
     let mut pts_list = Vec::new();
     let mut decoded = Video::empty();
+    let mut keepalives = Vec::new();
+
     loop {
         match inner.decoder.receive_frame(&mut decoded) {
             Ok(_) => {
@@ -227,7 +228,14 @@ fn decode_frames<'a>(
                 inner.height = decoded.height();
                 let desc =
                     export_drm_prime(&decoded).map_err(|_| rustler::Error::Atom("export"))?;
-                pts_list.push(decoded.timestamp().unwrap_or(0));
+                let mut res = Video::empty();
+                unsafe {
+                    // keepalive now references the same underlying surface
+                    sys::av_frame_ref(res.as_mut_ptr(), decoded.as_ptr());
+                }
+                let keepalive = ResourceArc::new(Keepalive { resource: res });
+                keepalives.push(keepalive);
+                pts_list.push(decoded.pts().unwrap_or(NO_PTS));
                 frames.push(desc.encode(env));
                 unsafe { sys::av_frame_unref(decoded.as_mut_ptr()) };
             }
@@ -236,7 +244,7 @@ fn decode_frames<'a>(
             Err(_) => return Err(rustler::Error::Atom("decode")),
         }
     }
-    Ok((pts_list, frames))
+    Ok((pts_list, frames, keepalives))
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -246,10 +254,10 @@ fn decode<'a>(
     data: Binary<'a>,
     pts: i64,
     dts: i64,
-) -> NifResult<(Atom, Vec<i64>, Vec<Term<'a>>)> {
+) -> NifResult<(Atom, Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>)> {
     let mut packet = Packet::copy(data.as_slice());
-    packet.set_pts(Some(pts));
-    packet.set_dts(Some(dts));
+    packet.set_pts((pts != NO_PTS).then_some(pts));
+    packet.set_dts((dts != NO_PTS).then_some(dts));
 
     let mut inner = state
         .inner
@@ -259,15 +267,15 @@ fn decode<'a>(
         .decoder
         .send_packet(&packet)
         .map_err(|_| rustler::Error::Atom("send_packet"))?;
-    let (pts_list, frames) = decode_frames(env, &mut inner)?;
-    Ok((ok(), pts_list, frames))
+    let (pts_list, frames, keepalives) = decode_frames(env, &mut inner)?;
+    Ok((ok(), pts_list, frames, keepalives))
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn flush<'a>(
     env: Env<'a>,
     state: ResourceArc<Decoder>,
-) -> NifResult<(Atom, Vec<i64>, Vec<Term<'a>>)> {
+) -> NifResult<(Atom, Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>)> {
     let mut inner = state
         .inner
         .lock()
@@ -276,8 +284,8 @@ fn flush<'a>(
         .decoder
         .send_eof()
         .map_err(|_| rustler::Error::Atom("send_eof"))?;
-    let (pts_list, frames) = decode_frames(env, &mut inner)?;
-    Ok((ok(), pts_list, frames))
+    let (pts_list, frames, keepalives) = decode_frames(env, &mut inner)?;
+    Ok((ok(), pts_list, frames, keepalives))
 }
 
 #[rustler::nif]

@@ -1,12 +1,18 @@
 use std::ffi::{CStr, CString};
 use std::fs::OpenOptions;
+use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-use drm::control::{Device as _, atomic::AtomicModeReq, connector, crtc, plane, property};
+use anyhow::{Context, Result, bail}; // gives you Result and bail!
+use drm::buffer::{DrmModifier, Handle as GemHandle, PlanarBuffer};
+
+use drm::control::{
+    Device as _, Event, FbCmd2Flags, atomic::AtomicModeReq, connector, crtc, framebuffer, plane,
+    property,
+};
 use drm::{ClientCapability, Device as _, buffer, control};
-use drm_ffi::mode;
 use drm_fourcc::DrmFourcc;
 use rustler::{Atom, Decoder, Encoder, NifResult, ResourceArc};
 
@@ -32,7 +38,7 @@ impl AsFd for Fd {
     }
 }
 
-#[derive(rustler::NifStruct)]
+#[derive(Debug, rustler::NifStruct)]
 #[module = "Membrane.DRM.PrimePlane"]
 struct PrimePlane {
     fd: Fd,
@@ -41,7 +47,7 @@ struct PrimePlane {
     modifier: Option<u64>,
 }
 
-#[derive(rustler::NifStruct)]
+#[derive(Debug, rustler::NifStruct)]
 #[module = "Membrane.DRM.Prime"]
 struct PrimeDesc {
     width: u32,
@@ -70,6 +76,45 @@ impl<'a> Decoder<'a> for Fd {
 
 #[derive(Debug)]
 struct Fourcc(DrmFourcc);
+
+#[derive(Clone, Debug)]
+pub struct FbWithHandles {
+    pub fb: framebuffer::Handle,
+    pub handles: [Option<GemHandle>; 4], // keep to close after vblank
+}
+
+/// In-memory PlanarBuffer based on your PrimeDesc.
+/// drm 0.14 expects a single global modifier via `modifier()`.
+struct PrimePlanarBuf {
+    w: u32,
+    h: u32,
+    fourcc: DrmFourcc,
+    pitches: [u32; 4],
+    offsets: [u32; 4],
+    handles: [Option<GemHandle>; 4],
+    modifier: Option<DrmModifier>, // single, not per-plane
+}
+
+impl PlanarBuffer for PrimePlanarBuf {
+    fn size(&self) -> (u32, u32) {
+        (self.w, self.h)
+    }
+    fn format(&self) -> DrmFourcc {
+        self.fourcc
+    }
+    fn pitches(&self) -> [u32; 4] {
+        self.pitches
+    }
+    fn handles(&self) -> [Option<GemHandle>; 4] {
+        self.handles
+    }
+    fn offsets(&self) -> [u32; 4] {
+        self.offsets
+    }
+    fn modifier(&self) -> Option<DrmModifier> {
+        self.modifier
+    }
+}
 
 impl Encoder for Fourcc {
     fn encode<'a>(&self, env: rustler::Env<'a>) -> rustler::Term<'a> {
@@ -115,7 +160,8 @@ struct DisplayInner {
     prop_crtc_h: property::Handle,
     mode_blob: u64,
     setup: bool,
-    last: Option<(control::framebuffer::Handle, Vec<buffer::Handle>)>,
+    stale: Option<FbWithHandles>,
+    in_flight: Option<FbWithHandles>,
 }
 
 fn open_card(path: &str) -> std::io::Result<Card> {
@@ -195,6 +241,7 @@ impl DisplayInner {
         let crtc = enc_info.crtc().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "encoder has no crtc")
         })?;
+
         log!("Selected CRTC: id={}", u32::from(crtc));
         let mode = conn.modes().first().copied().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "connector has no modes")
@@ -272,61 +319,16 @@ impl DisplayInner {
             prop_crtc_h,
             mode_blob: blob_id,
             setup: false,
-            last: None,
+            stale: None,
+            in_flight: None,
         })
     }
 
     fn display(&mut self, desc: PrimeDesc) -> std::io::Result<()> {
-        let width = desc.width;
-        let height = desc.height;
-        let format = desc.format.0;
-        let mut pitches = [0u32; 4];
-        let mut offsets = [0u32; 4];
-        let mut mods = [0u64; 4];
-        let mut handles_u32 = [0u32; 4];
-        let mut handles = Vec::new();
-        let use_mods = desc.planes.iter().any(|p| p.modifier.is_some());
-        for (i, plane) in desc.planes.into_iter().take(4).enumerate() {
-            pitches[i] = plane.pitch;
-            offsets[i] = plane.offset;
-            if let Some(m) = plane.modifier {
-                mods[i] = m;
-            }
-            let handle = self
-                .card
-                .prime_fd_to_buffer(plane.fd.as_fd())
-                .map_err(|e| {
-                    for h in &handles {
-                        let _ = self.card.close_buffer(*h);
-                    }
-                    std::io::Error::new(e.kind(), format!("prime fd to buffer: {e}"))
-                })?;
-            handles_u32[i] = handle.into();
-            handles.push(handle);
-        }
-        let mut flags = control::FbCmd2Flags::empty();
-        if use_mods {
-            flags |= control::FbCmd2Flags::MODIFIERS;
-        }
-        let fb_info = mode::add_fb2(
-            self.card.as_fd(),
-            width,
-            height,
-            format as u32,
-            &handles_u32,
-            &pitches,
-            &offsets,
-            &mods,
-            flags.bits(),
-        )
-        .map_err(|e| {
-            for h in &handles {
-                let _ = self.card.close_buffer(*h);
-            }
-            std::io::Error::new(e.kind(), format!("add framebuffer: {e}"))
+        let new_fb = self.add_fb_from_prime_desc(&desc).map_err(|e| {
+            log!("Add fb from prime error: {}", e);
+            io::Error::new(io::ErrorKind::Other, e)
         })?;
-        let fb = control::from_u32::<control::framebuffer::Handle>(fb_info.fb_id)
-            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::Other))?;
 
         let mut req = AtomicModeReq::new();
         if !self.setup {
@@ -391,37 +393,109 @@ impl DisplayInner {
         req.add_property(
             self.plane,
             self.prop_fb,
-            property::Value::Framebuffer(Some(fb)),
+            property::Value::Framebuffer(Some(new_fb.fb)),
         );
-        let flags = if self.last.is_none() {
+
+        let flags = if self.stale.is_none() && self.in_flight.is_none() {
             control::AtomicCommitFlags::ALLOW_MODESET
         } else {
             control::AtomicCommitFlags::empty()
         };
         if let Err(e) = self.card.atomic_commit(flags, req) {
-            let _ = self.card.destroy_framebuffer(fb);
-            for h in &handles {
-                let _ = self.card.close_buffer(*h);
+            let _ = self.card.destroy_framebuffer(new_fb.fb);
+            for &h in new_fb.handles.iter().flatten() {
+                self.card.close_buffer(h)?;
             }
             return Err(std::io::Error::new(e.kind(), format!("atomic commit: {e}")));
+        };
+        if let Some(stale_fb) = self.stale.take() {
+            log!("Dropping stale framebuffer {:?}\n", stale_fb);
+            // 1) Drop the KMS FB
+            self.card.destroy_framebuffer(stale_fb.fb)?;
         }
 
-        if let Some((old_fb, old_handles)) = self.last.take() {
-            let _ = self.card.destroy_framebuffer(old_fb);
-            for h in old_handles {
-                let _ = self.card.close_buffer(h);
+        self.stale = self.in_flight.take();
+        self.in_flight = Some(new_fb);
+        Ok(())
+    }
+
+    /// Create a KMS framebuffer from your PrimeDesc using drm-rs 0.14.
+    /// Accept any type that implements both `drm::Device` and `drm::control::Device`
+    /// (e.g., `&drm::DeviceFd`).
+    fn add_fb_from_prime_desc(&mut self, prime: &PrimeDesc) -> Result<FbWithHandles> {
+        if prime.planes.is_empty() {
+            bail!("PrimeDesc has no planes");
+        }
+        let n = prime.planes.len().min(4);
+
+        // Import planes (dmabuf -> GEM)
+        let mut handles: [Option<GemHandle>; 4] = [None, None, None, None];
+        let mut pitches: [u32; 4] = [0; 4];
+        let mut offsets: [u32; 4] = [0; 4];
+
+        // Collect per-plane modifiers, then collapse to one
+        let mut mods_raw: [Option<u64>; 4] = [None, None, None, None];
+        for i in 0..n {
+            let p = &prime.planes[i];
+            let gem = self
+                .card
+                .prime_fd_to_buffer(p.fd.as_fd())
+                .with_context(|| format!("prime_fd_to_buffer failed on plane {}", i))?;
+            handles[i] = Some(gem);
+            pitches[i] = p.pitch;
+            offsets[i] = p.offset;
+            mods_raw[i] = p.modifier;
+        }
+
+        // Collapse modifiers: all Some(m) must be the same, otherwise bail.
+        let mut common_mod: Option<u64> = None;
+        for m in mods_raw.iter().flatten().copied() {
+            match common_mod {
+                None => common_mod = Some(m),
+                Some(prev) if prev == m => {}
+                Some(prev) => bail!("mixed plane modifiers not supported ({} vs {})", prev, m),
             }
         }
-        self.last = Some((fb, handles));
-        Ok(())
+        let modifier = common_mod.map(DrmModifier::from);
+
+        // Build PlanarBuffer
+        let pb = PrimePlanarBuf {
+            w: prime.width,
+            h: prime.height,
+            fourcc: prime.format.0, // your Fourcc newtype wraps DrmFourcc
+            pitches,
+            offsets,
+            handles,
+            modifier,
+        };
+
+        // Use MODIFIERS flag iff we actually have one
+        let flags = if modifier.is_some() {
+            FbCmd2Flags::MODIFIERS
+        } else {
+            FbCmd2Flags::empty()
+        };
+
+        let fb = self
+            .card
+            .add_planar_framebuffer(&pb, flags)
+            .context("add_planar_framebuffer failed")?;
+
+        Ok(FbWithHandles { fb, handles })
     }
 }
 
 impl Drop for DisplayInner {
     fn drop(&mut self) {
-        if let Some((fb, handles)) = self.last.take() {
+        if let Some(FbWithHandles { fb, handles }) = self.stale.take() {
             let _ = self.card.destroy_framebuffer(fb);
-            for h in handles {
+            for &h in handles.iter().flatten() {
+                let _ = self.card.close_buffer(h);
+            }
+        }
+        if let Some(FbWithHandles { fb, handles }) = self.in_flight.take() {
+            let _ = self.card.destroy_framebuffer(fb);
+            for &h in handles.iter().flatten() {
                 let _ = self.card.close_buffer(h);
             }
         }
@@ -432,6 +506,8 @@ impl Drop for DisplayInner {
 impl DisplayInner {
     fn run(mut self, rx: mpsc::Receiver<PrimeDesc>, err: Arc<Mutex<Option<String>>>) {
         while let Ok(mut desc) = rx.recv() {
+            // If there are more frames in the queue
+            // take only last one
             while let Ok(d) = rx.try_recv() {
                 desc = d;
             }
@@ -449,7 +525,6 @@ impl DisplayInner {
 struct Display {
     tx: Option<mpsc::Sender<PrimeDesc>>,
     handle: Option<thread::JoinHandle<()>>,
-    err: Arc<Mutex<Option<String>>>,
 }
 
 impl Display {
@@ -462,7 +537,6 @@ impl Display {
         Ok(Self {
             tx: Some(tx),
             handle: Some(handle),
-            err,
         })
     }
 
@@ -472,14 +546,8 @@ impl Display {
             std::io::Error::from(std::io::ErrorKind::BrokenPipe)
         })?;
         tx.send(desc).map_err(|_| {
-            let msg = self
-                .err
-                .lock()
-                .ok()
-                .and_then(|mut g| g.take())
-                .unwrap_or_else(|| "broken pipe".to_string());
-            log!("Display thread disconnected: {msg}");
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, msg)
+            log!("Send desc failed");
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe)
         })
     }
 }

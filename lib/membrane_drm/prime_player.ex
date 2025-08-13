@@ -26,6 +26,7 @@ defmodule Membrane.DRM.PrimePlayer do
        display: nil,
        last_pts: nil,
        last_desc: nil,
+       last_keepalive: nil,
        card: card
      }}
   end
@@ -49,13 +50,17 @@ defmodule Membrane.DRM.PrimePlayer do
   end
 
   @impl true
-  def handle_buffer(:input, %Buffer{pts: pts, metadata: %{drm_prime: desc}}, _ctx, state) do
+  def handle_buffer(
+        :input,
+        %Buffer{pts: pts, metadata: %{drm_prime: desc, keepalive: keepalive}},
+        _ctx,
+        state
+      ) do
     actions =
       case state do
         %{last_pts: nil, last_desc: nil} ->
           case DrmPrime.display_prime(state.display, desc) do
             :ok ->
-              Membrane.Logger.info("Display frame: #{inspect(desc)}")
               [demand: :input, start_timer: {:demand_timer, :no_interval}]
 
             {:error, reason} ->
@@ -67,7 +72,7 @@ defmodule Membrane.DRM.PrimePlayer do
           [timer_interval: {:demand_timer, pts - last_pts}]
       end
 
-    {actions, %{state | last_pts: pts, last_desc: desc}}
+    {actions, %{state | last_pts: pts, last_desc: desc, last_keepalive: keepalive}}
   end
 
   @impl true
@@ -76,17 +81,14 @@ defmodule Membrane.DRM.PrimePlayer do
   end
 
   def handle_tick(:demand_timer, _ctx, state) do
-   Membrane.Logger.debug("Tick trying to display frame: #{inspect(state.last_desc)}")
+    case DrmPrime.display_prime(state.display, state.last_desc) do
+      :ok ->
+        {[timer_interval: {:demand_timer, :no_interval}, demand: :input], state}
 
-   case DrmPrime.display_prime(state.display, state.last_desc) do
-     :ok ->
-        Membrane.Logger.info("Displayed frame: #{inspect(state.last_desc)}")
-       {[timer_interval: {:demand_timer, :no_interval}, demand: :input], state}
-
-     {:error, reason} ->
-       Membrane.Logger.error("Failed to display frame: #{inspect(reason)}")
-       raise "Failed to display frame: #{inspect(reason)}"
-   end
+      {:error, reason} ->
+        Membrane.Logger.error("Failed to display frame: #{inspect(reason)}")
+        raise "Failed to display frame: #{inspect(reason)}"
+    end
   end
 
   @impl true
@@ -100,7 +102,6 @@ defmodule Membrane.DRM.PrimePlayer do
 
     {[stop_timer: :demand_timer], %{state | display: nil}}
   end
-
 
   @impl true
   def handle_terminate_request(_ctx, %{display: display} = state) do

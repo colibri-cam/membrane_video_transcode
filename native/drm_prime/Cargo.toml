@@ -8,6 +8,7 @@ name = "drm_prime"
 crate-type = ["cdylib"]
 
 [dependencies]
+anyhow = "1"
 drm = "0.14"  # aka "drm-rs"
 rustler = "0.36.2"
 drm-ffi = "0.9"
