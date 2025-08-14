@@ -38,7 +38,7 @@ impl AsFd for Fd {
 }
 
 #[derive(Debug, rustler::NifStruct)]
-#[module = "Membrane.DRM.PrimePlane"]
+#[module = "Membrane.PrimePlane"]
 struct PrimePlane {
     fd: Fd,
     pitch: u32,
@@ -47,7 +47,7 @@ struct PrimePlane {
 }
 
 #[derive(Debug, rustler::NifStruct)]
-#[module = "Membrane.DRM.Prime"]
+#[module = "Membrane.PrimeDesc"]
 struct PrimeDesc {
     width: u32,
     height: u32,
@@ -575,9 +575,9 @@ fn load(env: rustler::Env, _info: rustler::Term) -> bool {
 }
 
 #[rustler::nif]
-fn init_display(card_path: String) -> NifResult<ResourceArc<DisplayRes>> {
+fn init_display(card_path: String) -> NifResult<(Atom, ResourceArc<DisplayRes>)> {
     let display = Display::new(&card_path).map_err(nif_err)?;
-    Ok(ResourceArc::new(DisplayRes(Mutex::new(Some(display)))))
+    Ok((ok(), ResourceArc::new(DisplayRes(Mutex::new(Some(display))))))
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]

@@ -17,6 +17,12 @@ defmodule Membrane.H265.PrimeDecoder do
   alias Membrane.H265
   alias Membrane.H265.Common
 
+  def_options hw_device: [
+    spec: String.t(),
+    default: "/dev/dri/renderD129",
+    description: "Hw device to use"
+  ]
+
   def_input_pad(:input,
     flow_control: :auto,
     accepted_format: %H265{alignment: :au}
@@ -28,15 +34,15 @@ defmodule Membrane.H265.PrimeDecoder do
   )
 
   @impl true
-  def handle_init(_ctx, _opts) do
-    state = %{decoder_ref: nil, stream_format_sent?: false}
+  def handle_init(_ctx, opts) do
+    state = %{decoder_ref: nil, stream_format_sent?: false, hw_device: opts.hw_device}
     {[], state}
   end
 
   @impl true
   def handle_setup(_ctx, state) do
     decoder =
-      case Native.create() do
+      case Native.create(state.hw_device) do
         {:error, reason} -> raise "Error creating decoder #{inspect(reason)}"
         decoder -> decoder
       end

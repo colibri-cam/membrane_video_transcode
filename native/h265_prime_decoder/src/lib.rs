@@ -111,14 +111,14 @@ impl Drop for Decoder {
     }
 }
 
-fn init_decoder() -> Result<Decoder> {
+fn init_decoder(hw_device: String) -> Result<Decoder> {
     ffmpeg::init().context("ffmpeg init failed")?;
     let hevc = codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?;
     let mut decoder = codec::decoder::new();
 
     unsafe {
         let mut hw_device_ctx = std::ptr::null_mut();
-        let path = CString::new("/dev/dri/renderD129").context("device path")?;
+        let path = CString::new(hw_device).context("device path")?;
         if sys::av_hwdevice_ctx_create(
             &mut hw_device_ctx,
             sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
@@ -152,8 +152,8 @@ fn load(env: rustler::Env, _info: rustler::Term) -> bool {
 }
 
 #[rustler::nif]
-fn create() -> NifResult<ResourceArc<Decoder>> {
-    init_decoder()
+fn create(hw_device: String) -> NifResult<ResourceArc<Decoder>> {
+    init_decoder(hw_device)
         .map(ResourceArc::new)
         .map_err(|_| rustler::Error::Atom("create_failed"))
 }

@@ -12,6 +12,12 @@ defmodule Membrane.DRM.PrimeSink do
   alias Membrane.PrimeFormat
   alias Membrane.DRM.PrimeSink.Native
 
+  def_options card: [
+    spec: String.t(),
+    default: "/dev/dri/card0",
+    description: "Graphic card to use"
+  ]
+
   def_input_pad(:input,
     accepted_format: %PrimeFormat{},
     flow_control: :manual,
@@ -19,8 +25,8 @@ defmodule Membrane.DRM.PrimeSink do
   )
 
   @impl true
-  def handle_init(opts, _ctx) do
-    card = opts[:card] || "/dev/dri/card0"
+  def handle_init(_ctx, opts) do
+    card = opts.card
 
     {[],
      %{
@@ -36,14 +42,12 @@ defmodule Membrane.DRM.PrimeSink do
   def handle_setup(_ctx, state), do: {[], state}
 
   @impl true
-  def handle_stream_format(:input, %PrimeFormat{}, _ctx, state) do
-    if state.display do
-      {[], state}
-    else
+  def handle_stream_format(:input, %PrimeFormat{}, _ctx, %{display: nil} = state) do
       {:ok, display} = Native.init_display(state.card)
       {[], %{state | display: display}}
-    end
   end
+
+  def handle_stream_format(:input, _, _ctx, state), do: {[], state}
 
   @impl true
   def handle_start_of_stream(:input, _ctx, state) do
