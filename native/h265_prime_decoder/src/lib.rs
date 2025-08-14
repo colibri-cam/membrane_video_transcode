@@ -29,7 +29,7 @@ impl AsFd for Fd {
 }
 
 #[derive(rustler::NifStruct)]
-#[module = "Membrane.DRM.PrimePlane"]
+#[module = "Membrane.PrimePlane"]
 struct PrimePlane {
     fd: Fd,
     pitch: u32,
@@ -56,7 +56,7 @@ impl<'a> rustler::Decoder<'a> for Fourcc {
 }
 
 #[derive(rustler::NifStruct)]
-#[module = "Membrane.DRM.Prime"]
+#[module = "Membrane.PrimeDesc"]
 struct PrimeDesc {
     width: u32,
     height: u32,

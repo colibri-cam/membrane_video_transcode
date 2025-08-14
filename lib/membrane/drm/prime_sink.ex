@@ -9,7 +9,7 @@ defmodule Membrane.DRM.PrimeSink do
   require Membrane.Logger
 
   alias Membrane.Buffer
-  alias Membrane.DRM.PrimeFormat
+  alias Membrane.PrimeFormat
   alias Membrane.DRM.PrimeSink.Native
 
   def_input_pad(:input,

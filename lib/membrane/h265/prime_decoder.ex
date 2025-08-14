@@ -3,13 +3,17 @@ defmodule Membrane.H265.PrimeDecoder do
   Variant of `Membrane.H265.Decoder` that returns DRM Prime descriptors instead of
   raw frame payloads. Each decoded frame is sent downstream as an empty buffer
   with the descriptor attached under the `:drm_prime` metadata key.
+  
+  It also returns keepalive which is a reference to AV frame in GPU
+  memory. When reference gets GCed AV frame get's release. Keep
+  keepalive in pipeline until prime descriptor reaches consumer.
   """
 
   use Membrane.Filter
 
   alias __MODULE__.Native
   alias Membrane.Buffer
-  alias Membrane.DRM.PrimeFormat
+  alias Membrane.PrimeFormat
   alias Membrane.H265
   alias Membrane.H265.Common
 

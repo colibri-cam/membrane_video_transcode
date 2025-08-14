@@ -1,11 +1,14 @@
-# DrmExperiments
+# Membrane DRM sink
 
 Elixir experiment demonstrating how to drive a DRM device from a Rust NIF.
 The project provides four Membrane elements, each paired with a Rust
 implementation built using [Rustler](https://github.com/rusterlium/rustler):
 
+## Recreation of standard approach
   * `Membrane.H265.Decoder` – decodes H265 into raw video (`native/h265_decoder`)
   * `Membrane.DRM.Sink` – renders raw video frames (`native/drm_sink`)
+
+## DMA buff aproach
   * `Membrane.H265.PrimeDecoder` – outputs DRM Prime (DMABUF) descriptors
     (`native/h265_prime_decoder`)
   * `Membrane.DRM.PrimeSink` – scans out DRM Prime descriptors

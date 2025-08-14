@@ -48,7 +48,6 @@ defmodule DrmExperiments.MixProject do
   defp deps do
     [
       {:rustler, "~> 0.36.2"},
-      {:castore, "~> 1.0 or ~> 0.1"},
       {:membrane_core, "~> 1.2.4"},
       {:membrane_h265_format, "~> 0.2"},
       {:membrane_raw_video_format, "~> 0.4"}
