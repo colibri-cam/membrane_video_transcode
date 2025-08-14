@@ -9,8 +9,7 @@ use anyhow::{Context, Result, bail}; // gives you Result and bail!
 use drm::buffer::{DrmModifier, Handle as GemHandle, PlanarBuffer};
 
 use drm::control::{
-    Device as _, Event, FbCmd2Flags, atomic::AtomicModeReq, connector, crtc, framebuffer, plane,
-    property,
+    Device as _, FbCmd2Flags, atomic::AtomicModeReq, connector, crtc, framebuffer, plane, property,
 };
 use drm::{ClientCapability, Device as _, buffer, control};
 use drm_fourcc::DrmFourcc;
@@ -39,7 +38,7 @@ impl AsFd for Fd {
 }
 
 #[derive(Debug, rustler::NifStruct)]
-#[module = "Membrane.DRM.PrimePlane"]
+#[module = "Membrane.PrimePlane"]
 struct PrimePlane {
     fd: Fd,
     pitch: u32,
@@ -48,7 +47,7 @@ struct PrimePlane {
 }
 
 #[derive(Debug, rustler::NifStruct)]
-#[module = "Membrane.DRM.Prime"]
+#[module = "Membrane.PrimeDesc"]
 struct PrimeDesc {
     width: u32,
     height: u32,
@@ -327,7 +326,7 @@ impl DisplayInner {
     fn display(&mut self, desc: PrimeDesc) -> std::io::Result<()> {
         let new_fb = self.add_fb_from_prime_desc(&desc).map_err(|e| {
             log!("Add fb from prime error: {}", e);
-            io::Error::new(io::ErrorKind::Other, e)
+            io::Error::other(e)
         })?;
 
         let mut req = AtomicModeReq::new();
@@ -576,9 +575,9 @@ fn load(env: rustler::Env, _info: rustler::Term) -> bool {
 }
 
 #[rustler::nif]
-fn init_display(card_path: String) -> NifResult<ResourceArc<DisplayRes>> {
+fn init_display(card_path: String) -> NifResult<(Atom, ResourceArc<DisplayRes>)> {
     let display = Display::new(&card_path).map_err(nif_err)?;
-    Ok(ResourceArc::new(DisplayRes(Mutex::new(Some(display)))))
+    Ok((ok(), ResourceArc::new(DisplayRes(Mutex::new(Some(display))))))
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -604,4 +603,4 @@ fn close_display(res: ResourceArc<DisplayRes>) -> NifResult<Atom> {
     Ok(ok())
 }
 
-rustler::init!("Elixir.DrmPrime.Native", load = load);
+rustler::init!("Elixir.Membrane.DRM.PrimeSink.Native", load = load);

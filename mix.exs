@@ -21,16 +21,16 @@ defmodule DrmExperiments.MixProject do
           path: "native/drm_sink",
           mode: if(Mix.env() == :prod, do: :release, else: :debug)
         ],
-        drm_prime: [
-          path: "native/drm_prime",
+        drm_prime_sink: [
+          path: "native/drm_prime_sink",
           mode: if(Mix.env() == :prod, do: :release, else: :debug)
         ],
         h265_prime_decoder: [
           path: "native/h265_prime_decoder",
           mode: if(Mix.env() == :prod, do: :release, else: :debug)
         ],
-        h265decoder: [
-          path: "native/h265decoder",
+        h265_decoder: [
+          path: "native/h265_decoder",
           mode: if(Mix.env() == :prod, do: :release, else: :debug)
         ]
       ]
@@ -48,7 +48,6 @@ defmodule DrmExperiments.MixProject do
   defp deps do
     [
       {:rustler, "~> 0.36.2"},
-      {:castore, "~> 1.0 or ~> 0.1"},
       {:membrane_core, "~> 1.2.4"},
       {:membrane_h265_format, "~> 0.2"},
       {:membrane_raw_video_format, "~> 0.4"}

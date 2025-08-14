@@ -1,4 +1,4 @@
-defmodule DrmSinkTest do
+defmodule MembraneDRMTest do
   use ExUnit.Case, async: true
 
   test "basic assertion" do

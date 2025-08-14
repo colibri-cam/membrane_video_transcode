@@ -1,7 +1,7 @@
-defmodule Membrane.DRM.PrimePlayer do
+defmodule Membrane.DRM.PrimeSink do
   @moduledoc """
   Sink that receives DRM Prime descriptors and scans them out directly using a
-  native NIF without copying frame data.
+  native NIF (`Membrane.DRM.PrimeSink.Native`) without copying frame data.
   """
 
   use Membrane.Sink
@@ -9,7 +9,14 @@ defmodule Membrane.DRM.PrimePlayer do
   require Membrane.Logger
 
   alias Membrane.Buffer
-  alias Membrane.DRM.PrimeFormat
+  alias Membrane.PrimeFormat
+  alias Membrane.DRM.PrimeSink.Native
+
+  def_options card: [
+    spec: String.t(),
+    default: "/dev/dri/card0",
+    description: "Graphic card to use"
+  ]
 
   def_input_pad(:input,
     accepted_format: %PrimeFormat{},
@@ -18,8 +25,8 @@ defmodule Membrane.DRM.PrimePlayer do
   )
 
   @impl true
-  def handle_init(opts, _ctx) do
-    card = opts[:card] || "/dev/dri/card0"
+  def handle_init(_ctx, opts) do
+    card = opts.card
 
     {[],
      %{
@@ -35,14 +42,12 @@ defmodule Membrane.DRM.PrimePlayer do
   def handle_setup(_ctx, state), do: {[], state}
 
   @impl true
-  def handle_stream_format(:input, %PrimeFormat{}, _ctx, state) do
-    if state.display do
-      {[], state}
-    else
-      {:ok, display} = DrmPrime.init_display(state.card)
+  def handle_stream_format(:input, %PrimeFormat{}, _ctx, %{display: nil} = state) do
+      {:ok, display} = Native.init_display(state.card)
       {[], %{state | display: display}}
-    end
   end
+
+  def handle_stream_format(:input, _, _ctx, state), do: {[], state}
 
   @impl true
   def handle_start_of_stream(:input, _ctx, state) do
@@ -59,7 +64,7 @@ defmodule Membrane.DRM.PrimePlayer do
     actions =
       case state do
         %{last_pts: nil, last_desc: nil} ->
-          case DrmPrime.display_prime(state.display, desc) do
+          case Native.display_prime(state.display, desc) do
             :ok ->
               [demand: :input, start_timer: {:demand_timer, :no_interval}]
 
@@ -81,7 +86,7 @@ defmodule Membrane.DRM.PrimePlayer do
   end
 
   def handle_tick(:demand_timer, _ctx, state) do
-    case DrmPrime.display_prime(state.display, state.last_desc) do
+    case Native.display_prime(state.display, state.last_desc) do
       :ok ->
         {[timer_interval: {:demand_timer, :no_interval}, demand: :input], state}
 
@@ -94,7 +99,7 @@ defmodule Membrane.DRM.PrimePlayer do
   @impl true
   def handle_end_of_stream(:input, _ctx, %{display: display} = state) do
     if display do
-      case DrmPrime.close_display(display) do
+      case Native.close_display(display) do
         :ok -> :ok
         {:error, reason} -> Membrane.Logger.warning("Failed to close display: #{inspect(reason)}")
       end
@@ -106,7 +111,7 @@ defmodule Membrane.DRM.PrimePlayer do
   @impl true
   def handle_terminate_request(_ctx, %{display: display} = state) do
     if display do
-      case DrmPrime.close_display(display) do
+      case Native.close_display(display) do
         :ok -> :ok
         {:error, reason} -> Membrane.Logger.warning("Failed to close display: #{inspect(reason)}")
       end

@@ -29,7 +29,7 @@ impl AsFd for Fd {
 }
 
 #[derive(rustler::NifStruct)]
-#[module = "Membrane.DRM.PrimePlane"]
+#[module = "Membrane.PrimePlane"]
 struct PrimePlane {
     fd: Fd,
     pitch: u32,
@@ -56,7 +56,7 @@ impl<'a> rustler::Decoder<'a> for Fourcc {
 }
 
 #[derive(rustler::NifStruct)]
-#[module = "Membrane.DRM.Prime"]
+#[module = "Membrane.PrimeDesc"]
 struct PrimeDesc {
     width: u32,
     height: u32,
@@ -92,6 +92,7 @@ struct Decoder {
     inner: Mutex<DecoderInner>,
 }
 
+#[allow(dead_code)]
 struct Keepalive {
     resource: Video,
 }
@@ -110,14 +111,14 @@ impl Drop for Decoder {
     }
 }
 
-fn init_decoder() -> Result<Decoder> {
+fn init_decoder(hw_device: String) -> Result<Decoder> {
     ffmpeg::init().context("ffmpeg init failed")?;
     let hevc = codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?;
     let mut decoder = codec::decoder::new();
 
     unsafe {
         let mut hw_device_ctx = std::ptr::null_mut();
-        let path = CString::new("/dev/dri/renderD129").context("device path")?;
+        let path = CString::new(hw_device).context("device path")?;
         if sys::av_hwdevice_ctx_create(
             &mut hw_device_ctx,
             sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
@@ -143,13 +144,16 @@ fn init_decoder() -> Result<Decoder> {
 
 #[allow(non_local_definitions)]
 fn load(env: rustler::Env, _info: rustler::Term) -> bool {
-    assert!(rustler::resource!(Keepalive, env), "regisetr Keepalive resource failed");
+    assert!(
+        rustler::resource!(Keepalive, env),
+        "regisetr Keepalive resource failed"
+    );
     rustler::resource!(Decoder, env)
 }
 
 #[rustler::nif]
-fn create() -> NifResult<ResourceArc<Decoder>> {
-    init_decoder()
+fn create(hw_device: String) -> NifResult<ResourceArc<Decoder>> {
+    init_decoder(hw_device)
         .map(ResourceArc::new)
         .map_err(|_| rustler::Error::Atom("create_failed"))
 }
@@ -212,10 +216,9 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
     })
 }
 
-fn decode_frames<'a>(
-    env: Env<'a>,
-    inner: &mut DecoderInner,
-) -> NifResult<(Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>)> {
+type DecodeResult<'a> = (Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>);
+
+fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> NifResult<DecodeResult<'a>> {
     let mut frames = Vec::new();
     let mut pts_list = Vec::new();
     let mut decoded = Video::empty();
@@ -247,6 +250,8 @@ fn decode_frames<'a>(
     Ok((pts_list, frames, keepalives))
 }
 
+type DecodeResultWithOk<'a> = (Atom, Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>);
+
 #[rustler::nif(schedule = "DirtyCpu")]
 fn decode<'a>(
     env: Env<'a>,
@@ -254,7 +259,7 @@ fn decode<'a>(
     data: Binary<'a>,
     pts: i64,
     dts: i64,
-) -> NifResult<(Atom, Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>)> {
+) -> NifResult<DecodeResultWithOk<'a>> {
     let mut packet = Packet::copy(data.as_slice());
     packet.set_pts((pts != NO_PTS).then_some(pts));
     packet.set_dts((dts != NO_PTS).then_some(dts));
@@ -272,10 +277,7 @@ fn decode<'a>(
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn flush<'a>(
-    env: Env<'a>,
-    state: ResourceArc<Decoder>,
-) -> NifResult<(Atom, Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>)> {
+fn flush<'a>(env: Env<'a>, state: ResourceArc<Decoder>) -> NifResult<DecodeResultWithOk<'a>> {
     let mut inner = state
         .inner
         .lock()

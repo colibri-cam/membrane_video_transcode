@@ -1,4 +1,4 @@
-defmodule Membrane.H265Decoder do
+defmodule Membrane.H265.Decoder do
   @moduledoc """
   Membrane filter that decodes H265 video using a Rustler NIF with VAAPI acceleration.
   """
@@ -8,7 +8,7 @@ defmodule Membrane.H265Decoder do
   alias __MODULE__.Native
   alias Membrane.Buffer
   alias Membrane.H265
-  alias Membrane.H265Decoder.Common
+  alias Membrane.H265.Common
   alias Membrane.RawVideo
 
   @typedoc """

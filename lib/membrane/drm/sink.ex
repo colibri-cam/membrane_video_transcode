@@ -1,9 +1,9 @@
-defmodule Membrane.DRM.Player do
+defmodule Membrane.DRM.Sink do
   @moduledoc """
   Membrane sink that renders raw video frames on a DRM display.
 
   The sink supports a range of pixel formats and uses a native NIF implemented
-  in `DrmSink` to present frames on screen.
+  in `Membrane.DRM.Sink.Native` to present frames on screen.
 
   ## Options
 
@@ -18,6 +18,7 @@ defmodule Membrane.DRM.Player do
 
   alias Membrane.Buffer
   alias Membrane.RawVideo
+  alias Membrane.DRM.Sink.Native
 
   @formats [
     :I420,
@@ -69,17 +70,15 @@ defmodule Membrane.DRM.Player do
 
       true ->
         pixel_format = state.pixel_format || fmt
-        {:ok, display} = DrmSink.init_display(state.card, pixel_format)
+        {:ok, display} = Native.init_display(state.card, pixel_format)
         {[], %{state | display: display, pixel_format: pixel_format}}
     end
   end
-
 
   @impl true
   def handle_start_of_stream(:input, _ctx, state) do
     {[demand: :input, start_timer: {:demand_timer, :no_interval}], state}
   end
-
 
   @impl true
   def handle_buffer(:input, %Buffer{payload: payload, pts: pts}, _ctx, state) do
@@ -88,7 +87,7 @@ defmodule Membrane.DRM.Player do
     actions =
       case state do
         %{last_pts: nil, last_payload: nil} ->
-          case DrmSink.display_frame(state.display, payload) do
+          case Native.display_frame(state.display, payload) do
             :ok -> [demand: :input]
             {:error, reason} -> raise "Failed to display frame: #{inspect(reason)}"
           end
@@ -103,7 +102,7 @@ defmodule Membrane.DRM.Player do
   @impl true
   def handle_end_of_stream(:input, _ctx, %{display: display} = state) do
     if display do
-      case DrmSink.close_display(display) do
+      case Native.close_display(display) do
         :ok ->
           :ok
 
@@ -121,7 +120,7 @@ defmodule Membrane.DRM.Player do
   end
 
   def handle_tick(:demand_timer, _ctx, state) do
-    case DrmSink.display_frame(state.display, state.last_payload) do
+    case Native.display_frame(state.display, state.last_payload) do
       :ok ->
         {[timer_interval: {:demand_timer, :no_interval}, demand: :input], state}
 
@@ -133,7 +132,7 @@ defmodule Membrane.DRM.Player do
   @impl true
   def handle_terminate_request(_ctx, %{display: display} = state) do
     if display do
-      case DrmSink.close_display(display) do
+      case Native.close_display(display) do
         :ok ->
           :ok
 
