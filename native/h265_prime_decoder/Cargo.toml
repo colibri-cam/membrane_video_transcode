@@ -1,0 +1,21 @@
+[package]
+name = "h265_prime_decoder"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "h265_prime_decoder"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+ffmpeg-next = { version = "7.1", features = ["codec", "format", "software-scaling"] }
+rustler = "0.36"
+libc = "0.2"
+drm-fourcc = "2.2"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
