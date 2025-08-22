@@ -287,6 +287,12 @@ fn flush<'a>(
 }
 
 #[rustler::nif]
+fn close(state: ResourceArc<Decoder>) -> NifResult<Atom> {
+    drop(state);
+    Ok(atoms::ok())
+}
+
+#[rustler::nif]
 fn get_metadata(state: ResourceArc<Decoder>) -> NifResult<(Atom, u32, u32, Atom)> {
     let inner = state.inner.lock().map_err(|_| Error::Atom("lock"))?;
     let width = inner.decoder.width();

@@ -3,7 +3,7 @@ defmodule Membrane.H265.PrimeDecoder do
   Variant of `Membrane.H265.Decoder` that returns DRM Prime descriptors instead of
   raw frame payloads. Each decoded frame is sent downstream as an empty buffer
   with the descriptor attached under the `:drm_prime` metadata key.
-  
+
   It also returns keepalive which is a reference to AV frame in GPU
   memory. When reference gets GCed AV frame get's release. Keep
   keepalive in pipeline until prime descriptor reaches consumer.
@@ -17,11 +17,13 @@ defmodule Membrane.H265.PrimeDecoder do
   alias Membrane.H265
   alias Membrane.H265.Common
 
-  def_options hw_device: [
-    spec: String.t(),
-    default: "/dev/dri/renderD129",
-    description: "Hw device to use"
-  ]
+  def_options(
+    hw_device: [
+      spec: String.t(),
+      default: "/dev/dri/renderD129",
+      description: "Hw device to use"
+    ]
+  )
 
   def_input_pad(:input,
     flow_control: :auto,
@@ -76,12 +78,22 @@ defmodule Membrane.H265.PrimeDecoder do
   def handle_end_of_stream(:input, _ctx, %{decoder_ref: decoder} = state) do
     with {:ok, pts_list, descs, keepalives} <- Native.flush(decoder),
          bufs <- wrap_descriptors(pts_list, descs, keepalives) do
+      _ = Native.close(decoder)
       new_state = %{state | decoder_ref: nil}
       {bufs ++ [end_of_stream: :output], new_state}
     else
       {:error, reason} ->
         raise "Native decoder failed to flush: #{inspect(reason)}"
     end
+  end
+
+  @impl true
+  def handle_terminate_request(_ctx, %{decoder_ref: decoder} = state) do
+    if decoder do
+      _ = Native.close(decoder)
+    end
+
+    {[terminate: :normal], %{state | decoder_ref: nil}}
   end
 
   defp wrap_descriptors([], [], []), do: []
