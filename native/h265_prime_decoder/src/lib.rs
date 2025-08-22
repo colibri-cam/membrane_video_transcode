@@ -291,6 +291,16 @@ fn flush<'a>(env: Env<'a>, state: ResourceArc<Decoder>) -> NifResult<DecodeResul
 }
 
 #[rustler::nif]
+fn close(state: ResourceArc<Decoder>) -> NifResult<Atom> {
+    let mut inner = state
+        .inner
+        .lock()
+        .map_err(|_| rustler::Error::Atom("lock"))?;
+    inner.decoder.flush();
+    Ok(ok())
+}
+
+#[rustler::nif]
 fn get_metadata(state: ResourceArc<Decoder>) -> NifResult<(Atom, u32, u32)> {
     let inner = state
         .inner
