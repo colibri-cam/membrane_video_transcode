@@ -182,24 +182,68 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
         unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
         return Err(anyhow!("empty drm descriptor"));
     }
+
+// Pre-dup all object fds once
+    let mut obj_fds: Vec<Option<OwnedFd>> = Vec::with_capacity(desc.nb_objects as usize);
+    for j in 0..desc.nb_objects as usize {
+        let ofd = desc.objects[j].fd;
+        if ofd >= 0 {
+            let dupfd = unsafe { libc::dup(ofd) };
+            if dupfd < 0 {
+                unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
+                return Err(anyhow!("dup failed for object {j}"));
+            }
+            obj_fds.push(Some(unsafe { OwnedFd::from_raw_fd(dupfd) }));
+        } else {
+            // Leave as None for now; we may patch it up below if it’s a bogus extra object.
+            obj_fds.push(None);
+        }
+    }
+
+    // Heuristic: if we have at least one valid object (usually 0),
+    // allow planes whose object points to an invalid fd to reuse object 0.
+    let fallback_obj0 = obj_fds.get(0).and_then(|x| x.as_ref()).map(|fd| fd.as_raw_fd());
     let mut planes = Vec::new();
+
     for l in 0..desc.nb_layers as usize {
         let layer = &desc.layers[l];
         for i in 0..layer.nb_planes as usize {
             let p = layer.planes[i];
-            let obj = p.object_index as usize;
-            if obj >= desc.nb_objects as usize {
+            let obj = p.object_index as isize;
+            if obj < 0 || (obj as usize) >= desc.nb_objects as usize {
                 unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
-                return Err(anyhow!("invalid object index"));
+                return Err(anyhow!("invalid object index {} for plane {}", obj, i));
             }
-            let fd = unsafe { libc::dup(desc.objects[obj].fd) };
-            if fd < 0 {
+            let obj_idx = obj as usize;
+
+            // Ensure we have a usable fd for this plane’s object
+            let fd_owned = if let Some(fd) = &obj_fds[obj_idx] {
+                // Okay, valid object fd
+                let dupfd = unsafe { libc::dup(fd.as_raw_fd()) };
+                if dupfd < 0 {
+                    unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
+                    return Err(anyhow!("dup failed (plane {i}, object {obj_idx})"));
+                }
+                unsafe { OwnedFd::from_raw_fd(dupfd) }
+            } else if let Some(fd0) = fallback_obj0 {
+                // Workaround for buggy “second object with fd = -1” cases:
+                // reuse object 0’s fd; planes differ by offset/pitch anyway.
+                let dupfd = unsafe { libc::dup(fd0) };
+                if dupfd < 0 {
+                    unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
+                    return Err(anyhow!("dup failed (plane {i}, fallback obj0)"));
+                }
+                unsafe { OwnedFd::from_raw_fd(dupfd) }
+            } else {
                 unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
-                return Err(anyhow!("dup failed"));
-            }
-            let obj_desc = desc.objects[obj];
+                return Err(anyhow!(
+                    "no valid dma-buf fd for plane {i} (object {obj_idx})"
+                ));
+            };
+
+            let obj_desc = desc.objects[obj_idx];
             planes.push(PrimePlane {
-                fd: Fd(unsafe { OwnedFd::from_raw_fd(fd) }),
+                fd: Fd(fd_owned),
                 pitch: p.pitch as u32,
                 offset: p.offset as u32,
                 modifier: Some(obj_desc.format_modifier),
@@ -218,7 +262,7 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
 
 type DecodeResult<'a> = (Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>);
 
-fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> NifResult<DecodeResult<'a>> {
+fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> Result<DecodeResult<'a>> {
     let mut frames = Vec::new();
     let mut pts_list = Vec::new();
     let mut decoded = Video::empty();
@@ -229,8 +273,14 @@ fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> NifResult<Decode
             Ok(_) => {
                 inner.width = decoded.width();
                 inner.height = decoded.height();
-                let desc =
-                    export_drm_prime(&decoded).map_err(|_| rustler::Error::Atom("export"))?;
+                let desc = match export_drm_prime(&decoded) {
+                    Ok(desc) => desc,
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        unsafe { sys::av_frame_unref(decoded.as_mut_ptr()) };
+                        continue;
+                    },
+                };
                 let mut res = Video::empty();
                 unsafe {
                     // keepalive now references the same underlying surface
@@ -244,7 +294,10 @@ fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> NifResult<Decode
             }
             Err(ffmpeg::Error::Eof) => break,
             Err(ffmpeg::Error::Other { errno }) if errno == EAGAIN => break,
-            Err(_) => return Err(rustler::Error::Atom("decode")),
+            Err(e) => {
+                    eprintln!("Error: {e}");
+                    return Err(anyhow!("decode failed"));
+            },
         }
     }
     Ok((pts_list, frames, keepalives))
@@ -272,7 +325,10 @@ fn decode<'a>(
         .decoder
         .send_packet(&packet)
         .map_err(|_| rustler::Error::Atom("send_packet"))?;
-    let (pts_list, frames, keepalives) = decode_frames(env, &mut inner)?;
+    let (pts_list, frames, keepalives) = decode_frames(env, &mut inner).map_err(|e| {
+        eprintln!("Error: {e}");
+        rustler::Error::Atom("decode")
+    })?;
     Ok((ok(), pts_list, frames, keepalives))
 }
 
@@ -286,7 +342,10 @@ fn flush<'a>(env: Env<'a>, state: ResourceArc<Decoder>) -> NifResult<DecodeResul
         .decoder
         .send_eof()
         .map_err(|_| rustler::Error::Atom("send_eof"))?;
-    let (pts_list, frames, keepalives) = decode_frames(env, &mut inner)?;
+    let (pts_list, frames, keepalives) = decode_frames(env, &mut inner).map_err(|e| {
+        eprintln!("Error: {e}");
+        rustler::Error::Atom("decode")
+    })?;
     Ok((ok(), pts_list, frames, keepalives))
 }
 
