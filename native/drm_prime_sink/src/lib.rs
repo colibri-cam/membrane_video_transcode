@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::fs::OpenOptions;
 use std::io;
@@ -173,6 +174,20 @@ fn enable_atomic(card: &Card) -> std::io::Result<()> {
     card.set_client_capability(ClientCapability::UniversalPlanes, true)?;
     card.set_client_capability(ClientCapability::Atomic, true)?;
     log!("Enabled client caps: UNIVERSAL_PLANES + ATOMIC");
+    Ok(())
+}
+
+fn close_unique_handles<F, H>(handles: &[Option<H>], mut close_fn: F) -> std::io::Result<()>
+where
+    H: Eq + std::hash::Hash + Copy,
+    F: FnMut(H) -> std::io::Result<()>,
+{
+    let mut seen = HashSet::new();
+    for h in handles.iter().flatten().copied() {
+        if seen.insert(h) {
+            close_fn(h)?;
+        }
+    }
     Ok(())
 }
 
@@ -402,15 +417,15 @@ impl DisplayInner {
         };
         if let Err(e) = self.card.atomic_commit(flags, req) {
             let _ = self.card.destroy_framebuffer(new_fb.fb);
-            for &h in new_fb.handles.iter().flatten() {
-                self.card.close_buffer(h)?;
-            }
+            close_unique_handles(&new_fb.handles, |h| self.card.close_buffer(h))?;
             return Err(std::io::Error::new(e.kind(), format!("atomic commit: {e}")));
         };
         if let Some(stale_fb) = self.stale.take() {
             log!("Dropping stale framebuffer {:?}\n", stale_fb);
             // 1) Drop the KMS FB
             self.card.destroy_framebuffer(stale_fb.fb)?;
+            // 2) Close handles
+            close_unique_handles(&new_fb.handles, |h| self.card.close_buffer(h))?;
         }
 
         self.stale = self.in_flight.take();
@@ -488,15 +503,11 @@ impl Drop for DisplayInner {
     fn drop(&mut self) {
         if let Some(FbWithHandles { fb, handles }) = self.stale.take() {
             let _ = self.card.destroy_framebuffer(fb);
-            for &h in handles.iter().flatten() {
-                let _ = self.card.close_buffer(h);
-            }
+            let _ =  close_unique_handles(&handles, |h| self.card.close_buffer(h));
         }
         if let Some(FbWithHandles { fb, handles }) = self.in_flight.take() {
             let _ = self.card.destroy_framebuffer(fb);
-            for &h in handles.iter().flatten() {
-                let _ = self.card.close_buffer(h);
-            }
+            let _ =  close_unique_handles(&handles, |h| self.card.close_buffer(h));
         }
         let _ = self.card.destroy_property_blob(self.mode_blob);
     }
@@ -577,7 +588,10 @@ fn load(env: rustler::Env, _info: rustler::Term) -> bool {
 #[rustler::nif]
 fn init_display(card_path: String) -> NifResult<(Atom, ResourceArc<DisplayRes>)> {
     let display = Display::new(&card_path).map_err(nif_err)?;
-    Ok((ok(), ResourceArc::new(DisplayRes(Mutex::new(Some(display))))))
+    Ok((
+        ok(),
+        ResourceArc::new(DisplayRes(Mutex::new(Some(display)))),
+    ))
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
