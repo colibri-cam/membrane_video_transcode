@@ -12,11 +12,18 @@ defmodule Membrane.DRM.PrimeSink do
   alias Membrane.PrimeFormat
   alias Membrane.DRM.PrimeSink.Native
 
-  def_options card: [
-    spec: String.t(),
-    default: "/dev/dri/card0",
-    description: "Graphic card to use"
-  ]
+  def_options(
+    card: [
+      spec: String.t(),
+      default: "/dev/dri/card0",
+      description: "Graphic card to use"
+    ],
+    ignore_pts: [
+      spec: boolean,
+      default: false,
+      description: "Consume frames as fast as possible, skips frames beetween vblanks"
+    ]
+  )
 
   def_input_pad(:input,
     accepted_format: %PrimeFormat{},
@@ -26,15 +33,14 @@ defmodule Membrane.DRM.PrimeSink do
 
   @impl true
   def handle_init(_ctx, opts) do
-    card = opts.card
-
     {[],
      %{
+       ignore_pts: opts.ignore_pts,
        display: nil,
        last_pts: nil,
        last_desc: nil,
        last_keepalive: nil,
-       card: card
+       card: opts.card
      }}
   end
 
@@ -43,8 +49,8 @@ defmodule Membrane.DRM.PrimeSink do
 
   @impl true
   def handle_stream_format(:input, %PrimeFormat{}, _ctx, %{display: nil} = state) do
-      {:ok, display} = Native.init_display(state.card)
-      {[], %{state | display: display}}
+    {:ok, display} = Native.init_display(state.card)
+    {[], %{state | display: display}}
   end
 
   def handle_stream_format(:input, _, _ctx, state), do: {[], state}
@@ -52,6 +58,24 @@ defmodule Membrane.DRM.PrimeSink do
   @impl true
   def handle_start_of_stream(:input, _ctx, state) do
     {[demand: :input], state}
+  end
+
+  @impl true
+  def handle_buffer(
+        :input,
+        %Buffer{metadata: %{drm_prime: desc, keepalive: keepalive}},
+        _ctx,
+        %{ignore_pts: true} = state
+      ) do
+
+    case Native.display_prime(state.display, desc) do
+      :ok ->
+        {[demand: :input], %{state | last_desc: desc, last_keepalive: keepalive}}
+
+      {:error, reason} ->
+        Membrane.Logger.error("Failed to display frame: #{inspect(reason)}")
+        raise "Failed to display frame: #{inspect(reason)}"
+    end
   end
 
   @impl true
@@ -101,11 +125,16 @@ defmodule Membrane.DRM.PrimeSink do
     if display do
       case Native.close_display(display) do
         :ok -> :ok
-        {:error, reason} -> Membrane.Logger.warning("Failed to close display: #{inspect(reason)}")
+        {:error, reason} -> Membrane.Logger.error("Failed to close display: #{inspect(reason)}")
       end
     end
 
-    {[stop_timer: :demand_timer], %{state | display: nil}}
+    actions =
+      if state.ignore_pts,
+        do: [],
+        else: [stop_timer: :demand_timer]
+
+    {actions, %{state | display: nil}}
   end
 
   @impl true
