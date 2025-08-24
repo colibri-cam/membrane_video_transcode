@@ -18,6 +18,11 @@ defmodule Membrane.DRM.PrimeSink do
       default: "/dev/dri/card0",
       description: "Graphic card to use"
     ],
+    preferred_mode: [
+      spec: {pos_integer(), pos_integer(), pos_integer()} | nil,
+      default: nil,
+      description: "Preferred video mode as {width, height, framerate}"
+    ],
     ignore_pts: [
       spec: boolean,
       default: false,
@@ -40,7 +45,8 @@ defmodule Membrane.DRM.PrimeSink do
        last_pts: nil,
        last_desc: nil,
        last_keepalive: nil,
-       card: opts.card
+       card: opts.card,
+       preferred_mode: opts.preferred_mode
      }}
   end
 
@@ -49,7 +55,7 @@ defmodule Membrane.DRM.PrimeSink do
 
   @impl true
   def handle_stream_format(:input, %PrimeFormat{}, _ctx, %{display: nil} = state) do
-    {:ok, display} = Native.init_display(state.card)
+    {:ok, display} = Native.init_display(state.card, state.preferred_mode)
     {[], %{state | display: display}}
   end
 
@@ -67,7 +73,6 @@ defmodule Membrane.DRM.PrimeSink do
         _ctx,
         %{ignore_pts: true} = state
       ) do
-
     case Native.display_prime(state.display, desc) do
       :ok ->
         {[demand: :input], %{state | last_desc: desc, last_keepalive: keepalive}}
