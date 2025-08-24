@@ -88,14 +88,25 @@ defmodule Membrane.H265.Decoder do
 
   @impl true
   def handle_end_of_stream(:input, _ctx, %{decoder_ref: decoder} = state) do
-    with {:ok, pts_list, frames} <- Native.flush(decoder),
-         bufs <- wrap_frames(pts_list, frames) do
-      new_state = %{state | decoder_ref: nil}
-      {bufs ++ [end_of_stream: :output], new_state}
-    else
+    case Native.flush(decoder) do
+      {:ok, pts_list, frames} ->
+        :ok = Native.close(decoder)
+        bufs = wrap_frames(pts_list, frames)
+        new_state = %{state | decoder_ref: nil}
+        {bufs ++ [end_of_stream: :output], new_state}
+
       {:error, reason} ->
         raise "Native decoder failed to flush: #{inspect(reason)}"
     end
+  end
+
+  @impl true
+  def handle_terminate_request(_ctx, %{decoder_ref: decoder} = state) do
+    if decoder do
+      :ok = Native.close(decoder)
+    end
+
+    {[terminate: :normal], %{state | decoder_ref: nil}}
   end
 
   defp wrap_frames([], []), do: []
