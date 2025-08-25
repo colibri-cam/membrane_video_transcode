@@ -210,7 +210,7 @@ fn find_prop(
 }
 
 impl DisplayInner {
-    fn new(card_path: &str) -> std::io::Result<Self> {
+    fn new(card_path: &str, preferred_mode: Option<(u32, u32, u32)>) -> std::io::Result<Self> {
         let card = open_card(card_path)
             .map_err(|e| std::io::Error::new(e.kind(), format!("open card: {e}")))?;
         enable_atomic(&card)
@@ -257,9 +257,39 @@ impl DisplayInner {
         })?;
 
         log!("Selected CRTC: id={}", u32::from(crtc));
-        let mode = conn.modes().first().copied().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "connector has no modes")
-        })?;
+        let modes = conn.modes();
+        let mode = if let Some((w, h, r)) = preferred_mode {
+            modes
+                .iter()
+                .find(|m| {
+                    let size = m.size();
+                    u32::from(size.0) == w && u32::from(size.1) == h && m.vrefresh() == r
+                })
+                .copied()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("preferred mode {w}x{h}@{r} not found"),
+                    )
+                })?
+        } else {
+            modes
+                .iter()
+                .max_by(|a, b| {
+                    let size_a = a.size();
+                    let size_b = b.size();
+                    let area_a = u32::from(size_a.0) * u32::from(size_a.1);
+                    let area_b = u32::from(size_b.0) * u32::from(size_b.1);
+                    match area_a.cmp(&area_b) {
+                        std::cmp::Ordering::Equal => a.vrefresh().cmp(&b.vrefresh()),
+                        other => other,
+                    }
+                })
+                .copied()
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "connector has no modes")
+                })?
+        };
         log!(
             "Selected mode: {}x{}@{}",
             mode.size().0,
@@ -503,11 +533,11 @@ impl Drop for DisplayInner {
     fn drop(&mut self) {
         if let Some(FbWithHandles { fb, handles }) = self.stale.take() {
             let _ = self.card.destroy_framebuffer(fb);
-            let _ =  close_unique_handles(&handles, |h| self.card.close_buffer(h));
+            let _ = close_unique_handles(&handles, |h| self.card.close_buffer(h));
         }
         if let Some(FbWithHandles { fb, handles }) = self.in_flight.take() {
             let _ = self.card.destroy_framebuffer(fb);
-            let _ =  close_unique_handles(&handles, |h| self.card.close_buffer(h));
+            let _ = close_unique_handles(&handles, |h| self.card.close_buffer(h));
         }
         let _ = self.card.destroy_property_blob(self.mode_blob);
     }
@@ -538,8 +568,8 @@ struct Display {
 }
 
 impl Display {
-    fn new(card_path: &str) -> std::io::Result<Self> {
-        let inner = DisplayInner::new(card_path)?;
+    fn new(card_path: &str, preferred_mode: Option<(u32, u32, u32)>) -> std::io::Result<Self> {
+        let inner = DisplayInner::new(card_path, preferred_mode)?;
         let (tx, rx) = mpsc::channel();
         let err = Arc::new(Mutex::new(None));
         let err_clone = Arc::clone(&err);
@@ -586,8 +616,11 @@ fn load(env: rustler::Env, _info: rustler::Term) -> bool {
 }
 
 #[rustler::nif]
-fn init_display(card_path: String) -> NifResult<(Atom, ResourceArc<DisplayRes>)> {
-    let display = Display::new(&card_path).map_err(nif_err)?;
+fn init_display(
+    card_path: String,
+    preferred_mode: Option<(u32, u32, u32)>,
+) -> NifResult<(Atom, ResourceArc<DisplayRes>)> {
+    let display = Display::new(&card_path, preferred_mode).map_err(nif_err)?;
     Ok((
         ok(),
         ResourceArc::new(DisplayRes(Mutex::new(Some(display)))),
