@@ -13,8 +13,8 @@ This document outlines proposed changes required for the H265 decoder, H265 prim
 - Handle the NV12 pixel format produced by the Raspberry Pi hardware decoder without additional copies.
 
 ## Sink NIF Changes
-- Select the `vc7` DRM driver used on the Pi 5 instead of assuming `card0`.
-- Add plane and connector selection logic based on `vc7` DRM capabilities so the correct HDMI output is used.
+- Select the `vc4` DRM driver used on the Pi 5 instead of assuming `card0`.
+- Add plane and connector selection logic based on `vc4` DRM capabilities so the correct HDMI output is used.
 - Support modifiers required by the Raspberry Pi framebuffer, e.g., `DRM_FORMAT_MOD_BROADCOM_SAND128` for direct scan‑out. These updates cover both the standard DRM sink and the DRM prime sink NIFs.
 
 ## Testing

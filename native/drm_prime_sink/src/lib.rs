@@ -142,21 +142,21 @@ impl AsFd for Card {
 impl drm::Device for Card {}
 impl control::Device for Card {}
 
-fn driver_is_vc7(card: &Card) -> bool {
+fn driver_is_vc4(card: &Card) -> bool {
     card.get_driver()
         .ok()
         .and_then(|info| info.name().to_str().map(|s| s.to_owned()))
-        .map(|name| name.contains("vc7"))
+        .map(|name| name.contains("vc4"))
         .unwrap_or(false)
 }
 
-fn find_vc7_card() -> std::io::Result<String> {
+fn find_vc4_card() -> std::io::Result<String> {
     for entry in std::fs::read_dir("/dev/dri")? {
         let path = entry?.path();
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
             if name.starts_with("card") {
                 if let Ok(card) = open_card(path.to_str().unwrap()) {
-                    if driver_is_vc7(&card) {
+                    if driver_is_vc4(&card) {
                         return Ok(path.to_string_lossy().into_owned());
                     }
                 }
@@ -165,13 +165,13 @@ fn find_vc7_card() -> std::io::Result<String> {
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "No vc7 DRM device",
+        "No vc4 DRM device",
     ))
 }
 
 struct DisplayInner {
     card: Card,
-    is_vc7: bool,
+    is_vc4: bool,
     conn: connector::Handle,
     crtc: crtc::Handle,
     plane: plane::Handle,
@@ -299,13 +299,13 @@ impl DisplayInner {
     fn new(card_path: &str, preferred_mode: Option<(u32, u32, u32)>) -> std::io::Result<Self> {
         let card = open_card(card_path)
             .map_err(|e| std::io::Error::new(e.kind(), format!("open card: {e}")))?;
-        let is_vc7 = driver_is_vc7(&card);
+        let is_vc4 = driver_is_vc4(&card);
         enable_atomic(&card)
             .map_err(|e| std::io::Error::new(e.kind(), format!("enable atomic: {e}")))?;
         let res = card
             .resource_handles()
             .map_err(|e| std::io::Error::new(e.kind(), format!("get resources: {e}")))?;
-        let conn = pick_connected_connector(&card, &res, is_vc7)?;
+        let conn = pick_connected_connector(&card, &res, is_vc4)?;
         let enc = conn.encoders().first().copied().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "connector has no encoders")
         })?;
@@ -372,7 +372,7 @@ impl DisplayInner {
                 let allowed = res.filter_crtcs(info.possible_crtcs());
                 if allowed.contains(&crtc)
                     && info.formats().contains(&(buffer::DrmFourcc::Nv12 as u32))
-                    && (!is_vc7 || plane_is_primary(&card, *p))
+                    && (!is_vc4 || plane_is_primary(&card, *p))
                 {
                     Some(*p)
                 } else {
@@ -411,7 +411,7 @@ impl DisplayInner {
 
         Ok(Self {
             card,
-            is_vc7,
+            is_vc4,
             conn: conn.handle(),
             crtc,
             plane,
@@ -568,7 +568,7 @@ impl DisplayInner {
             }
         }
         let mut modifier = common_mod.map(DrmModifier::from);
-        if modifier.is_none() && self.is_vc7 {
+        if modifier.is_none() && self.is_vc4 {
             modifier = Some(DrmModifier::from(DRM_FORMAT_MOD_BROADCOM_SAND128));
         }
 
@@ -691,7 +691,7 @@ fn init_display(
     preferred_mode: Option<(u32, u32, u32)>,
 ) -> NifResult<(Atom, ResourceArc<DisplayRes>)> {
     let path = if card_path.is_empty() {
-        find_vc7_card().map_err(nif_err)?
+        find_vc4_card().map_err(nif_err)?
     } else {
         card_path
     };

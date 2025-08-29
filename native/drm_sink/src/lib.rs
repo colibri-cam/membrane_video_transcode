@@ -142,28 +142,28 @@ fn err(msg: &str) -> Error {
 }
 
 // ---------- helpers ----------
-fn driver_is_vc7(card: &Card) -> bool {
+fn driver_is_vc4(card: &Card) -> bool {
     card.get_driver()
         .ok()
         .and_then(|info| info.name().to_str().map(|s| s.to_owned()))
-        .map(|name| name.contains("vc7"))
+        .map(|name| name.contains("vc4"))
         .unwrap_or(false)
 }
 
-fn find_vc7_card() -> Result<String> {
+fn find_vc4_card() -> Result<String> {
     for entry in std::fs::read_dir("/dev/dri")? {
         let path = entry?.path();
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
             if name.starts_with("card") {
                 if let Ok(card) = open_card(path.to_str().unwrap()) {
-                    if driver_is_vc7(&card) {
+                    if driver_is_vc4(&card) {
                         return Ok(path.to_string_lossy().into_owned());
                     }
                 }
             }
         }
     }
-    Err(err("No vc7 DRM device"))
+    Err(err("No vc4 DRM device"))
 }
 
 /// Enable universal planes and atomic modesetting capabilities.
@@ -673,16 +673,16 @@ struct DisplayInner {
 impl Display {
     fn new(card_path: &str, fmt: PixelFormat) -> Result<(Self, u32, u32)> {
         let raw_card = open_card(card_path)?;
-        let is_vc7 = driver_is_vc7(&raw_card);
+        let is_vc4 = driver_is_vc4(&raw_card);
         let card = Arc::new(raw_card);
         enable_atomic_caps(&card)?;
         let res = get_resources(&card)?;
-        let conn = pick_connected_connector(&card, &res, is_vc7)?;
+        let conn = pick_connected_connector(&card, &res, is_vc4)?;
         let (_enc, crtc_h) = pick_encoder_and_crtc(&card, &conn)?;
         let mode = pick_mode(&conn)?;
         let (w16, h16) = mode.size();
         let (w, h) = (w16 as u32, h16 as u32);
-        let modifier = if is_vc7 {
+        let modifier = if is_vc4 {
             Some(drm::buffer::DrmModifier::from(
                 DRM_FORMAT_MOD_BROADCOM_SAND128,
             ))
@@ -851,7 +851,7 @@ fn init_display<'a>(
         .map_err(|e| nif_error(format!("{e:?}")))?;
     let pf = PixelFormat::from_str(&pf_str).ok_or_else(|| nif_error("unknown pixel format"))?;
     let path = if card_path.is_empty() {
-        find_vc7_card().map_err(nif_error)?
+        find_vc4_card().map_err(nif_error)?
     } else {
         card_path
     };
