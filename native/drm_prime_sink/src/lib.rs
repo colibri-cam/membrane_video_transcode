@@ -521,8 +521,8 @@ impl DisplayInner {
             log!("Dropping stale framebuffer {:?}\n", stale_fb);
             // 1) Drop the KMS FB
             self.card.destroy_framebuffer(stale_fb.fb)?;
-            // 2) Close handles
-            close_unique_handles(&new_fb.handles, |h| self.card.close_buffer(h))?;
+            // 2) Close handles associated with the stale framebuffer
+            close_unique_handles(&stale_fb.handles, |h| self.card.close_buffer(h))?;
         }
 
         self.stale = self.in_flight.take();
