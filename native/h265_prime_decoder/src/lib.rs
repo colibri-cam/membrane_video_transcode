@@ -180,6 +180,32 @@ fn create(hw_device: String) -> NifResult<ResourceArc<Decoder>> {
         .map_err(|_| rustler::Error::Atom("create_failed"))
 }
 
+fn derive_fourcc(desc: &sys::AVDRMFrameDescriptor) -> Result<DrmFourcc> {
+    match desc.nb_layers {
+        1 => DrmFourcc::try_from(desc.layers[0].format as u32)
+            .map_err(|_| anyhow!("unsupported fourcc {:#x}", desc.layers[0].format)),
+        2 => {
+            let l0 = DrmFourcc::try_from(desc.layers[0].format as u32);
+            let l1 = DrmFourcc::try_from(desc.layers[1].format as u32);
+            if let (Ok(DrmFourcc::R8), Ok(DrmFourcc::Gr88))
+            | (Ok(DrmFourcc::Gr88), Ok(DrmFourcc::R8)) = (l0, l1)
+            {
+                Ok(DrmFourcc::Nv12)
+            } else {
+                Err(anyhow!(
+                    "unsupported layer formats {:#x} and {:#x}",
+                    desc.layers[0].format,
+                    desc.layers[1].format
+                ))
+            }
+        }
+        _ => Err(anyhow!(
+            "unsupported DRM layer combination {}",
+            desc.nb_layers
+        )),
+    }
+}
+
 fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
     let hw_frames_ctx = unsafe { (*frame.as_ptr()).hw_frames_ctx };
     if hw_frames_ctx.is_null() {
@@ -215,8 +241,7 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
         return Err(anyhow!("empty drm descriptor"));
     }
 
-    let fourcc = DrmFourcc::try_from(desc.layers[0].format as u32)
-        .map_err(|_| anyhow!("unsupported fourcc {:#x}", desc.layers[0].format))?;
+    let fourcc = derive_fourcc(desc)?;
 
     // Pre-dup all object fds once
     let mut obj_fds: Vec<Option<OwnedFd>> = Vec::with_capacity(desc.nb_objects as usize);
