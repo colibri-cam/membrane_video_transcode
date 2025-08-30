@@ -16,6 +16,8 @@ use drm::{ClientCapability, Device as _, buffer, control};
 use drm_fourcc::DrmFourcc;
 use rustler::{Atom, Decoder, Encoder, NifResult, ResourceArc};
 
+const DRM_FORMAT_MOD_BROADCOM_SAND128: u64 = 0x0700_0000_0000_0004;
+
 #[cfg(feature = "verbose")]
 macro_rules! log {
     ($($t:tt)*) => { println!($($t)*); };
@@ -140,8 +142,36 @@ impl AsFd for Card {
 impl drm::Device for Card {}
 impl control::Device for Card {}
 
+fn driver_is_vc4(card: &Card) -> bool {
+    card.get_driver()
+        .ok()
+        .and_then(|info| info.name().to_str().map(|s| s.to_owned()))
+        .map(|name| name.contains("vc4"))
+        .unwrap_or(false)
+}
+
+fn find_vc4_card() -> std::io::Result<String> {
+    for entry in std::fs::read_dir("/dev/dri")? {
+        let path = entry?.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with("card") {
+                if let Ok(card) = open_card(path.to_str().unwrap()) {
+                    if driver_is_vc4(&card) {
+                        return Ok(path.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "No vc4 DRM device",
+    ))
+}
+
 struct DisplayInner {
     card: Card,
+    is_vc4: bool,
     conn: connector::Handle,
     crtc: crtc::Handle,
     plane: plane::Handle,
@@ -191,6 +221,62 @@ where
     Ok(())
 }
 
+fn pick_connected_connector(
+    card: &Card,
+    res: &control::ResourceHandles,
+    prefer_hdmi: bool,
+) -> std::io::Result<connector::Info> {
+    let mut fallback = None;
+    for &conn_h in res.connectors() {
+        let info = card.get_connector(conn_h, true)?;
+        if info.state() == connector::State::Connected && !info.modes().is_empty() {
+            if prefer_hdmi {
+                match info.interface() {
+                    connector::Interface::HDMIA | connector::Interface::HDMIB => {
+                        log!(
+                            "Selected HDMI connector: id={}, modes={}",
+                            u32::from(info.handle()),
+                            info.modes().len()
+                        );
+                        return Ok(info);
+                    }
+                    _ => {}
+                }
+            }
+            if fallback.is_none() {
+                fallback = Some(info);
+            }
+        }
+    }
+    if let Some(info) = fallback {
+        log!(
+            "Selected connector: id={}, type={:?}, modes={}",
+            u32::from(info.handle()),
+            info.interface(),
+            info.modes().len()
+        );
+        Ok(info)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no connected connector",
+        ))
+    }
+}
+
+fn plane_is_primary(card: &Card, ph: plane::Handle) -> bool {
+    if let Ok(props) = card.get_properties(ph) {
+        for (handle, value) in props.iter() {
+            if let Ok(info) = card.get_property(*handle) {
+                if info.name().to_bytes() == b"type" {
+                    return *value == 0;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn find_prop(
     card: &Card,
     obj: impl control::ResourceHandle,
@@ -213,34 +299,13 @@ impl DisplayInner {
     fn new(card_path: &str, preferred_mode: Option<(u32, u32, u32)>) -> std::io::Result<Self> {
         let card = open_card(card_path)
             .map_err(|e| std::io::Error::new(e.kind(), format!("open card: {e}")))?;
+        let is_vc4 = driver_is_vc4(&card);
         enable_atomic(&card)
             .map_err(|e| std::io::Error::new(e.kind(), format!("enable atomic: {e}")))?;
         let res = card
             .resource_handles()
             .map_err(|e| std::io::Error::new(e.kind(), format!("get resources: {e}")))?;
-        let conn = res
-            .connectors()
-            .iter()
-            .find_map(|h| {
-                let info = card.get_connector(*h, true).ok()?;
-                if info.state() == connector::State::Connected && !info.modes().is_empty() {
-                    Some(info)
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "no connected connector with modes",
-                )
-            })?;
-        log!(
-            "Selected connector: id={}, type={:?}, modes={}",
-            u32::from(conn.handle()),
-            conn.interface(),
-            conn.modes().len()
-        );
+        let conn = pick_connected_connector(&card, &res, is_vc4)?;
         let enc = conn.encoders().first().copied().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "connector has no encoders")
         })?;
@@ -307,6 +372,7 @@ impl DisplayInner {
                 let allowed = res.filter_crtcs(info.possible_crtcs());
                 if allowed.contains(&crtc)
                     && info.formats().contains(&(buffer::DrmFourcc::Nv12 as u32))
+                    && (!is_vc4 || plane_is_primary(&card, *p))
                 {
                     Some(*p)
                 } else {
@@ -345,6 +411,7 @@ impl DisplayInner {
 
         Ok(Self {
             card,
+            is_vc4,
             conn: conn.handle(),
             crtc,
             plane,
@@ -500,7 +567,10 @@ impl DisplayInner {
                 Some(prev) => bail!("mixed plane modifiers not supported ({} vs {})", prev, m),
             }
         }
-        let modifier = common_mod.map(DrmModifier::from);
+        let mut modifier = common_mod.map(DrmModifier::from);
+        if modifier.is_none() && self.is_vc4 {
+            modifier = Some(DrmModifier::from(DRM_FORMAT_MOD_BROADCOM_SAND128));
+        }
 
         // Build PlanarBuffer
         let pb = PrimePlanarBuf {
@@ -620,7 +690,12 @@ fn init_display(
     card_path: String,
     preferred_mode: Option<(u32, u32, u32)>,
 ) -> NifResult<(Atom, ResourceArc<DisplayRes>)> {
-    let display = Display::new(&card_path, preferred_mode).map_err(nif_err)?;
+    let path = if card_path.is_empty() {
+        find_vc4_card().map_err(nif_err)?
+    } else {
+        card_path
+    };
+    let display = Display::new(&path, preferred_mode).map_err(nif_err)?;
     Ok((
         ok(),
         ResourceArc::new(DisplayRes(Mutex::new(Some(display)))),

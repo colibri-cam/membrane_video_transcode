@@ -14,6 +14,8 @@ use std::os::fd::AsFd;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
+const DRM_FORMAT_MOD_BROADCOM_SAND128: u64 = 0x0700_0000_0000_0004;
+
 rustler::atoms! {
     ok,
 }
@@ -140,6 +142,30 @@ fn err(msg: &str) -> Error {
 }
 
 // ---------- helpers ----------
+fn driver_is_vc4(card: &Card) -> bool {
+    card.get_driver()
+        .ok()
+        .and_then(|info| info.name().to_str().map(|s| s.to_owned()))
+        .map(|name| name.contains("vc4"))
+        .unwrap_or(false)
+}
+
+fn find_vc4_card() -> Result<String> {
+    for entry in std::fs::read_dir("/dev/dri")? {
+        let path = entry?.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with("card") {
+                if let Ok(card) = open_card(path.to_str().unwrap()) {
+                    if driver_is_vc4(&card) {
+                        return Ok(path.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+    }
+    Err(err("No vc4 DRM device"))
+}
+
 /// Enable universal planes and atomic modesetting capabilities.
 ///
 /// These caps must be set before querying any plane or property state.
@@ -162,21 +188,45 @@ fn get_resources(card: &Card) -> Result<dc::ResourceHandles> {
     card.resource_handles()
 }
 
-/// Pick the first connected connector that has at least one mode.
-fn pick_connected_connector(card: &Card, res: &dc::ResourceHandles) -> Result<connector::Info> {
+/// Pick a connected connector, preferring HDMI when requested.
+fn pick_connected_connector(
+    card: &Card,
+    res: &dc::ResourceHandles,
+    prefer_hdmi: bool,
+) -> Result<connector::Info> {
+    let mut fallback = None;
     for &conn_h in res.connectors() {
         let info = card.get_connector(conn_h, true)?;
         if info.state() == connector::State::Connected && !info.modes().is_empty() {
-            log!(
-                "Selected connector: id={}, type={:?}, modes={}",
-                u32::from(info.handle()),
-                info.interface(),
-                info.modes().len()
-            );
-            return Ok(info);
+            if prefer_hdmi {
+                match info.interface() {
+                    connector::Interface::HDMIA | connector::Interface::HDMIB => {
+                        log!(
+                            "Selected HDMI connector: id={}, modes={}",
+                            u32::from(info.handle()),
+                            info.modes().len()
+                        );
+                        return Ok(info);
+                    }
+                    _ => {}
+                }
+            }
+            if fallback.is_none() {
+                fallback = Some(info);
+            }
         }
     }
-    Err(err("No connected connector"))
+    if let Some(info) = fallback {
+        log!(
+            "Selected connector: id={}, type={:?}, modes={}",
+            u32::from(info.handle()),
+            info.interface(),
+            info.modes().len()
+        );
+        Ok(info)
+    } else {
+        Err(err("No connected connector"))
+    }
 }
 
 /// Given a connector, retrieve its first encoder and corresponding CRTC.
@@ -227,6 +277,7 @@ struct DumbWrapper<'a> {
     w: u32,
     h: u32,
     fmt: PixelFormat,
+    modifier: Option<drm::buffer::DrmModifier>,
 }
 
 impl<'a> drm::buffer::PlanarBuffer for DumbWrapper<'a> {
@@ -237,7 +288,7 @@ impl<'a> drm::buffer::PlanarBuffer for DumbWrapper<'a> {
         self.fmt.fourcc()
     }
     fn modifier(&self) -> Option<drm::buffer::DrmModifier> {
-        None
+        self.modifier
     }
     fn pitches(&self) -> [u32; 4] {
         let pitch = self.db.pitch();
@@ -409,7 +460,13 @@ fn copy_frame(src: &[u8], dst: &mut [u8], pitch: usize, w: usize, h: usize, fmt:
 }
 
 /// Create a dumb buffer for the given pixel format, zero it, and register a framebuffer.
-fn create_dumb_and_fb(card: &Card, w: u32, h: u32, fmt: PixelFormat) -> Result<FbBundle> {
+fn create_dumb_and_fb(
+    card: &Card,
+    w: u32,
+    h: u32,
+    fmt: PixelFormat,
+    modifier: Option<drm::buffer::DrmModifier>,
+) -> Result<FbBundle> {
     let db_height = fmt.buffer_height(h);
     let mut db = card.create_dumb_buffer((w, db_height), fmt.fourcc(), fmt.bpp())?;
 
@@ -421,8 +478,19 @@ fn create_dumb_and_fb(card: &Card, w: u32, h: u32, fmt: PixelFormat) -> Result<F
         copy_frame(&frame, mapping.as_mut(), pitch, w as usize, h as usize, fmt);
     }
 
-    let wrapper = DumbWrapper { db: &db, w, h, fmt };
-    let fb = card.add_planar_framebuffer(&wrapper, FbCmd2Flags::empty())?;
+    let wrapper = DumbWrapper {
+        db: &db,
+        w,
+        h,
+        fmt,
+        modifier,
+    };
+    let flags = if modifier.is_some() {
+        FbCmd2Flags::MODIFIERS
+    } else {
+        FbCmd2Flags::empty()
+    };
+    let fb = card.add_planar_framebuffer(&wrapper, flags)?;
     log!("Created framebuffer id={}", u32::from(fb));
 
     Ok(FbBundle { db, fb })
@@ -434,6 +502,7 @@ fn find_plane_for_crtc(
     res: &dc::ResourceHandles,
     crtc_h: crtc::Handle,
     fmt: PixelFormat,
+    modifier: Option<drm::buffer::DrmModifier>,
 ) -> Result<(plane::Handle, PixelFormat)> {
     let planes = card.plane_handles()?;
     let mut fallback = None;
@@ -442,6 +511,9 @@ fn find_plane_for_crtc(
         // Use helper to turn filter into a list of allowed CRTCs.
         let allowed = res.filter_crtcs(pinfo.possible_crtcs());
         if allowed.contains(&crtc_h) {
+            if modifier.is_some() && !plane_is_primary(card, ph) {
+                continue;
+            }
             let fourcc = fmt.fourcc() as u32;
             if pinfo.formats().contains(&fourcc) {
                 log!("Selected plane id={} with format {:?}", u32::from(ph), fmt);
@@ -463,6 +535,19 @@ fn find_plane_for_crtc(
     } else {
         Err(err("No compatible plane found"))
     }
+}
+
+fn plane_is_primary(card: &Card, ph: plane::Handle) -> bool {
+    if let Ok(props) = card.get_properties(ph) {
+        for (handle, value) in props.iter() {
+            if let Ok(info) = card.get_property(*handle) {
+                if info.name().to_bytes() == b"type" {
+                    return *value == 0;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Create a property blob encapsulating the chosen mode.
@@ -587,20 +672,29 @@ struct DisplayInner {
 
 impl Display {
     fn new(card_path: &str, fmt: PixelFormat) -> Result<(Self, u32, u32)> {
-        let card = Arc::new(open_card(card_path)?);
+        let raw_card = open_card(card_path)?;
+        let is_vc4 = driver_is_vc4(&raw_card);
+        let card = Arc::new(raw_card);
         enable_atomic_caps(&card)?;
         let res = get_resources(&card)?;
-        let conn = pick_connected_connector(&card, &res)?;
+        let conn = pick_connected_connector(&card, &res, is_vc4)?;
         let (_enc, crtc_h) = pick_encoder_and_crtc(&card, &conn)?;
         let mode = pick_mode(&conn)?;
         let (w16, h16) = mode.size();
         let (w, h) = (w16 as u32, h16 as u32);
+        let modifier = if is_vc4 {
+            Some(drm::buffer::DrmModifier::from(
+                DRM_FORMAT_MOD_BROADCOM_SAND128,
+            ))
+        } else {
+            None
+        };
 
-        let (plane_h, fb_fmt) = find_plane_for_crtc(&card, &res, crtc_h, fmt)?;
+        let (plane_h, fb_fmt) = find_plane_for_crtc(&card, &res, crtc_h, fmt, modifier)?;
 
         let mut buffers = Vec::with_capacity(2);
         for _ in 0..2 {
-            buffers.push(create_dumb_and_fb(&card, w, h, fb_fmt)?);
+            buffers.push(create_dumb_and_fb(&card, w, h, fb_fmt, modifier)?);
         }
         let (mode_blob, blob_id) = create_mode_blob(&card, &mode)?;
         let fb = buffers.first().map(|b| b.fb);
@@ -756,7 +850,12 @@ fn init_display<'a>(
         .atom_to_string()
         .map_err(|e| nif_error(format!("{e:?}")))?;
     let pf = PixelFormat::from_str(&pf_str).ok_or_else(|| nif_error("unknown pixel format"))?;
-    let (display, _w, _h) = Display::new(&card_path, pf).map_err(nif_error)?;
+    let path = if card_path.is_empty() {
+        find_vc4_card().map_err(nif_error)?
+    } else {
+        card_path
+    };
+    let (display, _w, _h) = Display::new(&path, pf).map_err(nif_error)?;
     Ok(ResourceArc::new(DisplayResource(std::sync::Mutex::new(
         Some(display),
     ))))
