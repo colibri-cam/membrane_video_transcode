@@ -15,7 +15,7 @@ libc = "0.2"
 drm-fourcc = "2.2"
 
 [features]
-rpi = ["ffmpeg-next/rpi"]
+rpi = []
 
 [profile.release]
 opt-level = "z"

@@ -182,14 +182,16 @@ fn create(hw_device: String) -> NifResult<ResourceArc<Decoder>> {
 
 fn derive_fourcc(desc: &sys::AVDRMFrameDescriptor) -> Result<DrmFourcc> {
     match desc.nb_layers {
-        1 => DrmFourcc::try_from(desc.layers[0].format as u32)
+        1 => DrmFourcc::try_from(desc.layers[0].format)
             .map_err(|_| anyhow!("unsupported fourcc {:#x}", desc.layers[0].format)),
         2 => {
-            let l0 = DrmFourcc::try_from(desc.layers[0].format as u32);
-            let l1 = DrmFourcc::try_from(desc.layers[1].format as u32);
+            let l0 = DrmFourcc::try_from(desc.layers[0].format);
+            let l1 = DrmFourcc::try_from(desc.layers[1].format);
             match (l0, l1) {
                 (Ok(DrmFourcc::R8), Ok(DrmFourcc::Gr88))
                 | (Ok(DrmFourcc::Gr88), Ok(DrmFourcc::R8)) => Ok(DrmFourcc::Nv12),
+                #[cfg(feature = "rpi")]
+                (Ok(DrmFourcc::R8), Ok(DrmFourcc::R8)) => Ok(DrmFourcc::Nv12),
                 #[cfg(feature = "rpi")]
                 (Ok(DrmFourcc::R16), Ok(DrmFourcc::Gr1616))
                 | (Ok(DrmFourcc::Gr1616), Ok(DrmFourcc::R16)) => Ok(DrmFourcc::P010),
@@ -264,7 +266,7 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
     // Heuristic: if we have at least one valid object (usually 0),
     // allow planes whose object points to an invalid fd to reuse object 0.
     let fallback_obj0 = obj_fds
-        .get(0)
+        .first()
         .and_then(|x| x.as_ref())
         .map(|fd| fd.as_raw_fd());
     let mut planes = Vec::new();

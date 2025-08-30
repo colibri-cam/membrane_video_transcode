@@ -14,6 +14,7 @@ use std::os::fd::AsFd;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
+#[cfg(feature = "rpi")]
 const DRM_FORMAT_MOD_BROADCOM_SAND128: u64 = 0x0700_0000_0000_0004;
 
 rustler::atoms! {
@@ -682,12 +683,21 @@ impl Display {
         let mode = pick_mode(&conn)?;
         let (w16, h16) = mode.size();
         let (w, h) = (w16 as u32, h16 as u32);
-        let modifier = if is_vc4 {
-            Some(drm::buffer::DrmModifier::from(
-                DRM_FORMAT_MOD_BROADCOM_SAND128,
-            ))
-        } else {
-            None
+        let modifier = {
+            #[cfg(feature = "rpi")]
+            {
+                if is_vc4 {
+                    Some(drm::buffer::DrmModifier::from(
+                        DRM_FORMAT_MOD_BROADCOM_SAND128,
+                    ))
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(feature = "rpi"))]
+            {
+                None
+            }
         };
 
         let (plane_h, fb_fmt) = find_plane_for_crtc(&card, &res, crtc_h, fmt, modifier)?;

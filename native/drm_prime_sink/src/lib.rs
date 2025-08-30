@@ -16,6 +16,7 @@ use drm::{ClientCapability, Device as _, buffer, control};
 use drm_fourcc::DrmFourcc;
 use rustler::{Atom, Decoder, Encoder, NifResult, ResourceArc};
 
+#[cfg(feature = "rpi")]
 const DRM_FORMAT_MOD_BROADCOM_SAND128: u64 = 0x0700_0000_0000_0004;
 
 #[cfg(feature = "verbose")]
@@ -171,6 +172,7 @@ fn find_vc4_card() -> std::io::Result<String> {
 
 struct DisplayInner {
     card: Card,
+    #[cfg(feature = "rpi")]
     is_vc4: bool,
     conn: connector::Handle,
     crtc: crtc::Handle,
@@ -411,6 +413,7 @@ impl DisplayInner {
 
         Ok(Self {
             card,
+            #[cfg(feature = "rpi")]
             is_vc4,
             conn: conn.handle(),
             crtc,
@@ -567,9 +570,13 @@ impl DisplayInner {
                 Some(prev) => bail!("mixed plane modifiers not supported ({} vs {})", prev, m),
             }
         }
+        #[allow(unused_mut)]
         let mut modifier = common_mod.map(DrmModifier::from);
-        if modifier.is_none() && self.is_vc4 {
-            modifier = Some(DrmModifier::from(DRM_FORMAT_MOD_BROADCOM_SAND128));
+        #[cfg(feature = "rpi")]
+        {
+            if modifier.is_none() && self.is_vc4 {
+                modifier = Some(DrmModifier::from(DRM_FORMAT_MOD_BROADCOM_SAND128));
+            }
         }
 
         // Build PlanarBuffer
