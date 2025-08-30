@@ -181,17 +181,27 @@ fn create(hw_device: String) -> NifResult<ResourceArc<Decoder>> {
 }
 
 fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
+    let hw_frames_ctx = unsafe { (*frame.as_ptr()).hw_frames_ctx };
+    if hw_frames_ctx.is_null() {
+        return Err(anyhow!("no hw_frames_ctx"));
+    }
     let mut drm = Video::empty();
     unsafe {
         (*drm.as_mut_ptr()).format = sys::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
         (*drm.as_mut_ptr()).width = frame.width() as i32;
         (*drm.as_mut_ptr()).height = frame.height() as i32;
-        (*drm.as_mut_ptr()).hw_frames_ctx = sys::av_buffer_ref((*frame.as_ptr()).hw_frames_ctx);
+        let ctx_ref = sys::av_buffer_ref(hw_frames_ctx);
+        if ctx_ref.is_null() {
+            sys::av_frame_unref(drm.as_mut_ptr());
+            return Err(anyhow!("av_buffer_ref failed"));
+        }
+        (*drm.as_mut_ptr()).hw_frames_ctx = ctx_ref;
     }
     const AV_HWFRAME_MAP_DRM_PRIME: i32 = 0x0002_0000;
     let flags = (sys::AV_HWFRAME_MAP_READ as i32) | AV_HWFRAME_MAP_DRM_PRIME;
     let res = unsafe { sys::av_hwframe_map(drm.as_mut_ptr(), frame.as_ptr(), flags) };
     if res < 0 {
+        unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
         return Err(anyhow!("av_hwframe_map failed: {res}"));
     }
     let desc_ptr = unsafe { (*drm.as_ptr()).data[0] as *const sys::AVDRMFrameDescriptor };
@@ -205,7 +215,7 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
         return Err(anyhow!("empty drm descriptor"));
     }
 
-// Pre-dup all object fds once
+    // Pre-dup all object fds once
     let mut obj_fds: Vec<Option<OwnedFd>> = Vec::with_capacity(desc.nb_objects as usize);
     for j in 0..desc.nb_objects as usize {
         let ofd = desc.objects[j].fd;
@@ -224,7 +234,10 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
 
     // Heuristic: if we have at least one valid object (usually 0),
     // allow planes whose object points to an invalid fd to reuse object 0.
-    let fallback_obj0 = obj_fds.get(0).and_then(|x| x.as_ref()).map(|fd| fd.as_raw_fd());
+    let fallback_obj0 = obj_fds
+        .get(0)
+        .and_then(|x| x.as_ref())
+        .map(|fd| fd.as_raw_fd());
     let mut planes = Vec::new();
 
     for l in 0..desc.nb_layers as usize {
@@ -301,7 +314,7 @@ fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> Result<DecodeRes
                         eprintln!("Error: {e}");
                         unsafe { sys::av_frame_unref(decoded.as_mut_ptr()) };
                         continue;
-                    },
+                    }
                 };
                 let mut res = Video::empty();
                 unsafe {
@@ -317,9 +330,9 @@ fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> Result<DecodeRes
             Err(ffmpeg::Error::Eof) => break,
             Err(ffmpeg::Error::Other { errno }) if errno == EAGAIN => break,
             Err(e) => {
-                    eprintln!("Error: {e}");
-                    return Err(anyhow!("decode failed"));
-            },
+                eprintln!("Error: {e}");
+                return Err(anyhow!("decode failed"));
+            }
         }
     }
     Ok((pts_list, frames, keepalives))
