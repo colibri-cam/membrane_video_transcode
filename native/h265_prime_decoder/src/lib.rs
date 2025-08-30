@@ -215,6 +215,9 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
         return Err(anyhow!("empty drm descriptor"));
     }
 
+    let fourcc = DrmFourcc::try_from(desc.layers[0].format as u32)
+        .map_err(|_| anyhow!("unsupported fourcc {:#x}", desc.layers[0].format))?;
+
     // Pre-dup all object fds once
     let mut obj_fds: Vec<Option<OwnedFd>> = Vec::with_capacity(desc.nb_objects as usize);
     for j in 0..desc.nb_objects as usize {
@@ -290,7 +293,7 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
     Ok(PrimeDesc {
         width: frame.width(),
         height: frame.height(),
-        format: Fourcc(DrmFourcc::Nv12),
+        format: Fourcc(fourcc),
         planes,
     })
 }
