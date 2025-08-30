@@ -187,16 +187,17 @@ fn derive_fourcc(desc: &sys::AVDRMFrameDescriptor) -> Result<DrmFourcc> {
         2 => {
             let l0 = DrmFourcc::try_from(desc.layers[0].format as u32);
             let l1 = DrmFourcc::try_from(desc.layers[1].format as u32);
-            if let (Ok(DrmFourcc::R8), Ok(DrmFourcc::Gr88))
-            | (Ok(DrmFourcc::Gr88), Ok(DrmFourcc::R8)) = (l0, l1)
-            {
-                Ok(DrmFourcc::Nv12)
-            } else {
-                Err(anyhow!(
+            match (l0, l1) {
+                (Ok(DrmFourcc::R8), Ok(DrmFourcc::Gr88))
+                | (Ok(DrmFourcc::Gr88), Ok(DrmFourcc::R8)) => Ok(DrmFourcc::Nv12),
+                #[cfg(feature = "rpi")]
+                (Ok(DrmFourcc::R16), Ok(DrmFourcc::Gr1616))
+                | (Ok(DrmFourcc::Gr1616), Ok(DrmFourcc::R16)) => Ok(DrmFourcc::P010),
+                _ => Err(anyhow!(
                     "unsupported layer formats {:#x} and {:#x}",
                     desc.layers[0].format,
                     desc.layers[1].format
-                ))
+                )),
             }
         }
         _ => Err(anyhow!(
