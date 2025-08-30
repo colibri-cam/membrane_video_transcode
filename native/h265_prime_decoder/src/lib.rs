@@ -1,4 +1,6 @@
 use std::ffi::CString;
+use std::path::Path;
+use std::ptr;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
@@ -111,24 +113,39 @@ impl Drop for Decoder {
     }
 }
 
-fn init_decoder(hw_device: String) -> Result<Decoder> {
+fn init_decoder(hw_device: Option<String>) -> Result<Decoder> {
     ffmpeg::init().context("ffmpeg init failed")?;
-    let hevc = codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?;
+    let use_v4l2 = ["/dev/video11", "/dev/video10", "/dev/video0"]
+        .iter()
+        .any(|p| Path::new(p).exists());
+    let hevc = if use_v4l2 {
+        codec::decoder::find_by_name("hevc_v4l2m2m")
+            .or_else(|| codec::decoder::find(codec::Id::HEVC))
+            .ok_or_else(|| anyhow!("no hevc codec"))?
+    } else {
+        codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?
+    };
     let mut decoder = codec::decoder::new();
 
     unsafe {
-        let mut hw_device_ctx = std::ptr::null_mut();
-        let path = CString::new(hw_device).context("device path")?;
-        if sys::av_hwdevice_ctx_create(
-            &mut hw_device_ctx,
-            sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-            path.as_ptr(),
-            std::ptr::null_mut(),
-            0,
-        ) >= 0
-        {
-            (*decoder.as_mut_ptr()).hw_device_ctx = sys::av_buffer_ref(hw_device_ctx);
-            sys::av_buffer_unref(&mut hw_device_ctx);
+        let mut hw_device_ctx = ptr::null_mut();
+        if !use_v4l2 {
+            let path_str = hw_device.unwrap_or_else(|| "/dev/dri/renderD128".to_string());
+            if Path::new(&path_str).exists() {
+                if let Ok(path) = CString::new(path_str) {
+                    if sys::av_hwdevice_ctx_create(
+                        &mut hw_device_ctx,
+                        sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                        path.as_ptr(),
+                        ptr::null_mut(),
+                        0,
+                    ) >= 0
+                    {
+                        (*decoder.as_mut_ptr()).hw_device_ctx = sys::av_buffer_ref(hw_device_ctx);
+                        sys::av_buffer_unref(&mut hw_device_ctx);
+                    }
+                }
+            }
         }
     }
     let opened = decoder.open_as(hevc).context("open codec")?;
@@ -153,7 +170,12 @@ fn load(env: rustler::Env, _info: rustler::Term) -> bool {
 
 #[rustler::nif]
 fn create(hw_device: String) -> NifResult<ResourceArc<Decoder>> {
-    init_decoder(hw_device)
+    let path = if hw_device.is_empty() {
+        None
+    } else {
+        Some(hw_device)
+    };
+    init_decoder(path)
         .map(ResourceArc::new)
         .map_err(|_| rustler::Error::Atom("create_failed"))
 }
