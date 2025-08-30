@@ -13,8 +13,14 @@ ffmpeg-next = { version = "7.1", features = ["codec", "format", "software-scalin
 rustler = "0.36"
 libc = "0.2"
 
+[features]
+rpi = ["ffmpeg-next/rpi"]
+
 [profile.release]
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+
+[patch.crates-io]
+ffmpeg-sys-next = { git = "https://github.com/Damirados/rust-ffmpeg-sys.git", branch = "cross-target-linking" }

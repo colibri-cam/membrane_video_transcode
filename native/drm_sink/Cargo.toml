@@ -15,6 +15,7 @@ drm-ffi = "0.9"
 [features]
 default = []
 verbose = []          # enable to keep println-style logs
+rpi = []
 
 [profile.release]
 opt-level = "z"       # optimize for size

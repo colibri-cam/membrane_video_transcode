@@ -1,5 +1,14 @@
 defmodule Membrane.DRM.Sink.Native do
-  use Rustler, otp_app: :drm_experiments, crate: "drm_sink"
+  @rustler_opts Mix.Project.config()[:rustler_opts]
+
+  use Rustler,
+      Keyword.merge(
+        [
+          otp_app: :drm_experiments,
+          crate: "drm_sink"
+        ],
+        @rustler_opts
+      )
 
   def init_display(_card_path, _pixel_format), do: :erlang.nif_error(:nif_not_loaded)
   def display_frame(_handle, _frame), do: :erlang.nif_error(:nif_not_loaded)
