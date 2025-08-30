@@ -14,7 +14,7 @@ rustler = "0.36"
 libc = "0.2"
 
 [features]
-rpi = []
+rpi = ["ffmpeg-next/rpi"]
 
 [profile.release]
 opt-level = "z"
