@@ -55,7 +55,14 @@ defmodule Membrane.DRM.PrimeSink do
 
   @impl true
   def handle_stream_format(:input, %PrimeFormat{}, _ctx, %{display: nil} = state) do
-    {:ok, display} = Native.init_display(state.card, state.preferred_mode)
+    {:ok, info, display} = Native.init_display(state.card, state.preferred_mode)
+    {w, h, r} = info.mode
+
+    Membrane.Logger.info(
+      "Using card #{info.card_path}, connector #{info.connector_id} (#{info.connector_type}), " <>
+        "plane #{info.plane_id}, mode #{w}x#{h}@#{r}"
+    )
+
     {[], %{state | display: display}}
   end
 

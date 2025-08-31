@@ -59,6 +59,17 @@ struct PrimeDesc {
     planes: Vec<PrimePlane>,
 }
 
+#[derive(Debug, rustler::NifStruct)]
+#[module = "Membrane.DRM.PrimeSink.DisplayInfo"]
+struct DisplayInfo {
+    card_path: String,
+    connector_id: u32,
+    connector_type: String,
+    crtc_id: u32,
+    plane_id: u32,
+    mode: (u32, u32, u32),
+}
+
 impl Encoder for Fd {
     fn encode<'a>(&self, env: rustler::Env<'a>) -> rustler::Term<'a> {
         let dup_fd = unsafe { libc::dup(self.0.as_raw_fd()) };
@@ -298,7 +309,10 @@ fn find_prop(
 }
 
 impl DisplayInner {
-    fn new(card_path: &str, preferred_mode: Option<(u32, u32, u32)>) -> std::io::Result<Self> {
+    fn new(
+        card_path: &str,
+        preferred_mode: Option<(u32, u32, u32)>,
+    ) -> std::io::Result<(Self, DisplayInfo)> {
         let card = open_card(card_path)
             .map_err(|e| std::io::Error::new(e.kind(), format!("open card: {e}")))?;
         let is_vc4 = driver_is_vc4(&card);
@@ -411,31 +425,48 @@ impl DisplayInner {
         let prop_crtc_w = find_prop(&card, plane, &name("CRTC_W"))?;
         let prop_crtc_h = find_prop(&card, plane, &name("CRTC_H"))?;
 
-        Ok(Self {
-            card,
-            #[cfg(feature = "rpi")]
-            is_vc4,
-            conn: conn.handle(),
-            crtc,
-            plane,
-            prop_fb,
-            prop_crtc,
-            prop_conn_crtc,
-            prop_mode,
-            prop_active,
-            prop_src_x,
-            prop_src_y,
-            prop_src_w,
-            prop_src_h,
-            prop_crtc_x,
-            prop_crtc_y,
-            prop_crtc_w,
-            prop_crtc_h,
-            mode_blob: blob_id,
-            setup: false,
-            stale: None,
-            in_flight: None,
-        })
+        let mode_info = (
+            u32::from(mode.size().0),
+            u32::from(mode.size().1),
+            mode.vrefresh(),
+        );
+        let info = DisplayInfo {
+            card_path: card_path.to_string(),
+            connector_id: u32::from(conn.handle()),
+            connector_type: format!("{:?}", conn.interface()),
+            crtc_id: u32::from(crtc),
+            plane_id: u32::from(plane),
+            mode: mode_info,
+        };
+
+        Ok((
+            Self {
+                card,
+                #[cfg(feature = "rpi")]
+                is_vc4,
+                conn: conn.handle(),
+                crtc,
+                plane,
+                prop_fb,
+                prop_crtc,
+                prop_conn_crtc,
+                prop_mode,
+                prop_active,
+                prop_src_x,
+                prop_src_y,
+                prop_src_w,
+                prop_src_h,
+                prop_crtc_x,
+                prop_crtc_y,
+                prop_crtc_w,
+                prop_crtc_h,
+                mode_blob: blob_id,
+                setup: false,
+                stale: None,
+                in_flight: None,
+            },
+            info,
+        ))
     }
 
     fn display(&mut self, desc: PrimeDesc) -> std::io::Result<()> {
@@ -645,16 +676,22 @@ struct Display {
 }
 
 impl Display {
-    fn new(card_path: &str, preferred_mode: Option<(u32, u32, u32)>) -> std::io::Result<Self> {
-        let inner = DisplayInner::new(card_path, preferred_mode)?;
+    fn new(
+        card_path: &str,
+        preferred_mode: Option<(u32, u32, u32)>,
+    ) -> std::io::Result<(Self, DisplayInfo)> {
+        let (inner, info) = DisplayInner::new(card_path, preferred_mode)?;
         let (tx, rx) = mpsc::channel();
         let err = Arc::new(Mutex::new(None));
         let err_clone = Arc::clone(&err);
         let handle = thread::spawn(move || inner.run(rx, err_clone));
-        Ok(Self {
-            tx: Some(tx),
-            handle: Some(handle),
-        })
+        Ok((
+            Self {
+                tx: Some(tx),
+                handle: Some(handle),
+            },
+            info,
+        ))
     }
 
     fn display(&self, desc: PrimeDesc) -> std::io::Result<()> {
@@ -696,15 +733,16 @@ fn load(env: rustler::Env, _info: rustler::Term) -> bool {
 fn init_display(
     card_path: String,
     preferred_mode: Option<(u32, u32, u32)>,
-) -> NifResult<(Atom, ResourceArc<DisplayRes>)> {
+) -> NifResult<(Atom, DisplayInfo, ResourceArc<DisplayRes>)> {
     let path = if card_path.is_empty() {
         find_vc4_card().map_err(nif_err)?
     } else {
         card_path
     };
-    let display = Display::new(&path, preferred_mode).map_err(nif_err)?;
+    let (display, info) = Display::new(&path, preferred_mode).map_err(nif_err)?;
     Ok((
         ok(),
+        info,
         ResourceArc::new(DisplayRes(Mutex::new(Some(display)))),
     ))
 }
