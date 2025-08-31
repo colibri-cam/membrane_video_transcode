@@ -44,7 +44,8 @@ fn init_decoder(target: format::Pixel, atom: Atom) -> Result<Decoder> {
         .iter()
         .any(|p| std::path::Path::new(p).exists());
     let hevc = if use_v4l2 {
-        codec::decoder::find_by_name("hevc_v4l2m2m")
+        codec::decoder::find_by_name("hevc_v4l2request")
+            .or_else(|| codec::decoder::find_by_name("hevc_v4l2m2m"))
             .or_else(|| codec::decoder::find(codec::Id::HEVC))
             .ok_or_else(|| anyhow!("no hevc codec"))?
     } else {
