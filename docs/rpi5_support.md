@@ -5,7 +5,7 @@ This document outlines proposed changes required for the H265 decoder, H265 prim
 ## Build and Toolchain
 - Cross-compile all native crates for `aarch64-unknown-linux-gnu` since Raspberry Pi 5 defaults to a 64-bit kernel.
 - Update `Cross.toml` files to include an explicit target for Raspberry Pi 5 and verify that `cross` uses a recent `aarch64` GCC toolchain.
-- Ensure `ffmpeg` is built with the `v4l2-m2m` and `drm` backends enabled so hardware blocks are available.
+- Ensure `ffmpeg` is built with the `v4l2-request` and `drm` backends enabled so hardware blocks are available.
 
 ## Decoder NIF Changes
 - Replace the hard coded VAAPI path (`/dev/dri/renderD128`) with detection logic that prefers the `rpivid` or `v4l2` decoder nodes exposed by the Pi. This applies to both the regular and prime H265 decoder NIFs.
