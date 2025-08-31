@@ -329,6 +329,7 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
 type DecodeResult<'a> = (Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>);
 
 fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> Result<DecodeResult<'a>> {
+    eprintln!("decode_frames: start");
     let mut frames = Vec::new();
     let mut pts_list = Vec::new();
     let mut decoded = Video::empty();
@@ -358,14 +359,21 @@ fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> Result<DecodeRes
                 frames.push(desc.encode(env));
                 unsafe { sys::av_frame_unref(decoded.as_mut_ptr()) };
             }
-            Err(ffmpeg::Error::Eof) => break,
-            Err(ffmpeg::Error::Other { errno }) if errno == EAGAIN => break,
+            Err(ffmpeg::Error::Eof) => {
+                eprintln!("decode_frames: EOF");
+                break;
+            }
+            Err(ffmpeg::Error::Other { errno }) if errno == EAGAIN => {
+                eprintln!("decode_frames: EAGAIN");
+                break;
+            }
             Err(e) => {
                 eprintln!("Error: {e}");
                 return Err(anyhow!("decode failed"));
             }
         }
     }
+    eprintln!("decode_frames: returning {} frame(s)", frames.len());
     Ok((pts_list, frames, keepalives))
 }
 
@@ -379,6 +387,7 @@ fn decode<'a>(
     pts: i64,
     dts: i64,
 ) -> NifResult<DecodeResultWithOk<'a>> {
+    eprintln!("decode: packet size={}, pts={pts}, dts={dts}", data.len());
     let mut packet = Packet::copy(data.as_slice());
     packet.set_pts((pts != NO_PTS).then_some(pts));
     packet.set_dts((dts != NO_PTS).then_some(dts));
@@ -395,11 +404,13 @@ fn decode<'a>(
         eprintln!("Error: {e}");
         rustler::Error::Atom("decode")
     })?;
+    eprintln!("decode: produced {} frame(s)", frames.len());
     Ok((ok(), pts_list, frames, keepalives))
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn flush<'a>(env: Env<'a>, state: ResourceArc<Decoder>) -> NifResult<DecodeResultWithOk<'a>> {
+    eprintln!("flush: start");
     let mut inner = state
         .inner
         .lock()
@@ -412,6 +423,7 @@ fn flush<'a>(env: Env<'a>, state: ResourceArc<Decoder>) -> NifResult<DecodeResul
         eprintln!("Error: {e}");
         rustler::Error::Atom("decode")
     })?;
+    eprintln!("flush: produced {} frame(s)", frames.len());
     Ok((ok(), pts_list, frames, keepalives))
 }
 
