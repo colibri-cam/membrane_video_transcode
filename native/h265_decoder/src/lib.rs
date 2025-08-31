@@ -40,13 +40,13 @@ impl Drop for Decoder {
 
 fn init_decoder(target: format::Pixel, atom: Atom) -> Result<Decoder> {
     ffmpeg::init().context("ffmpeg init failed")?;
-    let use_v4l2 = ["/dev/video11", "/dev/video10", "/dev/video0"]
-        .iter()
-        .any(|p| std::path::Path::new(p).exists());
-    let hevc = if use_v4l2 {
-        codec::decoder::find_by_name("hevc_v4l2m2m")
-            .or_else(|| codec::decoder::find(codec::Id::HEVC))
-            .ok_or_else(|| anyhow!("no hevc codec"))?
+    let mut use_v4l2 = false;
+    let hevc = if let Some(codec) = codec::decoder::find_by_name("hevc_v4l2request") {
+        use_v4l2 = true;
+        codec
+    } else if let Some(codec) = codec::decoder::find_by_name("hevc_v4l2m2m") {
+        use_v4l2 = true;
+        codec
     } else {
         codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?
     };
@@ -86,7 +86,7 @@ fn create(format: Atom) -> NifResult<ResourceArc<Decoder>> {
     let pix = pixel_from_atom(format).ok_or(Error::Atom("bad_pixel_format"))?;
     init_decoder(pix, format)
         .map(ResourceArc::new)
-        .map_err(|_| Error::Atom("create_failed"))
+        .map_err(|e| Error::Term(Box::new((atoms::create_failed(), format!("{e:?}")))))
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -328,7 +328,8 @@ mod atoms {
         NV21,
         YV12,
         AYUV,
-        YUY2
+        YUY2,
+        create_failed
     }
 }
 

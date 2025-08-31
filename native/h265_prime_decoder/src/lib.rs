@@ -16,7 +16,8 @@ use rustler::{Atom, Binary, Encoder, Env, NifResult, ResourceArc, Term};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
 rustler::atoms! {
-    ok
+    ok,
+    create_failed
 }
 
 const NO_PTS: i64 = i64::MIN;
@@ -115,13 +116,13 @@ impl Drop for Decoder {
 
 fn init_decoder(hw_device: Option<String>) -> Result<Decoder> {
     ffmpeg::init().context("ffmpeg init failed")?;
-    let use_v4l2 = ["/dev/video11", "/dev/video10", "/dev/video0"]
-        .iter()
-        .any(|p| Path::new(p).exists());
-    let hevc = if use_v4l2 {
-        codec::decoder::find_by_name("hevc_v4l2m2m")
-            .or_else(|| codec::decoder::find(codec::Id::HEVC))
-            .ok_or_else(|| anyhow!("no hevc codec"))?
+    let mut use_v4l2 = false;
+    let hevc = if let Some(codec) = codec::decoder::find_by_name("hevc_v4l2request") {
+        use_v4l2 = true;
+        codec
+    } else if let Some(codec) = codec::decoder::find_by_name("hevc_v4l2m2m") {
+        use_v4l2 = true;
+        codec
     } else {
         codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?
     };
@@ -177,7 +178,7 @@ fn create(hw_device: String) -> NifResult<ResourceArc<Decoder>> {
     };
     init_decoder(path)
         .map(ResourceArc::new)
-        .map_err(|_| rustler::Error::Atom("create_failed"))
+        .map_err(|e| rustler::Error::Term(Box::new((create_failed(), format!("{e:?}")))))
 }
 
 fn derive_fourcc(desc: &sys::AVDRMFrameDescriptor) -> Result<DrmFourcc> {
