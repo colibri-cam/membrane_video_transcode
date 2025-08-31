@@ -7,7 +7,7 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg_next::codec::packet::Packet;
 use ffmpeg_next::sys;
 use ffmpeg_next::{
-    codec, format,
+    Codec, codec, format,
     software::scaling::{context::Context as Scaler, flag::Flags},
     util::{error::EAGAIN, frame::Video},
 };
@@ -47,25 +47,29 @@ impl Drop for Decoder {
     }
 }
 
+fn find_any(names: &[&str]) -> Option<Codec> {
+    names.iter().find_map(|n| codec::decoder::find_by_name(n))
+}
+
 fn init_decoder(target: format::Pixel, atom: Atom, backend: Backend) -> Result<Decoder> {
     ffmpeg::init().context("ffmpeg init failed")?;
     let mut use_v4l2 = matches!(backend, Backend::V4l2Request | Backend::V4l2M2M);
     let hevc = match backend {
         Backend::Auto => {
-            if let Some(codec) = codec::decoder::find_by_name("hevc_v4l2request") {
+            if let Some(codec) = find_any(&["hevc_v4l2request", "h265_v4l2request"]) {
                 use_v4l2 = true;
                 codec
-            } else if let Some(codec) = codec::decoder::find_by_name("hevc_v4l2m2m") {
+            } else if let Some(codec) = find_any(&["hevc_v4l2m2m", "h265_v4l2m2m"]) {
                 use_v4l2 = true;
                 codec
             } else {
                 codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?
             }
         }
-        Backend::V4l2Request => codec::decoder::find_by_name("hevc_v4l2request")
-            .ok_or_else(|| anyhow!("no hevc_v4l2request codec"))?,
-        Backend::V4l2M2M => codec::decoder::find_by_name("hevc_v4l2m2m")
-            .ok_or_else(|| anyhow!("no hevc_v4l2m2m codec"))?,
+        Backend::V4l2Request => find_any(&["hevc_v4l2request", "h265_v4l2request"])
+            .ok_or_else(|| anyhow!("no v4l2request codec"))?,
+        Backend::V4l2M2M => find_any(&["hevc_v4l2m2m", "h265_v4l2m2m"])
+            .ok_or_else(|| anyhow!("no v4l2m2m codec"))?,
         Backend::Vaapi | Backend::Software => {
             codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?
         }
