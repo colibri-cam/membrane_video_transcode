@@ -17,11 +17,21 @@ defmodule Membrane.H265.PrimeDecoder do
   alias Membrane.H265
   alias Membrane.H265.Common
 
+  @typedoc """
+  Decoder backend to use.
+  """
+  @type decoder_backend :: :auto | :vaapi | :v4l2request | :v4l2m2m | :software
+
   def_options(
     hw_device: [
       spec: String.t(),
       default: "/dev/dri/renderD129",
       description: "Hw device to use"
+    ],
+    decoder: [
+      spec: decoder_backend(),
+      default: :auto,
+      description: "Decoder backend to use"
     ]
   )
 
@@ -37,14 +47,20 @@ defmodule Membrane.H265.PrimeDecoder do
 
   @impl true
   def handle_init(_ctx, opts) do
-    state = %{decoder_ref: nil, stream_format_sent?: false, hw_device: opts.hw_device}
+    state = %{
+      decoder_ref: nil,
+      stream_format_sent?: false,
+      hw_device: opts.hw_device,
+      decoder: opts.decoder
+    }
+
     {[], state}
   end
 
   @impl true
   def handle_setup(_ctx, state) do
     decoder =
-      case Native.create(state.hw_device) do
+      case Native.create(state.hw_device, state.decoder) do
         {:error, reason} -> raise "Error creating decoder #{inspect(reason)}"
         decoder -> decoder
       end

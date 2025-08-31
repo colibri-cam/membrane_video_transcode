@@ -17,10 +17,24 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
 rustler::atoms! {
     ok,
-    create_failed
+    create_failed,
+    auto,
+    vaapi,
+    v4l2request,
+    v4l2m2m,
+    software
 }
 
 const NO_PTS: i64 = i64::MIN;
+
+#[derive(Clone, Copy)]
+enum Backend {
+    Auto,
+    Vaapi,
+    V4l2Request,
+    V4l2M2M,
+    Software,
+}
 
 #[derive(Debug)]
 struct Fd(OwnedFd);
@@ -114,23 +128,34 @@ impl Drop for Decoder {
     }
 }
 
-fn init_decoder(hw_device: Option<String>) -> Result<Decoder> {
+fn init_decoder(hw_device: Option<String>, backend: Backend) -> Result<Decoder> {
     ffmpeg::init().context("ffmpeg init failed")?;
-    let mut use_v4l2 = false;
-    let hevc = if let Some(codec) = codec::decoder::find_by_name("hevc_v4l2request") {
-        use_v4l2 = true;
-        codec
-    } else if let Some(codec) = codec::decoder::find_by_name("hevc_v4l2m2m") {
-        use_v4l2 = true;
-        codec
-    } else {
-        codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?
+    let mut use_v4l2 = matches!(backend, Backend::V4l2Request | Backend::V4l2M2M);
+    let hevc = match backend {
+        Backend::Auto => {
+            if let Some(codec) = codec::decoder::find_by_name("hevc_v4l2request") {
+                use_v4l2 = true;
+                codec
+            } else if let Some(codec) = codec::decoder::find_by_name("hevc_v4l2m2m") {
+                use_v4l2 = true;
+                codec
+            } else {
+                codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?
+            }
+        }
+        Backend::V4l2Request => codec::decoder::find_by_name("hevc_v4l2request")
+            .ok_or_else(|| anyhow!("no hevc_v4l2request codec"))?,
+        Backend::V4l2M2M => codec::decoder::find_by_name("hevc_v4l2m2m")
+            .ok_or_else(|| anyhow!("no hevc_v4l2m2m codec"))?,
+        Backend::Vaapi | Backend::Software => {
+            codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?
+        }
     };
     let mut decoder = codec::decoder::new();
 
     unsafe {
         let mut hw_device_ctx = ptr::null_mut();
-        if !use_v4l2 {
+        if matches!(backend, Backend::Vaapi | Backend::Auto) && !use_v4l2 {
             let path_str = hw_device.unwrap_or_else(|| "/dev/dri/renderD128".to_string());
             if Path::new(&path_str).exists() {
                 if let Ok(path) = CString::new(path_str) {
@@ -170,13 +195,26 @@ fn load(env: rustler::Env, _info: rustler::Term) -> bool {
 }
 
 #[rustler::nif]
-fn create(hw_device: String) -> NifResult<ResourceArc<Decoder>> {
+fn create(hw_device: String, decoder: Atom) -> NifResult<ResourceArc<Decoder>> {
     let path = if hw_device.is_empty() {
         None
     } else {
         Some(hw_device)
     };
-    init_decoder(path)
+    let backend = if decoder == auto() {
+        Backend::Auto
+    } else if decoder == vaapi() {
+        Backend::Vaapi
+    } else if decoder == v4l2request() {
+        Backend::V4l2Request
+    } else if decoder == v4l2m2m() {
+        Backend::V4l2M2M
+    } else if decoder == software() {
+        Backend::Software
+    } else {
+        return Err(rustler::Error::BadArg);
+    };
+    init_decoder(path, backend)
         .map(ResourceArc::new)
         .map_err(|e| rustler::Error::Term(Box::new((create_failed(), format!("{e:?}")))))
 }
