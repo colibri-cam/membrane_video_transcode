@@ -15,6 +15,21 @@ use rustler::{Atom, Binary, Env, Error, NifResult, OwnedBinary, ResourceArc, Ter
 
 const NO_PTS: i64 = i64::MIN;
 
+// get_format callback: choose DRM_PRIME when offered
+unsafe extern "C" fn get_format_drm_prime(
+    _ctx: *mut sys::AVCodecContext,
+    pix_fmts: *const sys::AVPixelFormat,
+) -> sys::AVPixelFormat {
+    let mut p = pix_fmts;
+    while !p.is_null() && *p != sys::AVPixelFormat::AV_PIX_FMT_NONE {
+        if *p == sys::AVPixelFormat::AV_PIX_FMT_DRM_PRIME {
+            return *p;
+        }
+        p = p.add(1);
+    }
+    *pix_fmts
+}
+
 #[derive(Clone, Copy)]
 enum Backend {
     Auto,
@@ -76,11 +91,25 @@ fn init_decoder(target: format::Pixel, atom: Atom, backend: Backend) -> Result<D
     };
     let mut decoder = codec::decoder::new();
     unsafe {
-        let mut hw_device_ctx = ptr::null_mut();
-        if matches!(backend, Backend::Vaapi | Backend::Auto)
-            && !use_v4l2
+        if use_v4l2 {
+            let mut hw_device_ctx = ptr::null_mut();
+            let ret = sys::av_hwdevice_ctx_create(
+                &mut hw_device_ctx,
+                sys::AVHWDeviceType::AV_HWDEVICE_TYPE_DRM,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+            );
+            if ret < 0 || hw_device_ctx.is_null() {
+                return Err(anyhow!("av_hwdevice_ctx_create DRM failed: {ret}"));
+            }
+            (*decoder.as_mut_ptr()).hw_device_ctx = sys::av_buffer_ref(hw_device_ctx);
+            (*decoder.as_mut_ptr()).get_format = Some(get_format_drm_prime);
+            sys::av_buffer_unref(&mut hw_device_ctx);
+        } else if matches!(backend, Backend::Vaapi | Backend::Auto)
             && std::path::Path::new("/dev/dri/renderD128").exists()
         {
+            let mut hw_device_ctx = ptr::null_mut();
             if let Ok(path) = CString::new("/dev/dri/renderD128") {
                 if sys::av_hwdevice_ctx_create(
                     &mut hw_device_ctx,
