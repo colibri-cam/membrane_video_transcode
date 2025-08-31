@@ -8,7 +8,9 @@ This document outlines proposed changes required for the H265 decoder, H265 prim
 - Ensure `ffmpeg` is built with the `v4l2-request` and `drm` backends enabled so hardware blocks are available.
 
 ## Decoder NIF Changes
-- Replace the hard coded VAAPI path (`/dev/dri/renderD128`) with detection logic that prefers the `rpivid` or `v4l2` decoder nodes exposed by the Pi. This applies to both the regular and prime H265 decoder NIFs.
+- Replace the hard coded VAAPI path (`/dev/dri/renderD128`) with detection logic that probes
+  for the `hevc_v4l2request` or `hevc_v4l2m2m` codecs before falling back to VAAPI or
+  software. This applies to both the regular and prime H265 decoder NIFs.
 - Fall back to software decoding when no hardware decoder is available.
 - Handle the NV12 pixel format produced by the Raspberry Pi hardware decoder without additional copies.
 
