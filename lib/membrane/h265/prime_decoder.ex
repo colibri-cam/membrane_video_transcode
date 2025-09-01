@@ -36,12 +36,14 @@ defmodule Membrane.H265.PrimeDecoder do
   )
 
   def_input_pad(:input,
-    flow_control: :auto,
+    flow_control: :manual,
+    demand_unit: :buffers,
     accepted_format: %H265{alignment: :au}
   )
 
   def_output_pad(:output,
-    flow_control: :auto,
+    flow_control: :manual,
+    demand_unit: :buffers,
     accepted_format: %PrimeFormat{}
   )
 
@@ -51,7 +53,11 @@ defmodule Membrane.H265.PrimeDecoder do
       decoder_ref: nil,
       stream_format_sent?: false,
       hw_device: opts.hw_device,
-      decoder: opts.decoder
+      decoder: opts.decoder,
+      queue: [],
+      pending_input: 0,
+      output_demand: 0,
+      end_of_stream?: false
     }
 
     {[], state}
@@ -69,17 +75,40 @@ defmodule Membrane.H265.PrimeDecoder do
   end
 
   @impl true
+  def handle_start_of_stream(:input, _ctx, state) do
+    {actions, state} = maybe_request_input(state)
+    {actions, state}
+  end
+
+  @impl true
+  def handle_demand(:output, size, _ctx, state) do
+    state = %{state | output_demand: state.output_demand + size}
+    {buf_actions, state} = send_from_queue(state)
+    {demand_actions, state} = maybe_request_input(state)
+    {buf_actions ++ demand_actions, state}
+  end
+
+  @impl true
   def handle_buffer(:input, buffer, ctx, %{decoder_ref: decoder} = state) do
     dts = Common.to_h265_time_base_truncated(buffer.dts)
     pts = Common.to_h265_time_base_truncated(buffer.pts)
 
     case Native.decode(decoder, buffer.payload, pts, dts) do
       {:ok, pts_list, descs, keepalives} ->
-        Membrane.Logger.debug("#{inspect {pts_list, descs, keepalives}}")
+        Membrane.Logger.debug("#{inspect({pts_list, descs, keepalives})}")
         in_stream_format = ctx.pads.input.stream_format
-        {actions, state} = maybe_send_stream_format(state, in_stream_format)
-        bufs = wrap_descriptors(pts_list, descs, keepalives)
-        {actions ++ bufs, state}
+        {sf_actions, state} = maybe_send_stream_format(state, in_stream_format)
+        queue_entries = Enum.zip([pts_list, descs, keepalives])
+
+        state = %{
+          state
+          | queue: state.queue ++ queue_entries,
+            pending_input: max(state.pending_input - 1, 0)
+        }
+
+        {buf_actions, state} = send_from_queue(state)
+        {demand_actions, state} = maybe_request_input(state)
+        {sf_actions ++ buf_actions ++ demand_actions, state}
 
       {:error, reason} ->
         raise "Failed to decode frame: #{inspect(reason)}"
@@ -96,9 +125,17 @@ defmodule Membrane.H265.PrimeDecoder do
     case Native.flush(decoder) do
       {:ok, pts_list, descs, keepalives} ->
         :ok = Native.close(decoder)
-        bufs = wrap_descriptors(pts_list, descs, keepalives)
-        new_state = %{state | decoder_ref: nil}
-        {bufs ++ [end_of_stream: :output], new_state}
+        queue_entries = Enum.zip([pts_list, descs, keepalives])
+
+        state = %{
+          state
+          | decoder_ref: nil,
+            queue: state.queue ++ queue_entries,
+            end_of_stream?: true
+        }
+
+        {actions, state} = send_from_queue(state)
+        {actions, state}
 
       {:error, reason} ->
         raise "Native decoder failed to flush: #{inspect(reason)}"
@@ -114,18 +151,47 @@ defmodule Membrane.H265.PrimeDecoder do
     {[terminate: :normal], %{state | decoder_ref: nil}}
   end
 
-  defp wrap_descriptors([], [], []), do: []
+  defp wrap_descriptor({p, desc, keepalive}) do
+    %Buffer{
+      pts: Common.to_membrane_time_base_truncated(p),
+      payload: <<>>,
+      metadata: %{drm_prime: desc, keepalive: keepalive}
+    }
+  end
 
-  defp wrap_descriptors(pts_list, descs, keepalives) do
-    Enum.zip([pts_list, descs, keepalives])
-    |> Enum.map(fn {p, desc, keepalive} ->
-      %Buffer{
-        pts: Common.to_membrane_time_base_truncated(p),
-        payload: <<>>,
-        metadata: %{drm_prime: desc, keepalive: keepalive}
-      }
-    end)
-    |> then(&[buffer: {:output, &1}])
+  defp send_from_queue(%{queue: queue, output_demand: demand} = state) do
+    {to_send, rest} = Enum.split(queue, demand)
+    buffers = Enum.map(to_send, &wrap_descriptor/1)
+
+    actions =
+      if buffers == [] do
+        []
+      else
+        [buffer: {:output, buffers}]
+      end
+
+    state = %{state | queue: rest, output_demand: demand - length(to_send)}
+
+    actions =
+      if state.end_of_stream? and state.queue == [] do
+        actions ++ [end_of_stream: :output]
+      else
+        actions
+      end
+
+    {actions, state}
+  end
+
+  defp maybe_request_input(%{queue: queue, pending_input: pending} = state) do
+    free = 2 - (length(queue) + pending)
+
+    cond do
+      free <= 0 or state.end_of_stream? or is_nil(state.decoder_ref) ->
+        {[], state}
+
+      true ->
+        {[demand: {:input, free}], %{state | pending_input: pending + free}}
+    end
   end
 
   defp maybe_send_stream_format(%{stream_format_sent?: true} = state, _in_sf), do: {[], state}
