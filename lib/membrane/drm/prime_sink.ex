@@ -51,10 +51,7 @@ defmodule Membrane.DRM.PrimeSink do
   end
 
   @impl true
-  def handle_setup(_ctx, state), do: {[], state}
-
-  @impl true
-  def handle_stream_format(:input, %PrimeFormat{}, _ctx, %{display: nil} = state) do
+  def handle_setup(_ctx, state) do
     {:ok, info, display} = Native.init_display(state.card, state.preferred_mode)
     {w, h, r} = info.mode
 
@@ -65,6 +62,19 @@ defmodule Membrane.DRM.PrimeSink do
 
     {[], %{state | display: display}}
   end
+
+  @impl true
+  #def handle_stream_format(:input, %PrimeFormat{}, _ctx, %{display: nil} = state) do
+  #  {:ok, info, display} = Native.init_display(state.card, state.preferred_mode)
+  #  {w, h, r} = info.mode
+
+  #  Membrane.Logger.info(
+  #    "Using card #{info.card_path}, connector #{info.connector_id} (#{info.connector_type}), " <>
+  #      "plane #{info.plane_id}, mode #{w}x#{h}@#{r}"
+  #  )
+
+  #  {[], %{state | display: display}}
+  #end
 
   def handle_stream_format(:input, _, _ctx, state), do: {[], state}
 
@@ -82,6 +92,7 @@ defmodule Membrane.DRM.PrimeSink do
       ) do
     case Native.display_prime(state.display, desc) do
       :ok ->
+        Membrane.Logger.debug("Displayed frame: #{inspect(desc)}")
         {[demand: :input], %{state | last_desc: desc, last_keepalive: keepalive}}
 
       {:error, reason} ->
@@ -102,6 +113,7 @@ defmodule Membrane.DRM.PrimeSink do
         %{last_pts: nil, last_desc: nil} ->
           case Native.display_prime(state.display, desc) do
             :ok ->
+              Membrane.Logger.debug("Displayed frame: #{inspect(desc)}")
               [demand: :input, start_timer: {:demand_timer, :no_interval}]
 
             {:error, reason} ->
@@ -124,6 +136,7 @@ defmodule Membrane.DRM.PrimeSink do
   def handle_tick(:demand_timer, _ctx, state) do
     case Native.display_prime(state.display, state.last_desc) do
       :ok ->
+        Membrane.Logger.debug("Displayed frame: #{inspect(state.last_desc)}")
         {[timer_interval: {:demand_timer, :no_interval}, demand: :input], state}
 
       {:error, reason} ->

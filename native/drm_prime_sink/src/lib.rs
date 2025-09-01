@@ -16,9 +16,6 @@ use drm::{ClientCapability, Device as _, buffer, control};
 use drm_fourcc::DrmFourcc;
 use rustler::{Atom, Decoder, Encoder, NifResult, ResourceArc};
 
-#[cfg(feature = "rpi")]
-const DRM_FORMAT_MOD_BROADCOM_SAND128: u64 = 0x0700_0000_0000_0004;
-
 #[cfg(feature = "verbose")]
 macro_rules! log {
     ($($t:tt)*) => { println!($($t)*); };
@@ -184,7 +181,6 @@ fn find_vc4_card() -> std::io::Result<String> {
 struct DisplayInner {
     card: Card,
     #[cfg(feature = "rpi")]
-    is_vc4: bool,
     conn: connector::Handle,
     crtc: crtc::Handle,
     plane: plane::Handle,
@@ -201,6 +197,8 @@ struct DisplayInner {
     prop_crtc_y: property::Handle,
     prop_crtc_w: property::Handle,
     prop_crtc_h: property::Handle,
+    // Optional/driver-specific properties
+    prop_zpos: Option<property::Handle>,
     mode_blob: u64,
     setup: bool,
     stale: Option<FbWithHandles>,
@@ -216,6 +214,9 @@ fn open_card(path: &str) -> std::io::Result<Card> {
 fn enable_atomic(card: &Card) -> std::io::Result<()> {
     card.set_client_capability(ClientCapability::UniversalPlanes, true)?;
     card.set_client_capability(ClientCapability::Atomic, true)?;
+    // Enable AddFB2 modifiers where supported (ignore error on old kernels)
+    // Note: AddFB2Modifiers is a device capability (not a client capability) in drm-rs 0.14.
+    // We will probe it where needed instead.
     log!("Enabled client caps: UNIVERSAL_PLANES + ATOMIC");
     Ok(())
 }
@@ -277,17 +278,23 @@ fn pick_connected_connector(
     }
 }
 
-fn plane_is_primary(card: &Card, ph: plane::Handle) -> bool {
+/// DRM plane type enum values are driver-defined but most drivers use:
+/// 0=OVERLAY, 1=PRIMARY, 2=CURSOR (matches modetest)
+fn plane_type_value(card: &Card, ph: plane::Handle) -> Option<u64> {
     if let Ok(props) = card.get_properties(ph) {
         for (handle, value) in props.iter() {
             if let Ok(info) = card.get_property(*handle) {
                 if info.name().to_bytes() == b"type" {
-                    return *value == 0;
+                    return Some(*value);
                 }
             }
         }
     }
-    false
+    None
+}
+
+fn plane_is_overlay(card: &Card, ph: plane::Handle) -> bool {
+    plane_type_value(card, ph) == Some(0)
 }
 
 fn find_prop(
@@ -377,28 +384,37 @@ impl DisplayInner {
             mode.size().1,
             mode.vrefresh()
         );
+
+        // -------- Plane selection --------
         let planes = card
             .plane_handles()
             .map_err(|e| std::io::Error::new(e.kind(), format!("plane handles: {e}")))?;
-        let plane = planes
-            .as_slice()
-            .iter()
-            .find_map(|p| {
-                let info = card.get_plane(*p).ok()?;
-                let allowed = res.filter_crtcs(info.possible_crtcs());
-                if allowed.contains(&crtc)
-                    && info.formats().contains(&(buffer::DrmFourcc::Nv12 as u32))
-                    && (!is_vc4 || plane_is_primary(&card, *p))
-                {
-                    Some(*p)
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "no suitable NV12 plane")
+        let mut chosen: Option<plane::Handle> = None;
+        for &p in planes.as_slice() {
+            let info = card.get_plane(p).map_err(|e| {
+                std::io::Error::new(e.kind(), format!("get plane {}: {e}", u32::from(p)))
             })?;
-        log!("Selected plane: id={}", u32::from(plane));
+            let allowed = res.filter_crtcs(info.possible_crtcs());
+            let supports_nv12 = info.formats().contains(&(buffer::DrmFourcc::Nv12 as u32));
+            if !allowed.contains(&crtc) || !supports_nv12 {
+                continue;
+            }
+            if is_vc4 && plane_is_overlay(&card, p) {
+                chosen = Some(p);
+                break; // prefer overlay plane on VC4
+            }
+            if chosen.is_none() {
+                chosen = Some(p);
+            }
+        }
+        let plane = chosen.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no suitable NV12 plane")
+        })?;
+        log!(
+            "Selected plane: id={}, type_val={:?}",
+            u32::from(plane),
+            plane_type_value(&card, plane)
+        );
 
         let mode_blob_val = card
             .create_property_blob(&mode)
@@ -425,6 +441,9 @@ impl DisplayInner {
         let prop_crtc_w = find_prop(&card, plane, &name("CRTC_W"))?;
         let prop_crtc_h = find_prop(&card, plane, &name("CRTC_H"))?;
 
+        // Optional props
+        let prop_zpos = find_prop(&card, plane, &name("ZPOS")).ok();
+
         let mode_info = (
             u32::from(mode.size().0),
             u32::from(mode.size().1),
@@ -443,7 +462,6 @@ impl DisplayInner {
             Self {
                 card,
                 #[cfg(feature = "rpi")]
-                is_vc4,
                 conn: conn.handle(),
                 crtc,
                 plane,
@@ -460,6 +478,7 @@ impl DisplayInner {
                 prop_crtc_y,
                 prop_crtc_w,
                 prop_crtc_h,
+                prop_zpos,
                 mode_blob: blob_id,
                 setup: false,
                 stale: None,
@@ -493,6 +512,7 @@ impl DisplayInner {
                 property::Value::Blob(self.mode_blob),
             );
             req.add_property(self.crtc, self.prop_active, property::Value::Boolean(true));
+            // Source coordinates (in 16.16 fixed point)
             req.add_property(
                 self.plane,
                 self.prop_src_x,
@@ -513,6 +533,7 @@ impl DisplayInner {
                 self.prop_src_h,
                 property::Value::UnsignedRange((desc.height as u64) << 16),
             );
+            // Destination on CRTC
             req.add_property(
                 self.plane,
                 self.prop_crtc_x,
@@ -533,6 +554,10 @@ impl DisplayInner {
                 self.prop_crtc_h,
                 property::Value::UnsignedRange(desc.height as u64),
             );
+            // Optional helpers: ZPOS and YUV color props if present
+            if let Some(zpos) = self.prop_zpos {
+                req.add_property(self.plane, zpos, property::Value::UnsignedRange(1));
+            }
             self.setup = true;
         }
         req.add_property(
@@ -547,6 +572,7 @@ impl DisplayInner {
             control::AtomicCommitFlags::empty()
         };
         if let Err(e) = self.card.atomic_commit(flags, req) {
+            eprintln!("atomic_commit error: {e:?}");
             let _ = self.card.destroy_framebuffer(new_fb.fb);
             close_unique_handles(&new_fb.handles, |h| self.card.close_buffer(h))?;
             return Err(std::io::Error::new(e.kind(), format!("atomic commit: {e}")));
@@ -556,7 +582,7 @@ impl DisplayInner {
             // 1) Drop the KMS FB
             self.card.destroy_framebuffer(stale_fb.fb)?;
             // 2) Close handles associated with the stale framebuffer
-            close_unique_handles(&stale_fb.handles, |h| self.card.close_buffer(h))?;
+            //close_unique_handles(&stale_fb.handles, |h| self.card.close_buffer(h))?;
         }
 
         self.stale = self.in_flight.take();
@@ -565,8 +591,6 @@ impl DisplayInner {
     }
 
     /// Create a KMS framebuffer from your PrimeDesc using drm-rs 0.14.
-    /// Accept any type that implements both `drm::Device` and `drm::control::Device`
-    /// (e.g., `&drm::DeviceFd`).
     fn add_fb_from_prime_desc(&mut self, prime: &PrimeDesc) -> Result<FbWithHandles> {
         if prime.planes.is_empty() {
             bail!("PrimeDesc has no planes");
@@ -601,27 +625,21 @@ impl DisplayInner {
                 Some(prev) => bail!("mixed plane modifiers not supported ({} vs {})", prev, m),
             }
         }
-        #[allow(unused_mut)]
-        let mut modifier = common_mod.map(DrmModifier::from);
-        #[cfg(feature = "rpi")]
-        {
-            if modifier.is_none() && self.is_vc4 {
-                modifier = Some(DrmModifier::from(DRM_FORMAT_MOD_BROADCOM_SAND128));
-            }
-        }
+        let modifier = common_mod.map(DrmModifier::from);
+        // On RPi/VC4 we DO NOT force a SAND modifier automatically anymore.
 
         // Build PlanarBuffer
         let pb = PrimePlanarBuf {
             w: prime.width,
             h: prime.height,
-            fourcc: prime.format.0, // your Fourcc newtype wraps DrmFourcc
+            fourcc: prime.format.0,
             pitches,
             offsets,
             handles,
             modifier,
         };
 
-        // Use MODIFIERS flag iff we actually have one
+        // Use MODIFIERS flag iff we actually have one **and** the device reports support
         let flags = if modifier.is_some() {
             FbCmd2Flags::MODIFIERS
         } else {
@@ -654,8 +672,7 @@ impl Drop for DisplayInner {
 impl DisplayInner {
     fn run(mut self, rx: mpsc::Receiver<PrimeDesc>, err: Arc<Mutex<Option<String>>>) {
         while let Ok(mut desc) = rx.recv() {
-            // If there are more frames in the queue
-            // take only last one
+            // Coalesce queue: only display the most recent
             while let Ok(d) = rx.try_recv() {
                 desc = d;
             }

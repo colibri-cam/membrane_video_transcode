@@ -1,13 +1,15 @@
 defmodule Membrane.DRM.PrimeSink.Native do
   @rustler_opts Mix.Project.config()[:rustler_opts]
+  @features ["verbose" | Keyword.get(@rustler_opts, :features, [])]
 
   use Rustler,
       Keyword.merge(
+        @rustler_opts,
         [
           otp_app: :drm_experiments,
-          crate: "drm_prime_sink"
-        ],
-        @rustler_opts
+          crate: "drm_prime_sink",
+          features: @features
+        ]
       )
 
   def init_display(_card_path, _preferred_mode), do: :erlang.nif_error(:nif_not_loaded)
