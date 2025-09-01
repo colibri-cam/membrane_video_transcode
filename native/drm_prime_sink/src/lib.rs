@@ -10,7 +10,8 @@ use anyhow::{Context, Result, bail}; // gives you Result and bail!
 use drm::buffer::{DrmModifier, Handle as GemHandle, PlanarBuffer};
 
 use drm::control::{
-    Device as _, FbCmd2Flags, atomic::AtomicModeReq, connector, crtc, framebuffer, plane, property,
+    Device as _, FbCmd2Flags, atomic::AtomicModeReq, connector, crtc, dumbbuffer as dumbbuf,
+    framebuffer, plane, property,
 };
 use drm::{ClientCapability, Device as _, buffer, control};
 use drm_fourcc::DrmFourcc;
@@ -180,10 +181,11 @@ fn find_vc4_card() -> std::io::Result<String> {
 
 struct DisplayInner {
     card: Card,
-    #[cfg(feature = "rpi")]
     conn: connector::Handle,
     crtc: crtc::Handle,
     plane: plane::Handle,
+    primary_plane: plane::Handle,
+    boot_primary_fb: Option<(framebuffer::Handle, dumbbuf::DumbBuffer)>,
     prop_fb: property::Handle,
     prop_crtc: property::Handle,
     prop_conn_crtc: property::Handle,
@@ -197,9 +199,21 @@ struct DisplayInner {
     prop_crtc_y: property::Handle,
     prop_crtc_w: property::Handle,
     prop_crtc_h: property::Handle,
+    prim_prop_fb: property::Handle,
+    prim_prop_crtc: property::Handle,
+    prim_prop_src_x: property::Handle,
+    prim_prop_src_y: property::Handle,
+    prim_prop_src_w: property::Handle,
+    prim_prop_src_h: property::Handle,
+    prim_prop_crtc_x: property::Handle,
+    prim_prop_crtc_y: property::Handle,
+    prim_prop_crtc_w: property::Handle,
+    prim_prop_crtc_h: property::Handle,
     // Optional/driver-specific properties
     prop_zpos: Option<property::Handle>,
     mode_blob: u64,
+    mode_w: u32,
+    mode_h: u32,
     setup: bool,
     stale: Option<FbWithHandles>,
     in_flight: Option<FbWithHandles>,
@@ -315,6 +329,54 @@ fn find_prop(
     ))
 }
 
+fn find_primary_plane(
+    card: &Card,
+    res: &control::ResourceHandles,
+    crtc: crtc::Handle,
+) -> io::Result<plane::Handle> {
+    for &ph in card.plane_handles()?.as_slice() {
+        let info = card.get_plane(ph)?;
+        if !res.filter_crtcs(info.possible_crtcs()).contains(&crtc) {
+            continue;
+        }
+        if plane_type_value(card, ph) == Some(1) {
+            return Ok(ph);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no PRIMARY plane for CRTC",
+    ))
+}
+
+fn load_primary_props(
+    card: &Card,
+    primary: plane::Handle,
+) -> io::Result<(property::Handle, property::Handle, [property::Handle; 8])> {
+    let n = |s: &str| CString::new(s).unwrap();
+    let fb = find_prop(card, primary, &n("FB_ID"))?;
+    let crtc = find_prop(card, primary, &n("CRTC_ID"))?;
+    let src_x = find_prop(card, primary, &n("SRC_X"))?;
+    let src_y = find_prop(card, primary, &n("SRC_Y"))?;
+    let src_w = find_prop(card, primary, &n("SRC_W"))?;
+    let src_h = find_prop(card, primary, &n("SRC_H"))?;
+    let cx = find_prop(card, primary, &n("CRTC_X"))?;
+    let cy = find_prop(card, primary, &n("CRTC_Y"))?;
+    let cw = find_prop(card, primary, &n("CRTC_W"))?;
+    let ch = find_prop(card, primary, &n("CRTC_H"))?;
+    Ok((fb, crtc, [src_x, src_y, src_w, src_h, cx, cy, cw, ch]))
+}
+
+fn make_primary_boot_fb(
+    card: &Card,
+    _w: u32,
+    _h: u32,
+) -> io::Result<(framebuffer::Handle, dumbbuf::DumbBuffer)> {
+    let db = card.create_dumb_buffer((8, 8), buffer::DrmFourcc::Xrgb8888, 32)?;
+    let fb = card.add_framebuffer(&db, 24, 32)?;
+    Ok((fb, db))
+}
+
 impl DisplayInner {
     fn new(
         card_path: &str,
@@ -416,6 +478,25 @@ impl DisplayInner {
             plane_type_value(&card, plane)
         );
 
+        let primary_plane = find_primary_plane(&card, &res, crtc)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("find primary plane: {e}")))?;
+        let (prim_prop_fb, prim_prop_crtc, prim_props) =
+            load_primary_props(&card, primary_plane)
+                .map_err(|e| std::io::Error::new(e.kind(), format!("load primary props: {e}")))?;
+        let [
+            prim_prop_src_x,
+            prim_prop_src_y,
+            prim_prop_src_w,
+            prim_prop_src_h,
+            prim_prop_crtc_x,
+            prim_prop_crtc_y,
+            prim_prop_crtc_w,
+            prim_prop_crtc_h,
+        ] = prim_props;
+
+        let mode_w = u32::from(mode.size().0);
+        let mode_h = u32::from(mode.size().1);
+
         let mode_blob_val = card
             .create_property_blob(&mode)
             .map_err(|e| std::io::Error::new(e.kind(), format!("create mode blob: {e}")))?;
@@ -461,10 +542,11 @@ impl DisplayInner {
         Ok((
             Self {
                 card,
-                #[cfg(feature = "rpi")]
                 conn: conn.handle(),
                 crtc,
                 plane,
+                primary_plane,
+                boot_primary_fb: None,
                 prop_fb,
                 prop_crtc,
                 prop_conn_crtc,
@@ -478,8 +560,20 @@ impl DisplayInner {
                 prop_crtc_y,
                 prop_crtc_w,
                 prop_crtc_h,
+                prim_prop_fb,
+                prim_prop_crtc,
+                prim_prop_src_x,
+                prim_prop_src_y,
+                prim_prop_src_w,
+                prim_prop_src_h,
+                prim_prop_crtc_x,
+                prim_prop_crtc_y,
+                prim_prop_crtc_w,
+                prim_prop_crtc_h,
                 prop_zpos,
                 mode_blob: blob_id,
+                mode_w,
+                mode_h,
                 setup: false,
                 stale: None,
                 in_flight: None,
@@ -488,100 +582,176 @@ impl DisplayInner {
         ))
     }
 
+    fn first_commit_with_primary(&mut self) -> io::Result<()> {
+        if self.boot_primary_fb.is_none() {
+            let fb = make_primary_boot_fb(&self.card, 8, 8)?;
+            self.boot_primary_fb = Some(fb);
+        }
+        let (p_fb, _) = self.boot_primary_fb.as_ref().unwrap();
+        let mut req = AtomicModeReq::new();
+        req.add_property(
+            self.crtc,
+            self.prop_mode,
+            property::Value::Blob(self.mode_blob),
+        );
+        req.add_property(self.crtc, self.prop_active, property::Value::Boolean(true));
+        req.add_property(
+            self.conn,
+            self.prop_conn_crtc,
+            property::Value::CRTC(Some(self.crtc)),
+        );
+        req.add_property(
+            self.primary_plane,
+            self.prim_prop_crtc,
+            property::Value::CRTC(Some(self.crtc)),
+        );
+        req.add_property(
+            self.primary_plane,
+            self.prim_prop_fb,
+            property::Value::Framebuffer(Some(*p_fb)),
+        );
+        req.add_property(
+            self.primary_plane,
+            self.prim_prop_src_x,
+            property::Value::UnsignedRange(0),
+        );
+        req.add_property(
+            self.primary_plane,
+            self.prim_prop_src_y,
+            property::Value::UnsignedRange(0),
+        );
+        req.add_property(
+            self.primary_plane,
+            self.prim_prop_src_w,
+            property::Value::UnsignedRange((self.mode_w as u64) << 16),
+        );
+        req.add_property(
+            self.primary_plane,
+            self.prim_prop_src_h,
+            property::Value::UnsignedRange((self.mode_h as u64) << 16),
+        );
+        req.add_property(
+            self.primary_plane,
+            self.prim_prop_crtc_x,
+            property::Value::SignedRange(0),
+        );
+        req.add_property(
+            self.primary_plane,
+            self.prim_prop_crtc_y,
+            property::Value::SignedRange(0),
+        );
+        req.add_property(
+            self.primary_plane,
+            self.prim_prop_crtc_w,
+            property::Value::UnsignedRange(self.mode_w as u64),
+        );
+        req.add_property(
+            self.primary_plane,
+            self.prim_prop_crtc_h,
+            property::Value::UnsignedRange(self.mode_h as u64),
+        );
+        self.card
+            .atomic_commit(control::AtomicCommitFlags::ALLOW_MODESET, req)?;
+        Ok(())
+    }
+
+    fn second_commit_overlay_and_disable_primary(
+        &mut self,
+        overlay_fb: framebuffer::Handle,
+        desc_w: u32,
+        desc_h: u32,
+    ) -> io::Result<()> {
+        let mut req = AtomicModeReq::new();
+        req.add_property(
+            self.plane,
+            self.prop_crtc,
+            property::Value::CRTC(Some(self.crtc)),
+        );
+        req.add_property(
+            self.plane,
+            self.prop_fb,
+            property::Value::Framebuffer(Some(overlay_fb)),
+        );
+        req.add_property(
+            self.plane,
+            self.prop_src_x,
+            property::Value::UnsignedRange(0),
+        );
+        req.add_property(
+            self.plane,
+            self.prop_src_y,
+            property::Value::UnsignedRange(0),
+        );
+        req.add_property(
+            self.plane,
+            self.prop_src_w,
+            property::Value::UnsignedRange((desc_w as u64) << 16),
+        );
+        req.add_property(
+            self.plane,
+            self.prop_src_h,
+            property::Value::UnsignedRange((desc_h as u64) << 16),
+        );
+        req.add_property(
+            self.plane,
+            self.prop_crtc_x,
+            property::Value::SignedRange(0),
+        );
+        req.add_property(
+            self.plane,
+            self.prop_crtc_y,
+            property::Value::SignedRange(0),
+        );
+        req.add_property(
+            self.plane,
+            self.prop_crtc_w,
+            property::Value::UnsignedRange(self.mode_w as u64),
+        );
+        req.add_property(
+            self.plane,
+            self.prop_crtc_h,
+            property::Value::UnsignedRange(self.mode_h as u64),
+        );
+        if let Some(zpos) = self.prop_zpos {
+            req.add_property(self.plane, zpos, property::Value::UnsignedRange(1));
+        }
+        req.add_property(
+            self.primary_plane,
+            self.prim_prop_fb,
+            property::Value::Framebuffer(None),
+        );
+        self.card
+            .atomic_commit(control::AtomicCommitFlags::empty(), req)?;
+        if let Some((fb, db)) = self.boot_primary_fb.take() {
+            let _ = self.card.destroy_framebuffer(fb);
+            let _ = self.card.destroy_dumb_buffer(db);
+        }
+        Ok(())
+    }
+
     fn display(&mut self, desc: PrimeDesc) -> std::io::Result<()> {
         let new_fb = self.add_fb_from_prime_desc(&desc).map_err(|e| {
             log!("Add fb from prime error: {}", e);
             io::Error::other(e)
         })?;
 
-        let mut req = AtomicModeReq::new();
         if !self.setup {
-            req.add_property(
-                self.plane,
-                self.prop_crtc,
-                property::Value::CRTC(Some(self.crtc)),
-            );
-            req.add_property(
-                self.conn,
-                self.prop_conn_crtc,
-                property::Value::CRTC(Some(self.crtc)),
-            );
-            req.add_property(
-                self.crtc,
-                self.prop_mode,
-                property::Value::Blob(self.mode_blob),
-            );
-            req.add_property(self.crtc, self.prop_active, property::Value::Boolean(true));
-            // Source coordinates (in 16.16 fixed point)
-            req.add_property(
-                self.plane,
-                self.prop_src_x,
-                property::Value::UnsignedRange(0),
-            );
-            req.add_property(
-                self.plane,
-                self.prop_src_y,
-                property::Value::UnsignedRange(0),
-            );
-            req.add_property(
-                self.plane,
-                self.prop_src_w,
-                property::Value::UnsignedRange((desc.width as u64) << 16),
-            );
-            req.add_property(
-                self.plane,
-                self.prop_src_h,
-                property::Value::UnsignedRange((desc.height as u64) << 16),
-            );
-            // Destination on CRTC
-            req.add_property(
-                self.plane,
-                self.prop_crtc_x,
-                property::Value::SignedRange(0),
-            );
-            req.add_property(
-                self.plane,
-                self.prop_crtc_y,
-                property::Value::SignedRange(0),
-            );
-            req.add_property(
-                self.plane,
-                self.prop_crtc_w,
-                property::Value::UnsignedRange(desc.width as u64),
-            );
-            req.add_property(
-                self.plane,
-                self.prop_crtc_h,
-                property::Value::UnsignedRange(desc.height as u64),
-            );
-            // Optional helpers: ZPOS and YUV color props if present
-            if let Some(zpos) = self.prop_zpos {
-                req.add_property(self.plane, zpos, property::Value::UnsignedRange(1));
-            }
+            self.first_commit_with_primary()?;
             self.setup = true;
         }
-        req.add_property(
-            self.plane,
-            self.prop_fb,
-            property::Value::Framebuffer(Some(new_fb.fb)),
-        );
 
-        let flags = if self.stale.is_none() && self.in_flight.is_none() {
-            control::AtomicCommitFlags::ALLOW_MODESET
-        } else {
-            control::AtomicCommitFlags::empty()
-        };
-        if let Err(e) = self.card.atomic_commit(flags, req) {
+        if let Err(e) =
+            self.second_commit_overlay_and_disable_primary(new_fb.fb, desc.width, desc.height)
+        {
             eprintln!("atomic_commit error: {e:?}");
             let _ = self.card.destroy_framebuffer(new_fb.fb);
             close_unique_handles(&new_fb.handles, |h| self.card.close_buffer(h))?;
             return Err(std::io::Error::new(e.kind(), format!("atomic commit: {e}")));
-        };
+        }
+
         if let Some(stale_fb) = self.stale.take() {
             log!("Dropping stale framebuffer {:?}\n", stale_fb);
-            // 1) Drop the KMS FB
             self.card.destroy_framebuffer(stale_fb.fb)?;
-            // 2) Close handles associated with the stale framebuffer
             //close_unique_handles(&stale_fb.handles, |h| self.card.close_buffer(h))?;
         }
 
@@ -664,6 +834,10 @@ impl Drop for DisplayInner {
         if let Some(FbWithHandles { fb, handles }) = self.in_flight.take() {
             let _ = self.card.destroy_framebuffer(fb);
             let _ = close_unique_handles(&handles, |h| self.card.close_buffer(h));
+        }
+        if let Some((fb, db)) = self.boot_primary_fb.take() {
+            let _ = self.card.destroy_framebuffer(fb);
+            let _ = self.card.destroy_dumb_buffer(db);
         }
         let _ = self.card.destroy_property_blob(self.mode_blob);
     }
