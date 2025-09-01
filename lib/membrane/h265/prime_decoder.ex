@@ -75,6 +75,7 @@ defmodule Membrane.H265.PrimeDecoder do
 
     case Native.decode(decoder, buffer.payload, pts, dts) do
       {:ok, pts_list, descs, keepalives} ->
+        Membrane.Logger.debug("#{inspect {pts_list, descs, keepalives}}")
         in_stream_format = ctx.pads.input.stream_format
         {actions, state} = maybe_send_stream_format(state, in_stream_format)
         bufs = wrap_descriptors(pts_list, descs, keepalives)

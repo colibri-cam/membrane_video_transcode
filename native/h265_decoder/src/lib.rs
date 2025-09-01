@@ -20,14 +20,16 @@ unsafe extern "C" fn get_format_drm_prime(
     _ctx: *mut sys::AVCodecContext,
     pix_fmts: *const sys::AVPixelFormat,
 ) -> sys::AVPixelFormat {
-    let mut p = pix_fmts;
-    while !p.is_null() && *p != sys::AVPixelFormat::AV_PIX_FMT_NONE {
-        if *p == sys::AVPixelFormat::AV_PIX_FMT_DRM_PRIME {
-            return *p;
+    unsafe {
+        let mut p = pix_fmts;
+        while !p.is_null() && *p != sys::AVPixelFormat::AV_PIX_FMT_NONE {
+            if *p == sys::AVPixelFormat::AV_PIX_FMT_DRM_PRIME {
+                return *p;
+            }
+            p = p.add(1);
         }
-        p = p.add(1);
+        *pix_fmts
     }
-    *pix_fmts
 }
 
 #[derive(Clone, Copy)]
