@@ -752,7 +752,7 @@ impl DisplayInner {
         if let Some(stale_fb) = self.stale.take() {
             log!("Dropping stale framebuffer {:?}\n", stale_fb);
             self.card.destroy_framebuffer(stale_fb.fb)?;
-            //close_unique_handles(&stale_fb.handles, |h| self.card.close_buffer(h))?;
+            close_unique_handles(&stale_fb.handles, |h| self.card.close_buffer(h))?;
         }
 
         self.stale = self.in_flight.take();
