@@ -163,14 +163,12 @@ fn driver_is_vc4(card: &Card) -> bool {
 fn find_vc4_card() -> std::io::Result<String> {
     for entry in std::fs::read_dir("/dev/dri")? {
         let path = entry?.path();
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with("card") {
-                if let Ok(card) = open_card(path.to_str().unwrap()) {
-                    if driver_is_vc4(&card) {
-                        return Ok(path.to_string_lossy().into_owned());
-                    }
-                }
-            }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.starts_with("card")
+            && let Ok(card) = open_card(path.to_str().unwrap())
+            && driver_is_vc4(&card)
+        {
+            return Ok(path.to_string_lossy().into_owned());
         }
     }
     Err(std::io::Error::new(
@@ -297,10 +295,10 @@ fn pick_connected_connector(
 fn plane_type_value(card: &Card, ph: plane::Handle) -> Option<u64> {
     if let Ok(props) = card.get_properties(ph) {
         for (handle, value) in props.iter() {
-            if let Ok(info) = card.get_property(*handle) {
-                if info.name().to_bytes() == b"type" {
-                    return Some(*value);
-                }
+            if let Ok(info) = card.get_property(*handle)
+                && info.name().to_bytes() == b"type"
+            {
+                return Some(*value);
             }
         }
     }
@@ -369,10 +367,10 @@ fn load_primary_props(
 
 fn make_primary_boot_fb(
     card: &Card,
-    _w: u32,
-    _h: u32,
+    w: u32,
+    h: u32,
 ) -> io::Result<(framebuffer::Handle, dumbbuf::DumbBuffer)> {
-    let db = card.create_dumb_buffer((8, 8), buffer::DrmFourcc::Xrgb8888, 32)?;
+    let db = card.create_dumb_buffer((w, h), buffer::DrmFourcc::Xrgb8888, 32)?;
     let fb = card.add_framebuffer(&db, 24, 32)?;
     Ok((fb, db))
 }
@@ -591,7 +589,7 @@ impl DisplayInner {
 
     fn first_commit_with_primary(&mut self) -> io::Result<()> {
         if self.boot_primary_fb.is_none() {
-            let fb = make_primary_boot_fb(&self.card, 8, 8)?;
+            let fb = make_primary_boot_fb(&self.card, self.mode_w, self.mode_h)?;
             self.boot_primary_fb = Some(fb);
         }
         let (p_fb, _) = self.boot_primary_fb.as_ref().unwrap();
