@@ -15,6 +15,7 @@ use drm::control::{
 use drm::{ClientCapability, Device as _, buffer, control};
 use drm_fourcc::DrmFourcc;
 use rustler::{Atom, Decoder, Encoder, NifResult, ResourceArc};
+use std::io::ErrorKind;
 
 #[cfg(feature = "verbose")]
 macro_rules! log {
@@ -180,7 +181,6 @@ fn find_vc4_card() -> std::io::Result<String> {
 
 struct DisplayInner {
     card: Card,
-    #[cfg(feature = "rpi")]
     conn: connector::Handle,
     crtc: crtc::Handle,
     plane: plane::Handle,
@@ -229,7 +229,22 @@ where
     let mut seen = HashSet::new();
     for h in handles.iter().flatten().copied() {
         if seen.insert(h) {
-            close_fn(h)?;
+            match close_fn(h) {
+                Ok(_) => break,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e)
+                    if e.kind() == ErrorKind::InvalidInput || e.kind() == ErrorKind::NotFound =>
+                {
+                    // Some drivers or wrapper layers report these when a handle was already closed.
+                    log!("close_buffer(): already closed ({e})");
+                    break;
+                }
+                Err(e) => {
+                    // Don’t crash the process/NIF; just log and continue.
+                    log!("close_buffer() failed: {e}");
+                    break;
+                }
+            }
         }
     }
     Ok(())
@@ -461,7 +476,6 @@ impl DisplayInner {
         Ok((
             Self {
                 card,
-                #[cfg(feature = "rpi")]
                 conn: conn.handle(),
                 crtc,
                 plane,
@@ -577,12 +591,13 @@ impl DisplayInner {
             close_unique_handles(&new_fb.handles, |h| self.card.close_buffer(h))?;
             return Err(std::io::Error::new(e.kind(), format!("atomic commit: {e}")));
         };
+
         if let Some(stale_fb) = self.stale.take() {
             log!("Dropping stale framebuffer {:?}\n", stale_fb);
             // 1) Drop the KMS FB
             self.card.destroy_framebuffer(stale_fb.fb)?;
             // 2) Close handles associated with the stale framebuffer
-            //close_unique_handles(&stale_fb.handles, |h| self.card.close_buffer(h))?;
+            close_unique_handles(&stale_fb.handles, |h| self.card.close_buffer(h))?;
         }
 
         self.stale = self.in_flight.take();
