@@ -4,9 +4,8 @@ defmodule Membrane.H265.PrimeDecoder do
   raw frame payloads. Each decoded frame is sent downstream as an empty buffer
   with the descriptor attached under the `:drm_prime` metadata key.
 
-  It also returns keepalive which is a reference to AV frame in GPU
-  memory. When reference gets GCed AV frame get's release. Keep
-  keepalive in pipeline until prime descriptor reaches consumer.
+  The descriptor contains an embedded keepalive reference to the underlying AV
+  frame. Once the descriptor is dropped, the frame is released automatically.
   """
 
   use Membrane.Filter
@@ -74,11 +73,11 @@ defmodule Membrane.H265.PrimeDecoder do
     pts = Common.to_h265_time_base_truncated(buffer.pts)
 
     case Native.decode(decoder, buffer.payload, pts, dts) do
-      {:ok, pts_list, descs, keepalives} ->
-        Membrane.Logger.debug("#{inspect {pts_list, descs, keepalives}}")
+      {:ok, pts_list, descs} ->
+        Membrane.Logger.debug("#{inspect({pts_list, descs})}")
         in_stream_format = ctx.pads.input.stream_format
         {actions, state} = maybe_send_stream_format(state, in_stream_format)
-        bufs = wrap_descriptors(pts_list, descs, keepalives)
+        bufs = wrap_descriptors(pts_list, descs)
         {actions ++ bufs, state}
 
       {:error, reason} ->
@@ -94,9 +93,9 @@ defmodule Membrane.H265.PrimeDecoder do
   @impl true
   def handle_end_of_stream(:input, _ctx, %{decoder_ref: decoder} = state) do
     case Native.flush(decoder) do
-      {:ok, pts_list, descs, keepalives} ->
+      {:ok, pts_list, descs} ->
         :ok = Native.close(decoder)
-        bufs = wrap_descriptors(pts_list, descs, keepalives)
+        bufs = wrap_descriptors(pts_list, descs)
         new_state = %{state | decoder_ref: nil}
         {bufs ++ [end_of_stream: :output], new_state}
 
@@ -114,15 +113,15 @@ defmodule Membrane.H265.PrimeDecoder do
     {[terminate: :normal], %{state | decoder_ref: nil}}
   end
 
-  defp wrap_descriptors([], [], []), do: []
+  defp wrap_descriptors([], []), do: []
 
-  defp wrap_descriptors(pts_list, descs, keepalives) do
-    Enum.zip([pts_list, descs, keepalives])
-    |> Enum.map(fn {p, desc, keepalive} ->
+  defp wrap_descriptors(pts_list, descs) do
+    Enum.zip([pts_list, descs])
+    |> Enum.map(fn {p, desc} ->
       %Buffer{
         pts: Common.to_membrane_time_base_truncated(p),
         payload: <<>>,
-        metadata: %{drm_prime: desc, keepalive: keepalive}
+        metadata: %{drm_prime: desc}
       }
     end)
     |> then(&[buffer: {:output, &1}])

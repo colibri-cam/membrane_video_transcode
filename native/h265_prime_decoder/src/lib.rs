@@ -97,6 +97,7 @@ struct PrimeDesc {
     height: u32,
     format: Fourcc,
     planes: Vec<PrimePlane>,
+    keepalive: ResourceArc<Keepalive>,
 }
 
 impl Encoder for Fd {
@@ -296,7 +297,7 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
 
     // Pointer to the AVFrame we will actually read from (either original or mapped)
     let src_avframe = if already_drm {
-        unsafe {frame.as_ptr()}
+        unsafe { frame.as_ptr() }
     } else {
         // Need to map to DRM_PRIME
         let hw_frames_ctx = unsafe { (*frame.as_ptr()).hw_frames_ctx };
@@ -327,7 +328,7 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
         }
 
         // Keep mapped frame alive until we finish dup’ing fds
-        let ptr = unsafe { drm.as_ptr()};
+        let ptr = unsafe { drm.as_ptr() };
         mapped = Some(drm);
         ptr
     };
@@ -403,7 +404,9 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
                 if let Some(ref mut m) = mapped {
                     unsafe { sys::av_frame_unref(m.as_mut_ptr()) };
                 }
-                return Err(anyhow!("no valid dma-buf fd for plane {i} (object {obj_idx})"));
+                return Err(anyhow!(
+                    "no valid dma-buf fd for plane {i} (object {obj_idx})"
+                ));
             };
 
             let obj_desc = desc.objects[obj_idx];
@@ -416,6 +419,13 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
         }
     }
 
+    // Duplicate the frame to keep it alive until the descriptor is consumed
+    let mut res = Video::empty();
+    unsafe {
+        sys::av_frame_ref(res.as_mut_ptr(), frame.as_ptr());
+    }
+    let keepalive = ResourceArc::new(Keepalive { resource: res });
+
     // Release mapped frame if we created one
     if let Some(mut m) = mapped {
         unsafe { sys::av_frame_unref(m.as_mut_ptr()) };
@@ -426,17 +436,17 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
         height: frame.height(),
         format: Fourcc(fourcc),
         planes,
+        keepalive,
     })
 }
 
-type DecodeResult<'a> = (Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>);
+type DecodeResult<'a> = (Vec<i64>, Vec<Term<'a>>);
 
 fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> Result<DecodeResult<'a>> {
     eprintln!("decode_frames: start");
     let mut frames = Vec::new();
     let mut pts_list = Vec::new();
     let mut decoded = Video::empty();
-    let mut keepalives = Vec::new();
 
     loop {
         match inner.decoder.receive_frame(&mut decoded) {
@@ -451,13 +461,6 @@ fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> Result<DecodeRes
                         continue;
                     }
                 };
-                let mut res = Video::empty();
-                unsafe {
-                    // keepalive now references the same underlying surface
-                    sys::av_frame_ref(res.as_mut_ptr(), decoded.as_ptr());
-                }
-                let keepalive = ResourceArc::new(Keepalive { resource: res });
-                keepalives.push(keepalive);
                 pts_list.push(decoded.pts().unwrap_or(NO_PTS));
                 frames.push(desc.encode(env));
                 unsafe { sys::av_frame_unref(decoded.as_mut_ptr()) };
@@ -477,10 +480,10 @@ fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> Result<DecodeRes
         }
     }
     eprintln!("decode_frames: returning {} frame(s)", frames.len());
-    Ok((pts_list, frames, keepalives))
+    Ok((pts_list, frames))
 }
 
-type DecodeResultWithOk<'a> = (Atom, Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>);
+type DecodeResultWithOk<'a> = (Atom, Vec<i64>, Vec<Term<'a>>);
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn decode<'a>(
@@ -503,12 +506,12 @@ fn decode<'a>(
         .decoder
         .send_packet(&packet)
         .map_err(|_| rustler::Error::Atom("send_packet"))?;
-    let (pts_list, frames, keepalives) = decode_frames(env, &mut inner).map_err(|e| {
+    let (pts_list, frames) = decode_frames(env, &mut inner).map_err(|e| {
         eprintln!("Error: {e}");
         rustler::Error::Atom("decode")
     })?;
     eprintln!("decode: produced {} frame(s)", frames.len());
-    Ok((ok(), pts_list, frames, keepalives))
+    Ok((ok(), pts_list, frames))
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -522,12 +525,12 @@ fn flush<'a>(env: Env<'a>, state: ResourceArc<Decoder>) -> NifResult<DecodeResul
         .decoder
         .send_eof()
         .map_err(|_| rustler::Error::Atom("send_eof"))?;
-    let (pts_list, frames, keepalives) = decode_frames(env, &mut inner).map_err(|e| {
+    let (pts_list, frames) = decode_frames(env, &mut inner).map_err(|e| {
         eprintln!("Error: {e}");
         rustler::Error::Atom("decode")
     })?;
     eprintln!("flush: produced {} frame(s)", frames.len());
-    Ok((ok(), pts_list, frames, keepalives))
+    Ok((ok(), pts_list, frames))
 }
 
 #[rustler::nif]

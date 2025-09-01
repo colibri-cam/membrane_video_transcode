@@ -14,7 +14,7 @@ use drm::control::{
 };
 use drm::{ClientCapability, Device as _, buffer, control};
 use drm_fourcc::DrmFourcc;
-use rustler::{Atom, Decoder, Encoder, NifResult, ResourceArc};
+use rustler::{Atom, Decoder, Encoder, NifResult, OwnedEnv, ResourceArc, Term};
 use std::io::ErrorKind;
 
 #[cfg(feature = "verbose")]
@@ -50,11 +50,20 @@ struct PrimePlane {
 
 #[derive(Debug, rustler::NifStruct)]
 #[module = "Membrane.PrimeDesc"]
-struct PrimeDesc {
+struct PrimeDesc<'a> {
     width: u32,
     height: u32,
     format: Fourcc,
     planes: Vec<PrimePlane>,
+    keepalive: Term<'a>,
+}
+
+struct PrimeDescOwned {
+    width: u32,
+    height: u32,
+    format: Fourcc,
+    planes: Vec<PrimePlane>,
+    keepalive: OwnedEnv,
 }
 
 #[derive(Debug, rustler::NifStruct)]
@@ -242,6 +251,7 @@ where
                 Err(e) => {
                     // Don’t crash the process/NIF; just log and continue.
                     log!("close_buffer() failed: {e}");
+                    let _ = e;
                     break;
                 }
             }
@@ -502,7 +512,7 @@ impl DisplayInner {
         ))
     }
 
-    fn display(&mut self, desc: PrimeDesc) -> std::io::Result<()> {
+    fn display(&mut self, desc: PrimeDescOwned) -> std::io::Result<()> {
         let new_fb = self.add_fb_from_prime_desc(&desc).map_err(|e| {
             log!("Add fb from prime error: {}", e);
             io::Error::other(e)
@@ -602,11 +612,13 @@ impl DisplayInner {
 
         self.stale = self.in_flight.take();
         self.in_flight = Some(new_fb);
+        // Drop keepalive after importing to framebuffer
+        drop(desc.keepalive);
         Ok(())
     }
 
     /// Create a KMS framebuffer from your PrimeDesc using drm-rs 0.14.
-    fn add_fb_from_prime_desc(&mut self, prime: &PrimeDesc) -> Result<FbWithHandles> {
+    fn add_fb_from_prime_desc(&mut self, prime: &PrimeDescOwned) -> Result<FbWithHandles> {
         if prime.planes.is_empty() {
             bail!("PrimeDesc has no planes");
         }
@@ -685,7 +697,7 @@ impl Drop for DisplayInner {
 }
 
 impl DisplayInner {
-    fn run(mut self, rx: mpsc::Receiver<PrimeDesc>, err: Arc<Mutex<Option<String>>>) {
+    fn run(mut self, rx: mpsc::Receiver<PrimeDescOwned>, err: Arc<Mutex<Option<String>>>) {
         while let Ok(mut desc) = rx.recv() {
             // Coalesce queue: only display the most recent
             while let Ok(d) = rx.try_recv() {
@@ -703,7 +715,7 @@ impl DisplayInner {
 }
 
 struct Display {
-    tx: Option<mpsc::Sender<PrimeDesc>>,
+    tx: Option<mpsc::Sender<PrimeDescOwned>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -726,7 +738,7 @@ impl Display {
         ))
     }
 
-    fn display(&self, desc: PrimeDesc) -> std::io::Result<()> {
+    fn display(&self, desc: PrimeDescOwned) -> std::io::Result<()> {
         let tx = self.tx.as_ref().ok_or_else(|| {
             log!("Display channel missing");
             std::io::Error::from(std::io::ErrorKind::BrokenPipe)
@@ -783,7 +795,16 @@ fn init_display(
 fn display_prime(res: ResourceArc<DisplayRes>, desc: PrimeDesc) -> NifResult<Atom> {
     let mut guard = res.0.lock().map_err(|_| nif_err("lock"))?;
     if let Some(display) = guard.as_mut() {
-        let res = display.display(desc);
+        let env = OwnedEnv::new();
+        env.save(desc.keepalive);
+        let desc_owned = PrimeDescOwned {
+            width: desc.width,
+            height: desc.height,
+            format: desc.format,
+            planes: desc.planes,
+            keepalive: env,
+        };
+        let res = display.display(desc_owned);
         if let Err(err) = res {
             let _ = guard.take();
             Err(nif_err(err))
