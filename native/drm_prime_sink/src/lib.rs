@@ -477,9 +477,16 @@ impl DisplayInner {
             u32::from(plane),
             plane_type_value(&card, plane)
         );
-
         let primary_plane = find_primary_plane(&card, &res, crtc)
             .map_err(|e| std::io::Error::new(e.kind(), format!("find primary plane: {e}")))?;
+        log!(
+            "Selected primary plane: id={}, type_val={:?}",
+            u32::from(primary_plane),
+            plane_type_value(&card, primary_plane)
+        );
+        if primary_plane == plane {
+            log!("NV12 plane matches primary plane");
+        }
         let (prim_prop_fb, prim_prop_crtc, prim_props) =
             load_primary_props(&card, primary_plane)
                 .map_err(|e| std::io::Error::new(e.kind(), format!("load primary props: {e}")))?;
@@ -715,11 +722,15 @@ impl DisplayInner {
         if let Some(zpos) = self.prop_zpos {
             req.add_property(self.plane, zpos, property::Value::UnsignedRange(1));
         }
-        req.add_property(
-            self.primary_plane,
-            self.prim_prop_fb,
-            property::Value::Framebuffer(None),
-        );
+        if self.plane != self.primary_plane {
+            req.add_property(
+                self.primary_plane,
+                self.prim_prop_fb,
+                property::Value::Framebuffer(None),
+            );
+        } else {
+            log!("Primary plane doubles as NV12 plane; not disabling it");
+        }
         self.card
             .atomic_commit(control::AtomicCommitFlags::empty(), req)?;
         if let Some((fb, db)) = self.boot_primary_fb.take() {
