@@ -47,7 +47,6 @@ fn init_decoder(target: format::Pixel, atom: Atom) -> Result<Decoder> {
     } else if let Some(codec) = codec::decoder::find_by_name("hevc_v4l2m2m") {
         use_v4l2 = true;
         codec
-
     } else {
         codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?
     };
@@ -87,7 +86,7 @@ fn create(format: Atom) -> NifResult<ResourceArc<Decoder>> {
     let pix = pixel_from_atom(format).ok_or(Error::Atom("bad_pixel_format"))?;
     init_decoder(pix, format)
         .map(ResourceArc::new)
-        .map_err(|_| Error::Atom("create_failed"))
+        .map_err(|e| Error::Term(Box::new((atoms::create_failed(), format!("{e:?}")))))
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -329,7 +328,8 @@ mod atoms {
         NV21,
         YV12,
         AYUV,
-        YUY2
+        YUY2,
+        create_failed
     }
 }
 

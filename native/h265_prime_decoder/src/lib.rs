@@ -16,7 +16,8 @@ use rustler::{Atom, Binary, Encoder, Env, NifResult, ResourceArc, Term};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
 rustler::atoms! {
-    ok
+    ok,
+    create_failed
 }
 
 const NO_PTS: i64 = i64::MIN;
@@ -177,7 +178,7 @@ fn create(hw_device: String) -> NifResult<ResourceArc<Decoder>> {
     };
     init_decoder(path)
         .map(ResourceArc::new)
-        .map_err(|_| rustler::Error::Atom("create_failed"))
+        .map_err(|e| rustler::Error::Term(Box::new((create_failed(), format!("{e:?}")))))
 }
 
 fn derive_fourcc(desc: &sys::AVDRMFrameDescriptor) -> Result<DrmFourcc> {
