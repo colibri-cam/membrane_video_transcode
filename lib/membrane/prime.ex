@@ -16,13 +16,20 @@ defmodule Membrane.PrimeDesc do
   `Membrane.Buffer` metadata under the `:drm_prime` key.
   """
 
-  @enforce_keys [:planes, :width, :height, :format]
-  defstruct [:planes, :width, :height, :format]
+  @enforce_keys [:planes, :objects, :width, :height, :format, :keepalive]
+  defstruct [:planes, :objects, :width, :height, :format, :keepalive, :owner_pid]
+end
+
+defmodule Membrane.PrimeObject do
+  @moduledoc false
+
+  @enforce_keys [:fd]
+  defstruct [:fd, :modifier]
 end
 
 defmodule Membrane.PrimePlane do
   @moduledoc false
 
-  @enforce_keys [:fd, :pitch, :offset]
-  defstruct [:fd, :pitch, :offset, :modifier]
+  @enforce_keys [:obj_idx, :pitch, :offset]
+  defstruct [:obj_idx, :pitch, :offset]
 end

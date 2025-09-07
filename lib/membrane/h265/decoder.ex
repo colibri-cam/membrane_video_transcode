@@ -29,11 +29,21 @@ defmodule Membrane.H265.Decoder do
 
   @formats [:I420, :I422, :I444, :RGB, :BGRA, :RGBA, :NV12, :NV21, :YV12, :AYUV, :YUY2]
 
+  @typedoc """
+  Decoder backend to use.
+  """
+  @type decoder_backend :: :auto | :vaapi | :v4l2request | :v4l2m2m | :software
+
   def_options(
     output_format: [
       spec: pixel_format(),
       default: :NV12,
       description: "Pixel format to use for decoded frames"
+    ],
+    decoder: [
+      spec: decoder_backend(),
+      default: :auto,
+      description: "Decoder backend to use"
     ]
   )
 
@@ -49,14 +59,20 @@ defmodule Membrane.H265.Decoder do
 
   @impl true
   def handle_init(_ctx, opts) do
-    state = %{decoder_ref: nil, stream_format_sent?: false, output_format: opts.output_format}
+    state = %{
+      decoder_ref: nil,
+      stream_format_sent?: false,
+      output_format: opts.output_format,
+      decoder: opts.decoder
+    }
+
     {[], state}
   end
 
   @impl true
-  def handle_setup(_ctx, %{output_format: fmt} = state) do
+  def handle_setup(_ctx, %{output_format: fmt, decoder: dec} = state) do
     decoder =
-      case Native.create(fmt) do
+      case Native.create(fmt, dec) do
         {:error, reason} -> raise "Error creating decoder #{inspect(reason)}"
         decoder -> decoder
       end

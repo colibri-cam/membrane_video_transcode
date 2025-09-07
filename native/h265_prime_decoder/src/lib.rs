@@ -9,17 +9,50 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg_next::codec::packet::Packet;
 use ffmpeg_next::sys;
 use ffmpeg_next::{
-    codec,
+    Codec, codec,
+    format::pixel::Pixel,
     util::{error::EAGAIN, frame::Video},
 };
 use rustler::{Atom, Binary, Encoder, Env, NifResult, ResourceArc, Term};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
 rustler::atoms! {
-    ok
+    ok,
+    create_failed,
+    auto,
+    vaapi,
+    v4l2request,
+    v4l2m2m,
+    software
 }
 
 const NO_PTS: i64 = i64::MIN;
+
+// get_format callback: choose DRM_PRIME when offered
+unsafe extern "C" fn get_format_drm_prime(
+    _ctx: *mut sys::AVCodecContext,
+    pix_fmts: *const sys::AVPixelFormat,
+) -> sys::AVPixelFormat {
+    unsafe {
+        let mut p = pix_fmts;
+        while !p.is_null() && *p != sys::AVPixelFormat::AV_PIX_FMT_NONE {
+            if *p == sys::AVPixelFormat::AV_PIX_FMT_DRM_PRIME {
+                return *p;
+            }
+            p = p.add(1);
+        }
+        *pix_fmts
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Backend {
+    Auto,
+    Vaapi,
+    V4l2Request,
+    V4l2M2M,
+    Software,
+}
 
 #[derive(Debug)]
 struct Fd(OwnedFd);
@@ -33,10 +66,9 @@ impl AsFd for Fd {
 #[derive(rustler::NifStruct)]
 #[module = "Membrane.PrimePlane"]
 struct PrimePlane {
-    fd: Fd,
+    obj_idx: u32,
     pitch: u32,
     offset: u32,
-    modifier: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -58,12 +90,21 @@ impl<'a> rustler::Decoder<'a> for Fourcc {
 }
 
 #[derive(rustler::NifStruct)]
+#[module = "Membrane.PrimeObject"]
+struct PrimeObject {
+    fd: Fd,
+    modifier: Option<u64>,
+}
+
+#[derive(rustler::NifStruct)]
 #[module = "Membrane.PrimeDesc"]
 struct PrimeDesc {
     width: u32,
     height: u32,
     format: Fourcc,
+    objects: Vec<PrimeObject>,
     planes: Vec<PrimePlane>,
+    keepalive: ResourceArc<Keepalive>,
 }
 
 impl Encoder for Fd {
@@ -94,9 +135,23 @@ struct Decoder {
     inner: Mutex<DecoderInner>,
 }
 
-#[allow(dead_code)]
-struct Keepalive {
-    resource: Video,
+pub struct Keepalive(Mutex<Option<Video>>);
+
+impl Keepalive {
+    fn release(&self) {
+        let mut g = self.0.lock().unwrap();
+        if let Some(mut ptr) = g.take() {
+            unsafe { sys::av_frame_unref(ptr.as_mut_ptr()) } // or your free() equivalent
+        }
+    }
+}
+
+impl Drop for Keepalive {
+    fn drop(&mut self) {
+        // Safe to call twice; release() handles Option
+        self.release();
+        println!("Keepalive dropped!");
+    }
 }
 
 unsafe impl Send for Keepalive {}
@@ -113,25 +168,53 @@ impl Drop for Decoder {
     }
 }
 
-fn init_decoder(hw_device: Option<String>) -> Result<Decoder> {
+fn find_any(names: &[&str]) -> Option<Codec> {
+    names.iter().find_map(|n| codec::decoder::find_by_name(n))
+}
+
+fn init_decoder(hw_device: Option<String>, backend: Backend) -> Result<Decoder> {
     ffmpeg::init().context("ffmpeg init failed")?;
-    let mut use_v4l2 = false;
-    let hevc = if let Some(codec) = codec::decoder::find_by_name("hevc_v4l2request") {
-        use_v4l2 = true;
-        codec
-    } else if let Some(codec) = codec::decoder::find_by_name("hevc_v4l2m2m") {
-        use_v4l2 = true;
-        codec
-    } else {
-        codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?
+    let mut use_v4l2 = matches!(backend, Backend::V4l2Request | Backend::V4l2M2M);
+    let hevc = match backend {
+        Backend::Auto => {
+            if let Some(codec) = find_any(&["hevc_v4l2request", "h265_v4l2request"]) {
+                use_v4l2 = true;
+                codec
+            } else if let Some(codec) = find_any(&["hevc_v4l2m2m", "h265_v4l2m2m"]) {
+                use_v4l2 = true;
+                codec
+            } else {
+                codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?
+            }
+        }
+        Backend::V4l2M2M => find_any(&["hevc_v4l2m2m", "h265_v4l2m2m"])
+            .ok_or_else(|| anyhow!("no v4l2m2m codec"))?,
+        Backend::Vaapi | Backend::Software | Backend::V4l2Request => {
+            codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?
+        }
     };
     let mut decoder = codec::decoder::new();
 
     unsafe {
-        let mut hw_device_ctx = ptr::null_mut();
-        if !use_v4l2 {
+        if use_v4l2 {
+            let mut hw_device_ctx = ptr::null_mut();
+            let ret = sys::av_hwdevice_ctx_create(
+                &mut hw_device_ctx,
+                sys::AVHWDeviceType::AV_HWDEVICE_TYPE_DRM,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+            );
+            if ret < 0 || hw_device_ctx.is_null() {
+                return Err(anyhow!("av_hwdevice_ctx_create DRM failed: {ret}"));
+            }
+            (*decoder.as_mut_ptr()).hw_device_ctx = sys::av_buffer_ref(hw_device_ctx);
+            (*decoder.as_mut_ptr()).get_format = Some(get_format_drm_prime);
+            sys::av_buffer_unref(&mut hw_device_ctx);
+        } else if matches!(backend, Backend::Vaapi | Backend::Auto) {
             let path_str = hw_device.unwrap_or_else(|| "/dev/dri/renderD128".to_string());
             if Path::new(&path_str).exists() {
+                let mut hw_device_ctx = ptr::null_mut();
                 if let Ok(path) = CString::new(path_str) {
                     if sys::av_hwdevice_ctx_create(
                         &mut hw_device_ctx,
@@ -147,6 +230,10 @@ fn init_decoder(hw_device: Option<String>) -> Result<Decoder> {
                 }
             }
         }
+        // Reserve additional hardware frames so the V4L2 request decoder has
+        // spare capture buffers while previously decoded frames are still in
+        // use downstream.
+        (*decoder.as_mut_ptr()).extra_hw_frames = 16;
     }
     let opened = decoder.open_as(hevc).context("open codec")?;
     let video = opened.video().context("video decoder")?;
@@ -169,15 +256,28 @@ fn load(env: rustler::Env, _info: rustler::Term) -> bool {
 }
 
 #[rustler::nif]
-fn create(hw_device: String) -> NifResult<ResourceArc<Decoder>> {
+fn create(hw_device: String, decoder: Atom) -> NifResult<ResourceArc<Decoder>> {
     let path = if hw_device.is_empty() {
         None
     } else {
         Some(hw_device)
     };
-    init_decoder(path)
+    let backend = if decoder == auto() {
+        Backend::Auto
+    } else if decoder == vaapi() {
+        Backend::Vaapi
+    } else if decoder == v4l2request() {
+        Backend::V4l2Request
+    } else if decoder == v4l2m2m() {
+        Backend::V4l2M2M
+    } else if decoder == software() {
+        Backend::Software
+    } else {
+        return Err(rustler::Error::BadArg);
+    };
+    init_decoder(path, backend)
         .map(ResourceArc::new)
-        .map_err(|_| rustler::Error::Atom("create_failed"))
+        .map_err(|e| rustler::Error::Term(Box::new((create_failed(), format!("{e:?}")))))
 }
 
 fn derive_fourcc(desc: &sys::AVDRMFrameDescriptor) -> Result<DrmFourcc> {
@@ -210,130 +310,130 @@ fn derive_fourcc(desc: &sys::AVDRMFrameDescriptor) -> Result<DrmFourcc> {
 }
 
 fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
-    let hw_frames_ctx = unsafe { (*frame.as_ptr()).hw_frames_ctx };
-    if hw_frames_ctx.is_null() {
-        return Err(anyhow!("no hw_frames_ctx"));
-    }
-    let mut drm = Video::empty();
-    unsafe {
-        (*drm.as_mut_ptr()).format = sys::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
-        (*drm.as_mut_ptr()).width = frame.width() as i32;
-        (*drm.as_mut_ptr()).height = frame.height() as i32;
-        let ctx_ref = sys::av_buffer_ref(hw_frames_ctx);
-        if ctx_ref.is_null() {
-            sys::av_frame_unref(drm.as_mut_ptr());
-            return Err(anyhow!("av_buffer_ref failed"));
+    // If the source is already DRM_PRIME, parse it directly.
+    let already_drm = frame.format() == Pixel::DRM_PRIME;
+
+    // We'll only allocate/map a temp frame if we must.
+    let mut mapped: Option<Video> = None;
+
+    // Pointer to the AVFrame we will actually read from (either original or mapped)
+    let src_avframe = if already_drm {
+        unsafe { frame.as_ptr() }
+    } else {
+        // Need to map to DRM_PRIME
+        let hw_frames_ctx = unsafe { (*frame.as_ptr()).hw_frames_ctx };
+        if hw_frames_ctx.is_null() {
+            return Err(anyhow!("no hw_frames_ctx"));
         }
-        (*drm.as_mut_ptr()).hw_frames_ctx = ctx_ref;
-    }
-    const AV_HWFRAME_MAP_DRM_PRIME: i32 = 0x0002_0000;
-    let flags = (sys::AV_HWFRAME_MAP_READ as i32) | AV_HWFRAME_MAP_DRM_PRIME;
-    let res = unsafe { sys::av_hwframe_map(drm.as_mut_ptr(), frame.as_ptr(), flags) };
-    if res < 0 {
-        unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
-        return Err(anyhow!("av_hwframe_map failed: {res}"));
-    }
-    let desc_ptr = unsafe { (*drm.as_ptr()).data[0] as *const sys::AVDRMFrameDescriptor };
+
+        let mut drm = Video::empty();
+        unsafe {
+            (*drm.as_mut_ptr()).format = sys::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+            (*drm.as_mut_ptr()).width = frame.width() as i32;
+            (*drm.as_mut_ptr()).height = frame.height() as i32;
+
+            let ctx_ref = sys::av_buffer_ref(hw_frames_ctx);
+            if ctx_ref.is_null() {
+                sys::av_frame_unref(drm.as_mut_ptr());
+                return Err(anyhow!("av_buffer_ref failed"));
+            }
+            (*drm.as_mut_ptr()).hw_frames_ctx = ctx_ref;
+
+            const AV_HWFRAME_MAP_DRM_PRIME: i32 = 0x0002_0000;
+            let flags = (sys::AV_HWFRAME_MAP_READ as i32) | AV_HWFRAME_MAP_DRM_PRIME;
+            let res = sys::av_hwframe_map(drm.as_mut_ptr(), frame.as_ptr(), flags);
+            if res < 0 {
+                sys::av_frame_unref(drm.as_mut_ptr());
+                return Err(anyhow!("av_hwframe_map failed: {res}"));
+            }
+        }
+
+        // Keep mapped frame alive until we finish dup’ing fds
+        let ptr = unsafe { drm.as_ptr() };
+        mapped = Some(drm);
+        ptr
+    };
+
+    // Now read the descriptor from whichever frame we decided on:
+    let desc_ptr = unsafe { (*src_avframe).data[0] as *const sys::AVDRMFrameDescriptor };
     if desc_ptr.is_null() {
-        unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
+        // Clean up the mapped frame (if any)
+        if let Some(ref mut m) = mapped {
+            unsafe { sys::av_frame_unref(m.as_mut_ptr()) };
+        }
         return Err(anyhow!("no drm descriptor"));
     }
+
     let desc = unsafe { &*desc_ptr };
     if desc.nb_objects == 0 || desc.nb_layers == 0 {
-        unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
+        if let Some(ref mut m) = mapped {
+            unsafe { sys::av_frame_unref(m.as_mut_ptr()) };
+        }
         return Err(anyhow!("empty drm descriptor"));
     }
 
+    // --- same plane/FD dup logic as you had ---
     let fourcc = derive_fourcc(desc)?;
-
-    // Pre-dup all object fds once
-    let mut obj_fds: Vec<Option<OwnedFd>> = Vec::with_capacity(desc.nb_objects as usize);
+    let mut objects: Vec<PrimeObject> = Vec::with_capacity(desc.nb_objects as usize);
     for j in 0..desc.nb_objects as usize {
         let ofd = desc.objects[j].fd;
-        if ofd >= 0 {
-            let dupfd = unsafe { libc::dup(ofd) };
-            if dupfd < 0 {
-                unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
-                return Err(anyhow!("dup failed for object {j}"));
+        let dupfd = unsafe { libc::dup(ofd) };
+        let modifier = desc.objects[j].format_modifier;
+        if dupfd < 0 {
+            if let Some(ref mut m) = mapped {
+                unsafe { sys::av_frame_unref(m.as_mut_ptr()) };
             }
-            obj_fds.push(Some(unsafe { OwnedFd::from_raw_fd(dupfd) }));
-        } else {
-            // Leave as None for now; we may patch it up below if it’s a bogus extra object.
-            obj_fds.push(None);
-        }
+            return Err(anyhow!("Object fd is {ofd}"));
+        };
+        objects.push(PrimeObject {
+            fd: unsafe { Fd(OwnedFd::from_raw_fd(dupfd)) },
+            modifier: Some(modifier),
+        });
     }
 
-    // Heuristic: if we have at least one valid object (usually 0),
-    // allow planes whose object points to an invalid fd to reuse object 0.
-    let fallback_obj0 = obj_fds
-        .first()
-        .and_then(|x| x.as_ref())
-        .map(|fd| fd.as_raw_fd());
     let mut planes = Vec::new();
 
     for l in 0..desc.nb_layers as usize {
         let layer = &desc.layers[l];
         for i in 0..layer.nb_planes as usize {
             let p = layer.planes[i];
-            let obj = p.object_index as isize;
-            if obj < 0 || (obj as usize) >= desc.nb_objects as usize {
-                unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
-                return Err(anyhow!("invalid object index {} for plane {}", obj, i));
-            }
-            let obj_idx = obj as usize;
-
-            // Ensure we have a usable fd for this plane’s object
-            let fd_owned = if let Some(fd) = &obj_fds[obj_idx] {
-                // Okay, valid object fd
-                let dupfd = unsafe { libc::dup(fd.as_raw_fd()) };
-                if dupfd < 0 {
-                    unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
-                    return Err(anyhow!("dup failed (plane {i}, object {obj_idx})"));
-                }
-                unsafe { OwnedFd::from_raw_fd(dupfd) }
-            } else if let Some(fd0) = fallback_obj0 {
-                // Workaround for buggy “second object with fd = -1” cases:
-                // reuse object 0’s fd; planes differ by offset/pitch anyway.
-                let dupfd = unsafe { libc::dup(fd0) };
-                if dupfd < 0 {
-                    unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
-                    return Err(anyhow!("dup failed (plane {i}, fallback obj0)"));
-                }
-                unsafe { OwnedFd::from_raw_fd(dupfd) }
-            } else {
-                unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
-                return Err(anyhow!(
-                    "no valid dma-buf fd for plane {i} (object {obj_idx})"
-                ));
-            };
-
-            let obj_desc = desc.objects[obj_idx];
             planes.push(PrimePlane {
-                fd: Fd(fd_owned),
+                obj_idx: p.object_index as u32,
                 pitch: p.pitch as u32,
                 offset: p.offset as u32,
-                modifier: Some(obj_desc.format_modifier),
             });
         }
     }
 
-    unsafe { sys::av_frame_unref(drm.as_mut_ptr()) };
+    // Release mapped frame if we created one
+    if let Some(mut m) = mapped {
+        unsafe { sys::av_frame_unref(m.as_mut_ptr()) };
+    }
+
+    let mut res = Video::empty();
+    unsafe {
+        // keepalive now references the same underlying surface
+        sys::av_frame_ref(res.as_mut_ptr(), frame.as_ptr());
+    }
+    let keepalive = ResourceArc::new(Keepalive(Mutex::new(Some(res))));
+
     Ok(PrimeDesc {
         width: frame.width(),
         height: frame.height(),
         format: Fourcc(fourcc),
+        objects,
         planes,
+        keepalive,
     })
 }
 
-type DecodeResult<'a> = (Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>);
+type DecodeResult<'a> = (Vec<i64>, Vec<Term<'a>>);
 
 fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> Result<DecodeResult<'a>> {
     eprintln!("decode_frames: start");
     let mut frames = Vec::new();
     let mut pts_list = Vec::new();
     let mut decoded = Video::empty();
-    let mut keepalives = Vec::new();
 
     loop {
         match inner.decoder.receive_frame(&mut decoded) {
@@ -348,13 +448,6 @@ fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> Result<DecodeRes
                         continue;
                     }
                 };
-                let mut res = Video::empty();
-                unsafe {
-                    // keepalive now references the same underlying surface
-                    sys::av_frame_ref(res.as_mut_ptr(), decoded.as_ptr());
-                }
-                let keepalive = ResourceArc::new(Keepalive { resource: res });
-                keepalives.push(keepalive);
                 pts_list.push(decoded.pts().unwrap_or(NO_PTS));
                 frames.push(desc.encode(env));
                 unsafe { sys::av_frame_unref(decoded.as_mut_ptr()) };
@@ -374,10 +467,16 @@ fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> Result<DecodeRes
         }
     }
     eprintln!("decode_frames: returning {} frame(s)", frames.len());
-    Ok((pts_list, frames, keepalives))
+    Ok((pts_list, frames))
 }
 
-type DecodeResultWithOk<'a> = (Atom, Vec<i64>, Vec<Term<'a>>, Vec<ResourceArc<Keepalive>>);
+type DecodeResultWithOk<'a> = (Atom, Vec<i64>, Vec<Term<'a>>);
+
+#[rustler::nif]
+fn keepalive_release(ka: ResourceArc<Keepalive>) -> NifResult<Atom> {
+    ka.release();
+    Ok(ok())
+}
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn decode<'a>(
@@ -400,12 +499,12 @@ fn decode<'a>(
         .decoder
         .send_packet(&packet)
         .map_err(|_| rustler::Error::Atom("send_packet"))?;
-    let (pts_list, frames, keepalives) = decode_frames(env, &mut inner).map_err(|e| {
+    let (pts_list, frames) = decode_frames(env, &mut inner).map_err(|e| {
         eprintln!("Error: {e}");
         rustler::Error::Atom("decode")
     })?;
     eprintln!("decode: produced {} frame(s)", frames.len());
-    Ok((ok(), pts_list, frames, keepalives))
+    Ok((ok(), pts_list, frames))
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -419,12 +518,12 @@ fn flush<'a>(env: Env<'a>, state: ResourceArc<Decoder>) -> NifResult<DecodeResul
         .decoder
         .send_eof()
         .map_err(|_| rustler::Error::Atom("send_eof"))?;
-    let (pts_list, frames, keepalives) = decode_frames(env, &mut inner).map_err(|e| {
+    let (pts_list, frames) = decode_frames(env, &mut inner).map_err(|e| {
         eprintln!("Error: {e}");
         rustler::Error::Atom("decode")
     })?;
     eprintln!("flush: produced {} frame(s)", frames.len());
-    Ok((ok(), pts_list, frames, keepalives))
+    Ok((ok(), pts_list, frames))
 }
 
 #[rustler::nif]

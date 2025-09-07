@@ -10,7 +10,7 @@ defmodule Membrane.H265.Decoder.Native do
         @rustler_opts
       )
 
-  def create(_format), do: :erlang.nif_error(:nif_not_loaded)
+  def create(_format, _decoder), do: :erlang.nif_error(:nif_not_loaded)
   def decode(_state, _data, _pts, _dts), do: :erlang.nif_error(:nif_not_loaded)
   def flush(_state), do: :erlang.nif_error(:nif_not_loaded)
   def get_metadata(_state), do: :erlang.nif_error(:nif_not_loaded)
