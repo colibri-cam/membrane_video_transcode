@@ -15,4 +15,6 @@ defmodule Membrane.H265.PrimeDecoder.Native do
   def flush(_state), do: :erlang.nif_error(:nif_not_loaded)
   def get_metadata(_state), do: :erlang.nif_error(:nif_not_loaded)
   def close(_state), do: :erlang.nif_error(:nif_not_loaded)
+  def keepalive_release(_keepalive), do: :erlang.nif_error(:nif_not_loaded)
+
 end

@@ -47,12 +47,22 @@ defmodule Membrane.H265.PrimeDecoder do
 
   @impl true
   def handle_init(_ctx, opts) do
+    {:ok, worker} =
+      Task.start_link(fn ->
+        worker_loop(self())
+      end)
+
+    # If you want to receive :'EXIT' messages from the worker:
+    Process.flag(:trap_exit, true)
+
     state = %{
       decoder_ref: nil,
       stream_format_sent?: false,
       hw_device: opts.hw_device,
-      decoder: opts.decoder
+      decoder: opts.decoder,
+      worker: worker
     }
+
 
     {[], state}
   end
@@ -74,15 +84,22 @@ defmodule Membrane.H265.PrimeDecoder do
     pts = Common.to_h265_time_base_truncated(buffer.pts)
 
     case Native.decode(decoder, buffer.payload, pts, dts) do
-      {:ok, pts_list, descs, keepalives} ->
-        Membrane.Logger.debug("#{inspect {pts_list, descs, keepalives}}")
+      {:ok, pts_list, descs} ->
+        Membrane.Logger.debug("#{inspect {pts_list, descs}}")
         in_stream_format = ctx.pads.input.stream_format
         {actions, state} = maybe_send_stream_format(state, in_stream_format)
-        bufs = wrap_descriptors(pts_list, descs, keepalives)
+        bufs = wrap_descriptors(pts_list, descs, state.worker)
         {actions ++ bufs, state}
 
       {:error, reason} ->
-        raise "Failed to decode frame: #{inspect(reason)}"
+        err = "Failed to decode frame: #{inspect(reason)}"
+        Membrane.Logger.error("Failed to decode frame: #{inspect(reason)}")
+        raise err
+      other -> 
+        err = "Failed to decode frame: #{inspect(other)}"
+
+        Membrane.Logger.error("Failed to decode frame: #{inspect(other)}")
+        raise err
     end
   end
 
@@ -94,9 +111,9 @@ defmodule Membrane.H265.PrimeDecoder do
   @impl true
   def handle_end_of_stream(:input, _ctx, %{decoder_ref: decoder} = state) do
     case Native.flush(decoder) do
-      {:ok, pts_list, descs, keepalives} ->
+      {:ok, pts_list, descs} ->
         :ok = Native.close(decoder)
-        bufs = wrap_descriptors(pts_list, descs, keepalives)
+        bufs = wrap_descriptors(pts_list, descs, state.worker)
         new_state = %{state | decoder_ref: nil}
         {bufs ++ [end_of_stream: :output], new_state}
 
@@ -106,23 +123,26 @@ defmodule Membrane.H265.PrimeDecoder do
   end
 
   @impl true
-  def handle_terminate_request(_ctx, %{decoder_ref: decoder} = state) do
+  def handle_terminate_request(_ctx, %{decoder_ref: decoder, worker: worker} = state) do
+    :erlang.garbage_collect(self())
     if decoder do
       :ok = Native.close(decoder)
     end
 
+    if Process.alive?(worker), do: Process.exit(worker, :shutdown)
+
     {[terminate: :normal], %{state | decoder_ref: nil}}
   end
 
-  defp wrap_descriptors([], [], []), do: []
+  defp wrap_descriptors([], [], _worker), do: []
 
-  defp wrap_descriptors(pts_list, descs, keepalives) do
-    Enum.zip([pts_list, descs, keepalives])
-    |> Enum.map(fn {p, desc, keepalive} ->
+  defp wrap_descriptors(pts_list, descs, worker) do
+    Enum.zip([pts_list, descs])
+    |> Enum.map(fn {p, desc} ->
       %Buffer{
         pts: Common.to_membrane_time_base_truncated(p),
         payload: <<>>,
-        metadata: %{drm_prime: desc, keepalive: keepalive}
+        metadata: %{drm_prime: Map.put(desc, :owner_pid, worker)}
       }
     end)
     |> then(&[buffer: {:output, &1}])
@@ -146,5 +166,20 @@ defmodule Membrane.H265.PrimeDecoder do
     }
 
     {[stream_format: {:output, sf}], %{state | stream_format_sent?: true}}
+  end
+
+ defp worker_loop(element_pid) do
+    receive do
+      {:keepalive, keepalive} = msg ->
+        Membrane.Logger.debug("#{inspect msg}")
+        Native.keepalive_release(keepalive)
+        worker_loop(element_pid)
+
+      # If the element dies (they’re linked), the worker will exit automatically.
+      # If you set trap_exit above, you can also handle exit signals explicitly:
+      {:EXIT, _from, reason} ->
+        # optional logging/cleanup
+        exit(reason)
+    end
   end
 end

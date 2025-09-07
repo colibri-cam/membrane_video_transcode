@@ -44,7 +44,6 @@ defmodule Membrane.DRM.PrimeSink do
        display: nil,
        last_pts: nil,
        last_desc: nil,
-       last_keepalive: nil,
        card: opts.card,
        preferred_mode: opts.preferred_mode
      }}
@@ -86,14 +85,15 @@ defmodule Membrane.DRM.PrimeSink do
   @impl true
   def handle_buffer(
         :input,
-        %Buffer{metadata: %{drm_prime: desc, keepalive: keepalive}},
+        %Buffer{pts: pts, metadata: %{drm_prime: desc}},
         _ctx,
         %{ignore_pts: true} = state
       ) do
+    :erlang.garbage_collect(self())
     case Native.display_prime(state.display, desc) do
       :ok ->
         Membrane.Logger.debug("Displayed frame: #{inspect(desc)}")
-        {[demand: :input], %{state | last_desc: desc, last_keepalive: keepalive}}
+        {[demand: :input], %{state | last_pts: pts, last_desc: desc}}
 
       {:error, reason} ->
         Membrane.Logger.error("Failed to display frame: #{inspect(reason)}")
@@ -104,10 +104,11 @@ defmodule Membrane.DRM.PrimeSink do
   @impl true
   def handle_buffer(
         :input,
-        %Buffer{pts: pts, metadata: %{drm_prime: desc, keepalive: keepalive}},
+        %Buffer{pts: pts, metadata: %{drm_prime: desc}},
         _ctx,
         state
       ) do
+    :erlang.garbage_collect(self())
     actions =
       case state do
         %{last_pts: nil, last_desc: nil} ->
@@ -125,7 +126,7 @@ defmodule Membrane.DRM.PrimeSink do
           [timer_interval: {:demand_timer, pts - last_pts}]
       end
 
-    {actions, %{state | last_pts: pts, last_desc: desc, last_keepalive: keepalive}}
+    {actions, %{state | last_pts: pts, last_desc: desc}}
   end
 
   @impl true
@@ -134,10 +135,11 @@ defmodule Membrane.DRM.PrimeSink do
   end
 
   def handle_tick(:demand_timer, _ctx, state) do
+    :erlang.garbage_collect(self())
     case Native.display_prime(state.display, state.last_desc) do
       :ok ->
         Membrane.Logger.debug("Displayed frame: #{inspect(state.last_desc)}")
-        {[timer_interval: {:demand_timer, :no_interval}, demand: :input], state}
+        {[timer_interval: {:demand_timer, :no_interval}, demand: :input], %{state| last_desc: nil}}
 
       {:error, reason} ->
         Membrane.Logger.error("Failed to display frame: #{inspect(reason)}")
@@ -159,6 +161,7 @@ defmodule Membrane.DRM.PrimeSink do
         do: [],
         else: [stop_timer: :demand_timer]
 
+    :erlang.garbage_collect(self())
     {actions, %{state | display: nil}}
   end
 

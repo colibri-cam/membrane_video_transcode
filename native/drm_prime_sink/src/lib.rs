@@ -14,7 +14,8 @@ use drm::control::{
 };
 use drm::{ClientCapability, Device as _, buffer, control};
 use drm_fourcc::DrmFourcc;
-use rustler::{Atom, Decoder, Encoder, NifResult, ResourceArc};
+use rustler::env::{OwnedEnv, SavedTerm};
+use rustler::{Atom, Decoder, Encoder, Env, LocalPid, NifResult, ResourceArc, Term};
 use std::io::ErrorKind;
 
 #[cfg(feature = "verbose")]
@@ -26,8 +27,62 @@ macro_rules! log {
     ($($t:tt)*) => {};
 }
 
+pub struct FrozenTerm {
+    env: Option<OwnedEnv>,    // taken on first send
+    saved: Option<SavedTerm>, // taken on first send
+}
+
+impl FrozenTerm {
+    /// If you need to read the term before it's sent, load it from a target env.
+    /// Panics if already used (you can change to return Result if you prefer).
+    pub fn load<'a>(&self, env: Env<'a>) -> Term<'a> {
+        self.saved
+            .as_ref()
+            .expect("FrozenTerm already used")
+            .load(env)
+    }
+
+    /// One-shot send: moves the OwnedEnv + SavedTerm and sends a message built by `make_msg`.
+    pub fn send_once_with<F>(&mut self, pid: &LocalPid, make_msg: F)
+    where
+        // HRTB: closure works for any env lifetime
+        F: for<'a> FnOnce(Env<'a>, Term<'a>) -> Term<'a>,
+    {
+        if let (Some(mut oenv), Some(saved)) = (self.env.take(), self.saved.take()) {
+            let _ = oenv.send_and_clear(pid, move |env| {
+                let payload = saved.load(env);
+                make_msg(env, payload)
+            });
+        } else {
+            // already used; ignore or log as you wish
+        }
+    }
+}
+
+impl<'a> Decoder<'a> for FrozenTerm {
+    fn decode(t: Term<'a>) -> NifResult<Self> {
+        let oenv = OwnedEnv::new();
+        let saved = oenv.save(t);
+        Ok(FrozenTerm {
+            env: Some(oenv),
+            saved: Some(saved), // <-- wrap in Some(...)
+        })
+    }
+}
+
+impl Encoder for FrozenTerm {
+    fn encode<'b>(&self, env: Env<'b>) -> Term<'b> {
+        // allow encoding before send_once_with is called
+        self.saved
+            .as_ref()
+            .expect("FrozenTerm already used")
+            .load(env)
+    }
+}
+
 rustler::atoms! {
-    ok
+    ok,
+    keepalive
 }
 
 #[derive(Debug)]
@@ -39,22 +94,31 @@ impl AsFd for Fd {
     }
 }
 
-#[derive(Debug, rustler::NifStruct)]
+#[derive(rustler::NifStruct)]
 #[module = "Membrane.PrimePlane"]
 struct PrimePlane {
-    fd: Fd,
+    obj_idx: u32,
     pitch: u32,
     offset: u32,
+}
+
+#[derive(rustler::NifStruct)]
+#[module = "Membrane.PrimeObject"]
+struct PrimeObject {
+    fd: Fd,
     modifier: Option<u64>,
 }
 
-#[derive(Debug, rustler::NifStruct)]
+#[derive(rustler::NifStruct)]
 #[module = "Membrane.PrimeDesc"]
 struct PrimeDesc {
     width: u32,
     height: u32,
     format: Fourcc,
+    objects: Vec<PrimeObject>,
     planes: Vec<PrimePlane>,
+    keepalive: FrozenTerm,
+    owner_pid: LocalPid,
 }
 
 #[derive(Debug, rustler::NifStruct)]
@@ -90,9 +154,15 @@ impl<'a> Decoder<'a> for Fd {
 struct Fourcc(DrmFourcc);
 
 #[derive(Clone, Debug)]
-pub struct FbWithHandles {
-    pub fb: framebuffer::Handle,
-    pub handles: [Option<GemHandle>; 4], // keep to close after vblank
+struct FbWithHandles {
+    fb: framebuffer::Handle,
+    handles: [Option<GemHandle>; 4], // keep to close after vblank
+}
+
+struct DisplayUnit {
+    fbwh: FbWithHandles,
+    keepalive: FrozenTerm,
+    owner_pid: LocalPid,
 }
 
 /// In-memory PlanarBuffer based on your PrimeDesc.
@@ -201,8 +271,8 @@ struct DisplayInner {
     prop_zpos: Option<property::Handle>,
     mode_blob: u64,
     setup: bool,
-    stale: Option<FbWithHandles>,
-    in_flight: Option<FbWithHandles>,
+    stale: Option<DisplayUnit>,
+    in_flight: Option<DisplayUnit>,
 }
 
 fn open_card(path: &str) -> std::io::Result<Card> {
@@ -239,9 +309,14 @@ where
                     log!("close_buffer(): already closed ({e})");
                     break;
                 }
+                #[cfg(feature = "verbose")]
                 Err(e) => {
                     // Don’t crash the process/NIF; just log and continue.
                     log!("close_buffer() failed: {e}");
+                    break;
+                }
+                #[cfg(not(feature = "verbose"))]
+                Err(_) => {
                     break;
                 }
             }
@@ -503,7 +578,10 @@ impl DisplayInner {
     }
 
     fn display(&mut self, desc: PrimeDesc) -> std::io::Result<()> {
-        let new_fb = self.add_fb_from_prime_desc(&desc).map_err(|e| {
+        let width = desc.width as u64;
+        let height = desc.height as u64;
+
+        let new_fb = self.add_fb_from_prime_desc(desc).map_err(|e| {
             log!("Add fb from prime error: {}", e);
             io::Error::other(e)
         })?;
@@ -540,12 +618,12 @@ impl DisplayInner {
             req.add_property(
                 self.plane,
                 self.prop_src_w,
-                property::Value::UnsignedRange((desc.width as u64) << 16),
+                property::Value::UnsignedRange(width << 16),
             );
             req.add_property(
                 self.plane,
                 self.prop_src_h,
-                property::Value::UnsignedRange((desc.height as u64) << 16),
+                property::Value::UnsignedRange(height << 16),
             );
             // Destination on CRTC
             req.add_property(
@@ -561,12 +639,12 @@ impl DisplayInner {
             req.add_property(
                 self.plane,
                 self.prop_crtc_w,
-                property::Value::UnsignedRange(desc.width as u64),
+                property::Value::UnsignedRange(width),
             );
             req.add_property(
                 self.plane,
                 self.prop_crtc_h,
-                property::Value::UnsignedRange(desc.height as u64),
+                property::Value::UnsignedRange(height),
             );
             // Optional helpers: ZPOS and YUV color props if present
             if let Some(zpos) = self.prop_zpos {
@@ -577,7 +655,7 @@ impl DisplayInner {
         req.add_property(
             self.plane,
             self.prop_fb,
-            property::Value::Framebuffer(Some(new_fb.fb)),
+            property::Value::Framebuffer(Some(new_fb.fbwh.fb)),
         );
 
         let flags = if self.stale.is_none() && self.in_flight.is_none() {
@@ -587,17 +665,19 @@ impl DisplayInner {
         };
         if let Err(e) = self.card.atomic_commit(flags, req) {
             eprintln!("atomic_commit error: {e:?}");
-            let _ = self.card.destroy_framebuffer(new_fb.fb);
-            close_unique_handles(&new_fb.handles, |h| self.card.close_buffer(h))?;
+            let _ = self.card.destroy_framebuffer(new_fb.fbwh.fb);
+            close_unique_handles(&new_fb.fbwh.handles, |h| self.card.close_buffer(h))?;
+            self.on_displayed(new_fb.keepalive, &new_fb.owner_pid);
             return Err(std::io::Error::new(e.kind(), format!("atomic commit: {e}")));
         };
 
         if let Some(stale_fb) = self.stale.take() {
-            log!("Dropping stale framebuffer {:?}\n", stale_fb);
+            log!("Dropping stale framebuffer {:?}\n", stale_fb.fbwh);
             // 1) Drop the KMS FB
-            self.card.destroy_framebuffer(stale_fb.fb)?;
+            self.card.destroy_framebuffer(stale_fb.fbwh.fb)?;
             // 2) Close handles associated with the stale framebuffer
-            close_unique_handles(&stale_fb.handles, |h| self.card.close_buffer(h))?;
+            close_unique_handles(&stale_fb.fbwh.handles, |h| self.card.close_buffer(h))?;
+            self.on_displayed(stale_fb.keepalive, &new_fb.owner_pid);
         }
 
         self.stale = self.in_flight.take();
@@ -606,29 +686,35 @@ impl DisplayInner {
     }
 
     /// Create a KMS framebuffer from your PrimeDesc using drm-rs 0.14.
-    fn add_fb_from_prime_desc(&mut self, prime: &PrimeDesc) -> Result<FbWithHandles> {
+    fn add_fb_from_prime_desc(&mut self, prime: PrimeDesc) -> Result<DisplayUnit> {
         if prime.planes.is_empty() {
             bail!("PrimeDesc has no planes");
         }
-        let n = prime.planes.len().min(4);
 
         // Import planes (dmabuf -> GEM)
+        let mut obj_handles: [Option<GemHandle>; 4] = [None, None, None, None];
         let mut handles: [Option<GemHandle>; 4] = [None, None, None, None];
         let mut pitches: [u32; 4] = [0; 4];
         let mut offsets: [u32; 4] = [0; 4];
 
         // Collect per-plane modifiers, then collapse to one
         let mut mods_raw: [Option<u64>; 4] = [None, None, None, None];
-        for i in 0..n {
-            let p = &prime.planes[i];
+
+        for i in 0..prime.objects.len() {
+            let o = &prime.objects[i];
             let gem = self
                 .card
-                .prime_fd_to_buffer(p.fd.as_fd())
+                .prime_fd_to_buffer(o.fd.as_fd())
                 .with_context(|| format!("prime_fd_to_buffer failed on plane {}", i))?;
-            handles[i] = Some(gem);
+            obj_handles[i] = Some(gem);
+            mods_raw[i] = o.modifier;
+        }
+
+        for i in 0..prime.planes.len() {
+            let p = &prime.planes[i];
+            handles[i] = obj_handles[p.obj_idx as usize];
             pitches[i] = p.pitch;
             offsets[i] = p.offset;
-            mods_raw[i] = p.modifier;
         }
 
         // Collapse modifiers: all Some(m) must be the same, otherwise bail.
@@ -666,29 +752,18 @@ impl DisplayInner {
             .add_planar_framebuffer(&pb, flags)
             .context("add_planar_framebuffer failed")?;
 
-        Ok(FbWithHandles { fb, handles })
+        Ok(DisplayUnit {
+            fbwh: FbWithHandles { fb, handles },
+            keepalive: prime.keepalive,
+            owner_pid: prime.owner_pid,
+        })
     }
-}
 
-impl Drop for DisplayInner {
-    fn drop(&mut self) {
-        if let Some(FbWithHandles { fb, handles }) = self.stale.take() {
-            let _ = self.card.destroy_framebuffer(fb);
-            let _ = close_unique_handles(&handles, |h| self.card.close_buffer(h));
-        }
-        if let Some(FbWithHandles { fb, handles }) = self.in_flight.take() {
-            let _ = self.card.destroy_framebuffer(fb);
-            let _ = close_unique_handles(&handles, |h| self.card.close_buffer(h));
-        }
-        let _ = self.card.destroy_property_blob(self.mode_blob);
-    }
-}
-
-impl DisplayInner {
     fn run(mut self, rx: mpsc::Receiver<PrimeDesc>, err: Arc<Mutex<Option<String>>>) {
         while let Ok(mut desc) = rx.recv() {
             // Coalesce queue: only display the most recent
             while let Ok(d) = rx.try_recv() {
+                self.on_displayed(desc.keepalive, &desc.owner_pid);
                 desc = d;
             }
             if let Err(e) = self.display(desc) {
@@ -699,6 +774,26 @@ impl DisplayInner {
             }
         }
         // dropping self cleans up resources
+    }
+
+    fn on_displayed(&self, mut ka: FrozenTerm, owner_pid: &LocalPid) {
+        ka.send_once_with(owner_pid, |env, payload| (keepalive(), payload).encode(env));
+    }
+}
+
+impl Drop for DisplayInner {
+    fn drop(&mut self) {
+        if let Some(du) = self.stale.take() {
+            let _ = self.card.destroy_framebuffer(du.fbwh.fb);
+            let _ = close_unique_handles(&du.fbwh.handles, |h| self.card.close_buffer(h));
+            let _ = self.on_displayed(du.keepalive, &du.owner_pid);
+        }
+        if let Some(du) = self.in_flight.take() {
+            let _ = self.card.destroy_framebuffer(du.fbwh.fb);
+            let _ = close_unique_handles(&du.fbwh.handles, |h| self.card.close_buffer(h));
+            let _ = self.on_displayed(du.keepalive, &du.owner_pid);
+        }
+        let _ = self.card.destroy_property_blob(self.mode_blob);
     }
 }
 
