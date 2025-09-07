@@ -1,3 +1,7 @@
+# Disclaimer
+
+Big parts of this codebase have been vibecoded in a hurry and need proper redo!!
+
 # Membrane DRM sink
 
 Elixir experiment demonstrating how to drive a DRM device from a Rust NIF.
