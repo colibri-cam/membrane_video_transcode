@@ -1,6 +1,6 @@
 # Disclaimer
 
-Big parts of this codebase have been vibecoded in a hurry and need proper redo!!
+Big parts of this codebase have been vibecoded in an extreme hurry, this all will get a proper redo. For now it just an AI slop
 
 # Membrane DRM sink
 
@@ -26,7 +26,7 @@ by adding `drm_experiments` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:drm_experiments, "~> 0.1.0"}
+    {:membrane_drm_sink, git: "https://github.com/colibri-cam/membrane_drm_sink"}
   ]
 end
 ```
