@@ -6,7 +6,7 @@ defmodule Membrane.DRM.PrimeSink.Native do
       Keyword.merge(
         @rustler_opts,
         [
-          otp_app: :drm_experiments,
+          otp_app: :membrane_drm_sink,
           crate: "drm_prime_sink",
           features: @features
         ]

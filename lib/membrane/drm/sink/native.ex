@@ -4,7 +4,7 @@ defmodule Membrane.DRM.Sink.Native do
   use Rustler,
       Keyword.merge(
         [
-          otp_app: :drm_experiments,
+          otp_app: :membrane_drm_sink,
           crate: "drm_sink"
         ],
         @rustler_opts
