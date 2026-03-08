@@ -1,9 +1,10 @@
 # Code Style and Testing Guidelines
 
-This project contains Elixir module. It is a membrane framework sink that uses
-Rust NIF to implement low level atomic modesetting implementation.
+This project contains Elixir modules backed by Rust NIFs for H.265 decoding and
+low level atomic modesetting.
 
-Check `native/drm_prime_sink/AGENTS.md` for the Rust instructions.
+Check `native/drm_prime_sink/AGENTS.md` and `native/h265_prime_decoder/AGENTS.md`
+for the Rust instructions.
 
 ## Code Style
 - Use elixir specified in .tool-versions

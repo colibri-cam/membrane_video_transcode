@@ -1,28 +1,59 @@
 defmodule Membrane.H265.PrimeDecoder do
   @moduledoc """
-  Variant of `Membrane.H265.Decoder` that returns DRM Prime descriptors instead of
-  raw frame payloads. Each decoded frame is sent downstream as an empty buffer
-  with the descriptor attached under the `:drm_prime` metadata key.
+  Decodes H265 into either DRM Prime descriptors or raw video frames.
 
-  It also returns keepalive which is a reference to AV frame in GPU
-  memory. When reference gets GCed AV frame get's release. Keep
-  keepalive in pipeline until prime descriptor reaches consumer.
+  Prime output sends empty buffers with descriptors attached under the
+  `:drm_prime` metadata key. Raw output sends copied frame payloads.
   """
 
   use Membrane.Filter
 
   alias __MODULE__.Native
   alias Membrane.Buffer
-  alias Membrane.PrimeFormat
   alias Membrane.H265
   alias Membrane.H265.Common
+  alias Membrane.PrimeFormat
+  alias Membrane.RawVideo
+
+  @typedoc """
+  Supported raw output pixel formats.
+  """
+  @type pixel_format ::
+          :I420
+          | :I422
+          | :I444
+          | :RGB
+          | :BGRA
+          | :RGBA
+          | :NV12
+          | :NV21
+          | :YV12
+          | :AYUV
+          | :YUY2
+
+  @formats [:I420, :I422, :I444, :RGB, :BGRA, :RGBA, :NV12, :NV21, :YV12, :AYUV, :YUY2]
 
   @typedoc """
   Decoder backend to use.
   """
   @type decoder_backend :: :auto | :vaapi | :v4l2request | :v4l2m2m | :software
 
+  @typedoc """
+  Decoder output mode.
+  """
+  @type output_mode :: :prime | :raw
+
   def_options(
+    output: [
+      spec: output_mode(),
+      default: :prime,
+      description: "Whether to emit DRM Prime descriptors or raw frames"
+    ],
+    output_format: [
+      spec: pixel_format(),
+      default: :NV12,
+      description: "Pixel format to use for raw decoded frames"
+    ],
     hw_device: [
       spec: String.t(),
       default: "/dev/dri/renderD129",
@@ -42,27 +73,26 @@ defmodule Membrane.H265.PrimeDecoder do
 
   def_output_pad(:output,
     flow_control: :auto,
-    accepted_format: %PrimeFormat{}
+    accepted_format:
+      any_of(
+        %PrimeFormat{},
+        %RawVideo{pixel_format: format, aligned: true} when format in @formats
+      )
   )
 
   @impl true
   def handle_init(_ctx, opts) do
-    {:ok, worker} =
-      Task.start_link(fn ->
-        worker_loop(self())
-      end)
-
-    # If you want to receive :'EXIT' messages from the worker:
-    Process.flag(:trap_exit, true)
+    worker = maybe_start_worker(opts.output)
 
     state = %{
       decoder_ref: nil,
       stream_format_sent?: false,
+      output: opts.output,
+      output_format: opts.output_format,
       hw_device: opts.hw_device,
       decoder: opts.decoder,
       worker: worker
     }
-
 
     {[], state}
   end
@@ -70,7 +100,12 @@ defmodule Membrane.H265.PrimeDecoder do
   @impl true
   def handle_setup(_ctx, state) do
     decoder =
-      case Native.create(state.hw_device, state.decoder) do
+      case Native.create(
+             state.output,
+             output_format_for_nif(state),
+             state.hw_device,
+             state.decoder
+           ) do
         {:error, reason} -> raise "Error creating decoder #{inspect(reason)}"
         decoder -> decoder
       end
@@ -84,21 +119,20 @@ defmodule Membrane.H265.PrimeDecoder do
     pts = Common.to_h265_time_base_truncated(buffer.pts)
 
     case Native.decode(decoder, buffer.payload, pts, dts) do
-      {:ok, pts_list, descs} ->
-        Membrane.Logger.debug("#{inspect {pts_list, descs}}")
+      {:ok, pts_list, frames} ->
         in_stream_format = ctx.pads.input.stream_format
         {actions, state} = maybe_send_stream_format(state, in_stream_format)
-        bufs = wrap_descriptors(pts_list, descs, state.worker)
+        bufs = wrap_outputs(state.output, pts_list, frames, state.worker)
         {actions ++ bufs, state}
 
       {:error, reason} ->
         err = "Failed to decode frame: #{inspect(reason)}"
-        Membrane.Logger.error("Failed to decode frame: #{inspect(reason)}")
+        Membrane.Logger.error("#{err}")
         raise err
-      other -> 
-        err = "Failed to decode frame: #{inspect(other)}"
 
-        Membrane.Logger.error("Failed to decode frame: #{inspect(other)}")
+      other ->
+        err = "Failed to decode frame: #{inspect(other)}"
+        Membrane.Logger.error("#{err}")
         raise err
     end
   end
@@ -111,9 +145,9 @@ defmodule Membrane.H265.PrimeDecoder do
   @impl true
   def handle_end_of_stream(:input, _ctx, %{decoder_ref: decoder} = state) do
     case Native.flush(decoder) do
-      {:ok, pts_list, descs} ->
+      {:ok, pts_list, frames} ->
         :ok = Native.close(decoder)
-        bufs = wrap_descriptors(pts_list, descs, state.worker)
+        bufs = wrap_outputs(state.output, pts_list, frames, state.worker)
         new_state = %{state | decoder_ref: nil}
         {bufs ++ [end_of_stream: :output], new_state}
 
@@ -125,22 +159,36 @@ defmodule Membrane.H265.PrimeDecoder do
   @impl true
   def handle_terminate_request(_ctx, %{decoder_ref: decoder, worker: worker} = state) do
     :erlang.garbage_collect(self())
+
     if decoder do
       :ok = Native.close(decoder)
     end
 
-    if Process.alive?(worker), do: Process.exit(worker, :shutdown)
+    if worker && Process.alive?(worker) do
+      Process.exit(worker, :shutdown)
+    end
 
     {[terminate: :normal], %{state | decoder_ref: nil}}
   end
 
-  defp wrap_descriptors([], [], _worker), do: []
+  defp maybe_start_worker(:prime) do
+    {:ok, worker} = Task.start_link(fn -> worker_loop() end)
+    Process.flag(:trap_exit, true)
+    worker
+  end
 
-  defp wrap_descriptors(pts_list, descs, worker) do
-    Enum.zip([pts_list, descs])
-    |> Enum.map(fn {p, desc} ->
+  defp maybe_start_worker(:raw), do: nil
+
+  defp output_format_for_nif(%{output: :prime}), do: nil
+  defp output_format_for_nif(%{output: :raw, output_format: format}), do: format
+
+  defp wrap_outputs(_output, [], [], _worker), do: []
+
+  defp wrap_outputs(:prime, pts_list, descs, worker) do
+    Enum.zip(pts_list, descs)
+    |> Enum.map(fn {pts, desc} ->
       %Buffer{
-        pts: Common.to_membrane_time_base_truncated(p),
+        pts: Common.to_membrane_time_base_truncated(pts),
         payload: <<>>,
         metadata: %{drm_prime: Map.put(desc, :owner_pid, worker)}
       }
@@ -148,10 +196,18 @@ defmodule Membrane.H265.PrimeDecoder do
     |> then(&[buffer: {:output, &1}])
   end
 
+  defp wrap_outputs(:raw, pts_list, frames, _worker) do
+    Enum.zip(pts_list, frames)
+    |> Enum.map(fn {pts, payload} ->
+      %Buffer{pts: Common.to_membrane_time_base_truncated(pts), payload: payload}
+    end)
+    |> then(&[buffer: {:output, &1}])
+  end
+
   defp maybe_send_stream_format(%{stream_format_sent?: true} = state, _in_sf), do: {[], state}
 
-  defp maybe_send_stream_format(%{decoder_ref: decoder} = state, in_sf) do
-    {:ok, width, height} = Native.get_metadata(decoder)
+  defp maybe_send_stream_format(%{decoder_ref: decoder, output: :prime} = state, in_sf) do
+    {:ok, width, height, _} = Native.get_metadata(decoder)
 
     framerate =
       case in_sf do
@@ -159,26 +215,38 @@ defmodule Membrane.H265.PrimeDecoder do
         _ -> {0, 1}
       end
 
-    sf = %PrimeFormat{
+    sf = %PrimeFormat{width: width, height: height, framerate: framerate}
+
+    {[stream_format: {:output, sf}], %{state | stream_format_sent?: true}}
+  end
+
+  defp maybe_send_stream_format(%{decoder_ref: decoder, output: :raw} = state, in_sf) do
+    {:ok, width, height, pix_fmt} = Native.get_metadata(decoder)
+
+    framerate =
+      case in_sf do
+        %H265{framerate: in_framerate} -> in_framerate
+        _ -> {0, 1}
+      end
+
+    sf = %RawVideo{
+      pixel_format: pix_fmt,
       width: width,
       height: height,
-      framerate: framerate
+      framerate: framerate,
+      aligned: true
     }
 
     {[stream_format: {:output, sf}], %{state | stream_format_sent?: true}}
   end
 
- defp worker_loop(element_pid) do
+  defp worker_loop do
     receive do
-      {:keepalive, keepalive} = msg ->
-        Membrane.Logger.debug("#{inspect msg}")
+      {:keepalive, keepalive} ->
         Native.keepalive_release(keepalive)
-        worker_loop(element_pid)
+        worker_loop()
 
-      # If the element dies (they’re linked), the worker will exit automatically.
-      # If you set trap_exit above, you can also handle exit signals explicitly:
       {:EXIT, _from, reason} ->
-        # optional logging/cleanup
         exit(reason)
     end
   end
