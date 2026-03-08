@@ -9,6 +9,7 @@ defmodule Membrane.DRM.PrimeSink do
   require Membrane.Logger
 
   alias Membrane.Buffer
+  alias Membrane.DRM.PrimeSink.DisplayInfo
   alias Membrane.PrimeFormat
   alias Membrane.DRM.PrimeSink.Native
 
@@ -21,7 +22,8 @@ defmodule Membrane.DRM.PrimeSink do
     preferred_mode: [
       spec: {pos_integer(), pos_integer(), pos_integer()} | nil,
       default: nil,
-      description: "Preferred video mode as {width, height, framerate}"
+      description:
+        "Preferred video mode as {width, height, framerate}; defaults to the input stream format when available"
     ],
     ignore_pts: [
       spec: boolean,
@@ -51,31 +53,38 @@ defmodule Membrane.DRM.PrimeSink do
 
   @impl true
   def handle_setup(_ctx, state) do
-    {:ok, info, display} = Native.init_display(state.card, state.preferred_mode)
-    {w, h, r} = info.mode
+    {[], state}
+  end
 
-    Membrane.Logger.info(
-      "Using card #{info.card_path}, connector #{info.connector_id} (#{info.connector_type}), " <>
-        "plane #{info.plane_id}, mode #{w}x#{h}@#{r}"
-    )
+  @impl true
+  def handle_stream_format(:input, %PrimeFormat{} = format, _ctx, %{display: nil} = state) do
+    mode = state.preferred_mode || stream_format_mode(format)
+    {:ok, info, display} = Native.init_display(state.card, mode, self())
+
+    if info do
+      log_display_info(info)
+    end
 
     {[], %{state | display: display}}
   end
 
-  @impl true
-  #def handle_stream_format(:input, %PrimeFormat{}, _ctx, %{display: nil} = state) do
-  #  {:ok, info, display} = Native.init_display(state.card, state.preferred_mode)
-  #  {w, h, r} = info.mode
-
-  #  Membrane.Logger.info(
-  #    "Using card #{info.card_path}, connector #{info.connector_id} (#{info.connector_type}), " <>
-  #      "plane #{info.plane_id}, mode #{w}x#{h}@#{r}"
-  #  )
-
-  #  {[], %{state | display: display}}
-  #end
-
   def handle_stream_format(:input, _, _ctx, state), do: {[], state}
+
+  @impl true
+  def handle_info({:display_waiting, reason}, _ctx, state) do
+    Membrane.Logger.warning("Waiting for DRM display hot-plug on #{state.card}: #{reason}")
+    {[], state}
+  end
+
+  def handle_info({:display_connected, %DisplayInfo{} = info}, _ctx, state) do
+    log_display_info(info)
+    {[], state}
+  end
+
+  def handle_info({:display_disconnected, reason}, _ctx, state) do
+    Membrane.Logger.warning("Lost DRM display on #{state.card}, waiting for hot-plug: #{reason}")
+    {[], state}
+  end
 
   @impl true
   def handle_start_of_stream(:input, _ctx, state) do
@@ -90,6 +99,7 @@ defmodule Membrane.DRM.PrimeSink do
         %{ignore_pts: true} = state
       ) do
     :erlang.garbage_collect(self())
+
     case Native.display_prime(state.display, desc) do
       :ok ->
         Membrane.Logger.debug("Displayed frame: #{inspect(desc)}")
@@ -109,6 +119,7 @@ defmodule Membrane.DRM.PrimeSink do
         state
       ) do
     :erlang.garbage_collect(self())
+
     actions =
       case state do
         %{last_pts: nil, last_desc: nil} ->
@@ -136,10 +147,13 @@ defmodule Membrane.DRM.PrimeSink do
 
   def handle_tick(:demand_timer, _ctx, state) do
     :erlang.garbage_collect(self())
+
     case Native.display_prime(state.display, state.last_desc) do
       :ok ->
         Membrane.Logger.debug("Displayed frame: #{inspect(state.last_desc)}")
-        {[timer_interval: {:demand_timer, :no_interval}, demand: :input], %{state| last_desc: nil}}
+
+        {[timer_interval: {:demand_timer, :no_interval}, demand: :input],
+         %{state | last_desc: nil}}
 
       {:error, reason} ->
         Membrane.Logger.error("Failed to display frame: #{inspect(reason)}")
@@ -175,5 +189,28 @@ defmodule Membrane.DRM.PrimeSink do
     end
 
     {[terminate: :normal], %{state | display: nil}}
+  end
+
+  defp stream_format_mode(%PrimeFormat{width: width, height: height, framerate: framerate}) do
+    case framerate_to_hz(framerate) do
+      nil -> nil
+      hz -> {width, height, hz}
+    end
+  end
+
+  defp framerate_to_hz({num, den})
+       when is_integer(num) and is_integer(den) and num > 0 and den > 0 do
+    div(num + div(den, 2), den)
+  end
+
+  defp framerate_to_hz(_framerate), do: nil
+
+  defp log_display_info(%DisplayInfo{} = info) do
+    {w, h, r} = info.mode
+
+    Membrane.Logger.info(
+      "Using card #{info.card_path}, connector #{info.connector_id} (#{info.connector_type}), " <>
+        "plane #{info.plane_id}, mode #{w}x#{h}@#{r}"
+    )
   end
 end
