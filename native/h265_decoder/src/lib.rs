@@ -109,10 +109,10 @@ fn init_decoder(target: format::Pixel, atom: Atom, backend: Backend) -> Result<D
             (*decoder.as_mut_ptr()).get_format = Some(get_format_drm_prime);
             sys::av_buffer_unref(&mut hw_device_ctx);
         } else if matches!(backend, Backend::Vaapi | Backend::Auto)
-            && std::path::Path::new("/dev/dri/renderD128").exists()
+            && std::path::Path::new("/dev/dri/renderD129").exists()
         {
             let mut hw_device_ctx = ptr::null_mut();
-            if let Ok(path) = CString::new("/dev/dri/renderD128") {
+            if let Ok(path) = CString::new("/dev/dri/renderD129") {
                 if sys::av_hwdevice_ctx_create(
                     &mut hw_device_ctx,
                     sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
