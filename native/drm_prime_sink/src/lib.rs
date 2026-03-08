@@ -909,6 +909,7 @@ struct DisplayQueue {
 
 struct DisplayQueueState {
     pending: Option<PrimeDesc>,
+    releases: Vec<PrimeDesc>,
     closed: bool,
 }
 
@@ -922,6 +923,7 @@ impl DisplayQueue {
         Self {
             state: Mutex::new(DisplayQueueState {
                 pending: None,
+                releases: Vec::new(),
                 closed: false,
             }),
             wakeup: Condvar::new(),
@@ -929,17 +931,13 @@ impl DisplayQueue {
     }
 
     fn enqueue(&self, desc: PrimeDesc) -> std::io::Result<()> {
-        let replaced = {
-            let mut state = self.state.lock().map_err(|_| io::Error::other("lock"))?;
-            if state.closed {
-                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
-            }
+        let mut state = self.state.lock().map_err(|_| io::Error::other("lock"))?;
+        if state.closed {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
 
-            state.pending.replace(desc)
-        };
-
-        if let Some(desc) = replaced {
-            release_prime_desc(desc);
+        if let Some(desc) = state.pending.replace(desc) {
+            state.releases.push(desc);
         }
 
         self.wakeup.notify_one();
@@ -952,30 +950,25 @@ impl DisplayQueue {
     }
 
     fn restore_or_release(&self, desc: PrimeDesc) -> std::io::Result<()> {
-        let pending = {
-            let mut state = self.state.lock().map_err(|_| io::Error::other("lock"))?;
-            if state.closed {
-                Some(desc)
-            } else if state.pending.is_none() {
-                state.pending = Some(desc);
-                None
-            } else {
-                Some(desc)
-            }
-        };
-
-        if let Some(desc) = pending {
-            release_prime_desc(desc);
+        let mut state = self.state.lock().map_err(|_| io::Error::other("lock"))?;
+        if state.closed || state.pending.is_some() {
+            state.releases.push(desc);
         } else {
-            self.wakeup.notify_one();
+            state.pending = Some(desc);
         }
 
+        self.wakeup.notify_one();
         Ok(())
+    }
+
+    fn take_releases(&self) -> std::io::Result<Vec<PrimeDesc>> {
+        let mut state = self.state.lock().map_err(|_| io::Error::other("lock"))?;
+        Ok(std::mem::take(&mut state.releases))
     }
 
     fn wait_timeout(&self, timeout: Duration) -> std::io::Result<bool> {
         let state = self.state.lock().map_err(|_| io::Error::other("lock"))?;
-        if state.closed || state.pending.is_some() {
+        if state.closed || state.pending.is_some() || !state.releases.is_empty() {
             return Ok(state.closed);
         }
 
@@ -986,15 +979,12 @@ impl DisplayQueue {
         Ok(state.closed)
     }
 
-    fn close(&self) -> std::io::Result<Option<PrimeDesc>> {
-        let pending = {
-            let mut state = self.state.lock().map_err(|_| io::Error::other("lock"))?;
-            state.closed = true;
-            state.pending.take()
-        };
+    fn close(&self) -> std::io::Result<()> {
+        let mut state = self.state.lock().map_err(|_| io::Error::other("lock"))?;
+        state.closed = true;
 
         self.wakeup.notify_all();
-        Ok(pending)
+        Ok(())
     }
 
     fn is_closed(&self) -> std::io::Result<bool> {
@@ -1004,6 +994,29 @@ impl DisplayQueue {
 }
 
 impl Display {
+    fn release_queued_descs(queue: &DisplayQueue) -> bool {
+        match queue.take_releases() {
+            Ok(descs) => {
+                for desc in descs {
+                    release_prime_desc(desc);
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn release_pending_desc(queue: &DisplayQueue) -> bool {
+        match queue.take_pending() {
+            Ok(Some(desc)) => {
+                release_prime_desc(desc);
+                true
+            }
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    }
+
     fn new(
         card_path: &str,
         preferred_mode: Option<(u32, u32, u32)>,
@@ -1069,9 +1082,21 @@ impl Display {
         }
 
         loop {
+            if !Self::release_queued_descs(&queue) {
+                break;
+            }
+
             match queue.is_closed() {
-                Ok(true) | Err(_) => break,
+                Ok(true) => {
+                    if !Self::release_pending_desc(&queue) {
+                        break;
+                    }
+
+                    let _ = Self::release_queued_descs(&queue);
+                    break;
+                }
                 Ok(false) => {}
+                Err(_) => break,
             }
 
             if let Some(current) = active.as_mut() {
@@ -1115,7 +1140,7 @@ impl Display {
 
                 let timeout = next_hotplug_check.saturating_duration_since(Instant::now());
                 match queue.wait_timeout(timeout) {
-                    Ok(true) | Err(_) => break,
+                    Ok(true) | Err(_) => continue,
                     Ok(false) => continue,
                 }
             }
@@ -1136,7 +1161,7 @@ impl Display {
 
             let timeout = next_connect_attempt.saturating_duration_since(Instant::now());
             match queue.wait_timeout(timeout) {
-                Ok(true) | Err(_) => break,
+                Ok(true) | Err(_) => continue,
                 Ok(false) => {}
             }
         }
@@ -1145,9 +1170,7 @@ impl Display {
 
 impl Drop for Display {
     fn drop(&mut self) {
-        if let Ok(Some(desc)) = self.queue.close() {
-            release_prime_desc(desc);
-        }
+        let _ = self.queue.close();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
