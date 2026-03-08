@@ -3,7 +3,7 @@
 This project contains Elixir module. It is a membrane framework sink that uses
 Rust NIF to implement low level atomic modesetting implementation.
 
-Check `native/drm_sink/AGENTS.md` for the Rust instructions.
+Check `native/drm_prime_sink/AGENTS.md` for the Rust instructions.
 
 ## Code Style
 - Use elixir specified in .tool-versions

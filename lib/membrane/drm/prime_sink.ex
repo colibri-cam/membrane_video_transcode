@@ -1,7 +1,10 @@
 defmodule Membrane.DRM.PrimeSink do
   @moduledoc """
-  Sink that receives DRM Prime descriptors and scans them out directly using a
-  native NIF (`Membrane.DRM.PrimeSink.Native`) without copying frame data.
+  Sink that displays either DRM Prime descriptors or raw video frames on a DRM
+  display.
+
+  DRM Prime frames are scanned out directly by the native NIF without copying.
+  Raw frames are copied into reusable scanout buffers inside the native sink.
   """
 
   use Membrane.Sink
@@ -12,6 +15,9 @@ defmodule Membrane.DRM.PrimeSink do
   alias Membrane.DRM.PrimeSink.DisplayInfo
   alias Membrane.PrimeFormat
   alias Membrane.DRM.PrimeSink.Native
+  alias Membrane.RawVideo
+
+  @raw_formats [:I420, :I422, :I444, :RGB, :BGRA, :RGBA, :NV12, :NV21, :YV12, :AYUV, :YUY2]
 
   def_options(
     card: [
@@ -29,11 +35,17 @@ defmodule Membrane.DRM.PrimeSink do
       spec: boolean,
       default: false,
       description: "Consume frames as fast as possible, skips frames beetween vblanks"
+    ],
+    pixel_format: [
+      spec: atom() | nil,
+      default: nil,
+      description: "Expected raw input pixel format; defaults to the stream format"
     ]
   )
 
   def_input_pad(:input,
-    accepted_format: %PrimeFormat{},
+    accepted_format:
+      any_of(%PrimeFormat{}, %RawVideo{pixel_format: format} when format in @raw_formats),
     flow_control: :manual,
     demand_unit: :buffers
   )
@@ -43,11 +55,15 @@ defmodule Membrane.DRM.PrimeSink do
     {[],
      %{
        ignore_pts: opts.ignore_pts,
+       backend: nil,
        display: nil,
        last_pts: nil,
        last_desc: nil,
+       last_payload: nil,
        card: opts.card,
-       preferred_mode: opts.preferred_mode
+       preferred_mode: opts.preferred_mode,
+       pixel_format: opts.pixel_format,
+       raw_stream_format: nil
      }}
   end
 
@@ -65,10 +81,64 @@ defmodule Membrane.DRM.PrimeSink do
       log_display_info(info)
     end
 
-    {[], %{state | display: display}}
+    {[],
+     %{
+       state
+       | display: display,
+         backend: :prime,
+         last_pts: nil,
+         last_desc: nil,
+         last_payload: nil
+     }}
   end
 
-  def handle_stream_format(:input, _, _ctx, state), do: {[], state}
+  def handle_stream_format(:input, %PrimeFormat{}, _ctx, %{backend: :prime} = state),
+    do: {[], state}
+
+  def handle_stream_format(:input, %PrimeFormat{}, _ctx, _state) do
+    raise "Stream format changed while playing. Switching between raw and DRM Prime is not supported."
+  end
+
+  def handle_stream_format(:input, %RawVideo{} = format, _ctx, %{display: nil} = state) do
+    pixel_format = state.pixel_format || format.pixel_format
+
+    if pixel_format != format.pixel_format do
+      raise "Configured pixel format #{inspect(pixel_format)} does not match stream pixel format #{inspect(format.pixel_format)}"
+    end
+
+    mode = state.preferred_mode || raw_stream_format_mode(format)
+
+    {:ok, info, display} =
+      Native.init_raw_display(state.card, pixel_format, format.width, format.height, mode, self())
+
+    if info do
+      log_display_info(info)
+    end
+
+    {[],
+     %{
+       state
+       | display: display,
+         backend: :raw,
+         pixel_format: pixel_format,
+         last_pts: nil,
+         last_desc: nil,
+         last_payload: nil,
+         raw_stream_format: raw_stream_signature(format)
+     }}
+  end
+
+  def handle_stream_format(:input, %RawVideo{} = format, _ctx, %{backend: :raw} = state) do
+    if state.raw_stream_format != raw_stream_signature(format) do
+      raise "Raw stream format changed while playing. This is not supported."
+    end
+
+    {[], state}
+  end
+
+  def handle_stream_format(:input, %RawVideo{}, _ctx, _state) do
+    raise "Stream format changed while playing. Switching between raw and DRM Prime is not supported."
+  end
 
   @impl true
   def handle_info({:display_waiting, reason}, _ctx, state) do
@@ -141,11 +211,53 @@ defmodule Membrane.DRM.PrimeSink do
   end
 
   @impl true
+  def handle_buffer(
+        :input,
+        %Buffer{payload: payload, pts: pts},
+        _ctx,
+        %{backend: :raw, ignore_pts: true} = state
+      ) do
+    payload = Membrane.Payload.to_binary(payload)
+
+    case Native.display_frame(state.display, payload) do
+      :ok ->
+        {[demand: :input], %{state | last_pts: pts, last_payload: payload}}
+
+      {:error, reason} ->
+        Membrane.Logger.error("Failed to display frame: #{inspect(reason)}")
+        raise "Failed to display frame: #{inspect(reason)}"
+    end
+  end
+
+  @impl true
+  def handle_buffer(:input, %Buffer{payload: payload, pts: pts}, _ctx, %{backend: :raw} = state) do
+    payload = Membrane.Payload.to_binary(payload)
+
+    actions =
+      case state do
+        %{last_pts: nil, last_payload: nil} ->
+          case Native.display_frame(state.display, payload) do
+            :ok ->
+              [demand: :input, start_timer: {:demand_timer, :no_interval}]
+
+            {:error, reason} ->
+              Membrane.Logger.error("Failed to display frame: #{inspect(reason)}")
+              raise "Failed to display frame: #{inspect(reason)}"
+          end
+
+        %{last_pts: last_pts} ->
+          [timer_interval: {:demand_timer, pts - last_pts}]
+      end
+
+    {actions, %{state | last_pts: pts, last_payload: payload}}
+  end
+
+  @impl true
   def handle_tick(:demand_timer, _ctx, %{display: nil} = state) do
     {[], state}
   end
 
-  def handle_tick(:demand_timer, _ctx, state) do
+  def handle_tick(:demand_timer, _ctx, %{backend: :prime} = state) do
     :erlang.garbage_collect(self())
 
     case Native.display_prime(state.display, state.last_desc) do
@@ -154,6 +266,18 @@ defmodule Membrane.DRM.PrimeSink do
 
         {[timer_interval: {:demand_timer, :no_interval}, demand: :input],
          %{state | last_desc: nil}}
+
+      {:error, reason} ->
+        Membrane.Logger.error("Failed to display frame: #{inspect(reason)}")
+        raise "Failed to display frame: #{inspect(reason)}"
+    end
+  end
+
+  def handle_tick(:demand_timer, _ctx, %{backend: :raw} = state) do
+    case Native.display_frame(state.display, state.last_payload) do
+      :ok ->
+        {[timer_interval: {:demand_timer, :no_interval}, demand: :input],
+         %{state | last_payload: nil}}
 
       {:error, reason} ->
         Membrane.Logger.error("Failed to display frame: #{inspect(reason)}")
@@ -176,7 +300,17 @@ defmodule Membrane.DRM.PrimeSink do
         else: [stop_timer: :demand_timer]
 
     :erlang.garbage_collect(self())
-    {actions, %{state | display: nil}}
+
+    {actions,
+     %{
+       state
+       | display: nil,
+         backend: nil,
+         last_pts: nil,
+         last_desc: nil,
+         last_payload: nil,
+         raw_stream_format: nil
+     }}
   end
 
   @impl true
@@ -188,7 +322,16 @@ defmodule Membrane.DRM.PrimeSink do
       end
     end
 
-    {[terminate: :normal], %{state | display: nil}}
+    {[terminate: :normal],
+     %{
+       state
+       | display: nil,
+         backend: nil,
+         last_pts: nil,
+         last_desc: nil,
+         last_payload: nil,
+         raw_stream_format: nil
+     }}
   end
 
   defp stream_format_mode(%PrimeFormat{width: width, height: height, framerate: framerate}) do
@@ -196,6 +339,17 @@ defmodule Membrane.DRM.PrimeSink do
       nil -> nil
       hz -> {width, height, hz}
     end
+  end
+
+  defp raw_stream_format_mode(%RawVideo{width: width, height: height, framerate: framerate}) do
+    case framerate_to_hz(framerate) do
+      nil -> nil
+      hz -> {width, height, hz}
+    end
+  end
+
+  defp raw_stream_signature(%RawVideo{} = format) do
+    {format.pixel_format, format.width, format.height, format.framerate}
   end
 
   defp framerate_to_hz({num, den})

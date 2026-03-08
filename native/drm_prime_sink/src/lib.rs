@@ -8,17 +8,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail}; // gives you Result and bail!
-use drm::buffer::{DrmModifier, Handle as GemHandle, PlanarBuffer};
+use drm::buffer::{Buffer as _, DrmModifier, Handle as GemHandle, PlanarBuffer};
 
 use drm::control::{
-    Device as _, FbCmd2Flags, atomic::AtomicModeReq, connector, crtc, encoder, framebuffer, plane,
-    property,
+    Device as _, FbCmd2Flags, atomic::AtomicModeReq, connector, crtc, dumbbuffer as dumbbuf,
+    encoder, framebuffer, plane, property,
 };
 use drm::{ClientCapability, Device as _, buffer, control};
 use drm_fourcc::DrmFourcc;
 use rustler::env::{OwnedEnv, SavedTerm};
-use rustler::{Atom, Decoder, Encoder, Env, LocalPid, NifResult, ResourceArc, Term};
+use rustler::{Atom, Binary, Decoder, Encoder, Env, LocalPid, NifResult, ResourceArc, Term};
 use std::io::ErrorKind;
+
+#[cfg(feature = "rpi")]
+const DRM_FORMAT_MOD_BROADCOM_SAND128: u64 = 0x0700_0000_0000_0004;
 
 #[cfg(feature = "verbose")]
 macro_rules! log {
@@ -27,6 +30,104 @@ macro_rules! log {
 #[cfg(not(feature = "verbose"))]
 macro_rules! log {
     ($($t:tt)*) => {};
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(clippy::upper_case_acronyms)]
+enum PixelFormat {
+    I420,
+    I422,
+    I444,
+    RGB,
+    BGRA,
+    RGBA,
+    NV12,
+    NV21,
+    YV12,
+    AYUV,
+    YUY2,
+}
+
+impl PixelFormat {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "I420" => Some(Self::I420),
+            "I422" => Some(Self::I422),
+            "I444" => Some(Self::I444),
+            "RGB" => Some(Self::RGB),
+            "BGRA" => Some(Self::BGRA),
+            "RGBA" => Some(Self::RGBA),
+            "NV12" => Some(Self::NV12),
+            "NV21" => Some(Self::NV21),
+            "YV12" => Some(Self::YV12),
+            "AYUV" => Some(Self::AYUV),
+            "YUY2" => Some(Self::YUY2),
+            _ => None,
+        }
+    }
+
+    fn fourcc(self) -> buffer::DrmFourcc {
+        use buffer::DrmFourcc as F;
+
+        match self {
+            Self::I420 => F::Yuv420,
+            Self::I422 => F::Yuv422,
+            Self::I444 => F::Yuv444,
+            Self::RGB => F::Rgb888,
+            Self::BGRA => F::Bgra8888,
+            Self::RGBA => F::Rgba8888,
+            Self::NV12 => F::Nv12,
+            Self::NV21 => F::Nv21,
+            Self::YV12 => F::Yvu420,
+            Self::AYUV => F::Ayuv,
+            Self::YUY2 => F::Yuyv,
+        }
+    }
+
+    fn bpp(self) -> u32 {
+        match self {
+            Self::RGB => 24,
+            Self::BGRA | Self::RGBA | Self::AYUV => 32,
+            Self::YUY2 => 16,
+            _ => 8,
+        }
+    }
+
+    fn buffer_height(self, height: u32) -> u32 {
+        match self {
+            Self::I420 | Self::YV12 => height * 2,
+            Self::NV12 | Self::NV21 => height * 3 / 2,
+            Self::I422 | Self::I444 => height * 3,
+            _ => height,
+        }
+    }
+
+    fn frame_size(self, width: u32, height: u32) -> usize {
+        let width = width as usize;
+        let height = height as usize;
+
+        match self {
+            Self::I420 | Self::NV12 | Self::NV21 | Self::YV12 => width * height * 3 / 2,
+            Self::I422 | Self::YUY2 => width * height * 2,
+            Self::I444 | Self::RGB => width * height * 3,
+            Self::BGRA | Self::RGBA | Self::AYUV => width * height * 4,
+        }
+    }
+
+    fn num_planes(self) -> usize {
+        match self {
+            Self::I420 | Self::I422 | Self::I444 | Self::YV12 => 3,
+            Self::NV12 | Self::NV21 => 2,
+            _ => 1,
+        }
+    }
+
+    fn fb_format(self) -> Self {
+        match self {
+            Self::I420 => Self::NV12,
+            other => other,
+        }
+    }
 }
 
 pub struct FrozenTerm {
@@ -564,6 +665,570 @@ fn scan_display_info(
     let (_, crtc) = pick_encoder_and_crtc(&card, &conn)?;
     let mode = pick_mode(&conn, preferred_mode)?;
     let plane = pick_plane(&card, &res, crtc, is_vc4)?;
+
+    Ok(build_display_info(card_path, &conn, crtc, plane, mode))
+}
+
+struct RawFbBundle {
+    db: dumbbuf::DumbBuffer,
+    fb: framebuffer::Handle,
+}
+
+struct RawDumbWrapper<'a> {
+    db: &'a dumbbuf::DumbBuffer,
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+    modifier: Option<DrmModifier>,
+}
+
+impl PlanarBuffer for RawDumbWrapper<'_> {
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    fn format(&self) -> buffer::DrmFourcc {
+        self.format.fourcc()
+    }
+
+    fn modifier(&self) -> Option<DrmModifier> {
+        self.modifier
+    }
+
+    fn pitches(&self) -> [u32; 4] {
+        let pitch = self.db.pitch();
+
+        match self.format {
+            PixelFormat::I420 | PixelFormat::I422 | PixelFormat::I444 | PixelFormat::YV12 => {
+                [pitch, pitch, pitch, 0]
+            }
+            PixelFormat::NV12 | PixelFormat::NV21 => [pitch, pitch, 0, 0],
+            _ => [pitch, 0, 0, 0],
+        }
+    }
+
+    fn handles(&self) -> [Option<buffer::Handle>; 4] {
+        let handle = self.db.handle();
+
+        match self.format.num_planes() {
+            3 => [Some(handle), Some(handle), Some(handle), None],
+            2 => [Some(handle), Some(handle), None, None],
+            _ => [Some(handle), None, None, None],
+        }
+    }
+
+    fn offsets(&self) -> [u32; 4] {
+        let pitch = self.db.pitch();
+
+        match self.format {
+            PixelFormat::I420 => [
+                0,
+                pitch * self.height,
+                pitch * self.height + pitch * (self.height / 2),
+                0,
+            ],
+            PixelFormat::YV12 => [
+                0,
+                pitch * self.height,
+                pitch * self.height + pitch * (self.height / 2),
+                0,
+            ],
+            PixelFormat::I422 | PixelFormat::I444 => {
+                [0, pitch * self.height, pitch * self.height * 2, 0]
+            }
+            PixelFormat::NV12 | PixelFormat::NV21 => [0, pitch * self.height, 0, 0],
+            _ => [0, 0, 0, 0],
+        }
+    }
+}
+
+fn plane_is_primary(card: &Card, plane_handle: plane::Handle) -> bool {
+    if let Ok(props) = card.get_properties(plane_handle) {
+        for (handle, value) in props.iter() {
+            if let Ok(info) = card.get_property(*handle)
+                && info.name().to_bytes() == b"type"
+            {
+                return *value == 0;
+            }
+        }
+    }
+
+    false
+}
+
+fn pick_raw_mode(
+    conn: &connector::Info,
+    frame_width: u32,
+    frame_height: u32,
+    preferred_mode: Option<(u32, u32, u32)>,
+) -> std::io::Result<control::Mode> {
+    if let Some((width, height, _refresh)) = preferred_mode
+        && (width != frame_width || height != frame_height)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "preferred mode {width}x{height} does not match raw frame size {frame_width}x{frame_height}"
+            ),
+        ));
+    }
+
+    let mut candidates = conn.modes().iter().copied().filter(|mode| {
+        let size = mode.size();
+        u32::from(size.0) == frame_width && u32::from(size.1) == frame_height
+    });
+
+    let first = candidates.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no display mode matches raw frame size {frame_width}x{frame_height}"),
+        )
+    })?;
+
+    let mode = if let Some((_, _, refresh)) = preferred_mode {
+        conn.modes()
+            .iter()
+            .filter(|mode| {
+                let size = mode.size();
+                u32::from(size.0) == frame_width && u32::from(size.1) == frame_height
+            })
+            .min_by_key(|mode| mode.vrefresh().abs_diff(refresh))
+            .copied()
+            .unwrap_or(first)
+    } else {
+        first
+    };
+
+    Ok(mode)
+}
+
+fn find_raw_plane_for_crtc(
+    card: &Card,
+    res: &control::ResourceHandles,
+    crtc: crtc::Handle,
+    format: PixelFormat,
+    modifier: Option<DrmModifier>,
+) -> std::io::Result<(plane::Handle, PixelFormat)> {
+    let planes = card
+        .plane_handles()
+        .map_err(|e| std::io::Error::new(e.kind(), format!("plane handles: {e}")))?;
+    let mut fallback = None;
+
+    for &plane_handle in planes.as_slice() {
+        let info = card.get_plane(plane_handle).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("get plane {}: {e}", u32::from(plane_handle)),
+            )
+        })?;
+        let allowed = res.filter_crtcs(info.possible_crtcs());
+        if !allowed.contains(&crtc) {
+            continue;
+        }
+        if modifier.is_some() && !plane_is_primary(card, plane_handle) {
+            continue;
+        }
+
+        let fourcc = format.fourcc() as u32;
+        if info.formats().contains(&fourcc) {
+            return Ok((plane_handle, format));
+        }
+
+        let fb_fourcc = format.fb_format().fourcc() as u32;
+        if fallback.is_none() && info.formats().contains(&fb_fourcc) {
+            fallback = Some(plane_handle);
+        }
+    }
+
+    if let Some(plane_handle) = fallback {
+        Ok((plane_handle, format.fb_format()))
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no compatible plane found for raw format",
+        ))
+    }
+}
+
+fn copy_plane(src: &[u8], dst: &mut [u8], pitch: usize, width: usize, height: usize) {
+    for row in 0..height {
+        let dst_offset = row * pitch;
+        let src_offset = row * width;
+        dst[dst_offset..dst_offset + width].copy_from_slice(&src[src_offset..src_offset + width]);
+    }
+}
+
+fn copy_i420_frame(src: &[u8], dst: &mut [u8], pitch: usize, width: usize, height: usize) {
+    let mut offset = 0;
+    copy_plane(
+        &src[offset..offset + width * height],
+        dst,
+        pitch,
+        width,
+        height,
+    );
+    offset += width * height;
+
+    let u_base = pitch * height;
+    let chroma_size = (width / 2) * (height / 2);
+    copy_plane(
+        &src[offset..offset + chroma_size],
+        &mut dst[u_base..],
+        pitch,
+        width / 2,
+        height / 2,
+    );
+    offset += chroma_size;
+
+    let v_base = u_base + pitch * (height / 2);
+    copy_plane(
+        &src[offset..offset + chroma_size],
+        &mut dst[v_base..],
+        pitch,
+        width / 2,
+        height / 2,
+    );
+}
+
+fn copy_i422_frame(src: &[u8], dst: &mut [u8], pitch: usize, width: usize, height: usize) {
+    let mut offset = 0;
+    copy_plane(
+        &src[offset..offset + width * height],
+        dst,
+        pitch,
+        width,
+        height,
+    );
+    offset += width * height;
+
+    let u_base = pitch * height;
+    let chroma_size = (width / 2) * height;
+    copy_plane(
+        &src[offset..offset + chroma_size],
+        &mut dst[u_base..],
+        pitch,
+        width / 2,
+        height,
+    );
+    offset += chroma_size;
+
+    let v_base = u_base + pitch * height;
+    copy_plane(
+        &src[offset..offset + chroma_size],
+        &mut dst[v_base..],
+        pitch,
+        width / 2,
+        height,
+    );
+}
+
+fn copy_i444_frame(src: &[u8], dst: &mut [u8], pitch: usize, width: usize, height: usize) {
+    let mut offset = 0;
+    copy_plane(
+        &src[offset..offset + width * height],
+        dst,
+        pitch,
+        width,
+        height,
+    );
+    offset += width * height;
+
+    let u_base = pitch * height;
+    copy_plane(
+        &src[offset..offset + width * height],
+        &mut dst[u_base..],
+        pitch,
+        width,
+        height,
+    );
+    offset += width * height;
+
+    let v_base = u_base + pitch * height;
+    copy_plane(
+        &src[offset..offset + width * height],
+        &mut dst[v_base..],
+        pitch,
+        width,
+        height,
+    );
+}
+
+fn copy_nv12_frame(src: &[u8], dst: &mut [u8], pitch: usize, width: usize, height: usize) {
+    let mut offset = 0;
+    copy_plane(
+        &src[offset..offset + width * height],
+        dst,
+        pitch,
+        width,
+        height,
+    );
+    offset += width * height;
+
+    let uv_base = pitch * height;
+    let uv_size = width * (height / 2);
+    copy_plane(
+        &src[offset..offset + uv_size],
+        &mut dst[uv_base..],
+        pitch,
+        width,
+        height / 2,
+    );
+}
+
+fn copy_yv12_frame(src: &[u8], dst: &mut [u8], pitch: usize, width: usize, height: usize) {
+    let mut offset = 0;
+    copy_plane(
+        &src[offset..offset + width * height],
+        dst,
+        pitch,
+        width,
+        height,
+    );
+    offset += width * height;
+
+    let v_base = pitch * height;
+    let chroma_size = (width / 2) * (height / 2);
+    copy_plane(
+        &src[offset..offset + chroma_size],
+        &mut dst[v_base..],
+        pitch,
+        width / 2,
+        height / 2,
+    );
+    offset += chroma_size;
+
+    let u_base = v_base + pitch * (height / 2);
+    copy_plane(
+        &src[offset..offset + chroma_size],
+        &mut dst[u_base..],
+        pitch,
+        width / 2,
+        height / 2,
+    );
+}
+
+fn copy_i420_to_nv12(src: &[u8], dst: &mut [u8], pitch: usize, width: usize, height: usize) {
+    let mut offset = 0;
+    copy_plane(
+        &src[offset..offset + width * height],
+        dst,
+        pitch,
+        width,
+        height,
+    );
+    offset += width * height;
+
+    let chroma_size = (width / 2) * (height / 2);
+    let u_plane = &src[offset..offset + chroma_size];
+    offset += chroma_size;
+    let v_plane = &src[offset..offset + chroma_size];
+    let uv_base = pitch * height;
+
+    for row in 0..(height / 2) {
+        let dst_offset = uv_base + row * pitch;
+        for column in 0..(width / 2) {
+            let u = u_plane[row * (width / 2) + column];
+            let v = v_plane[row * (width / 2) + column];
+            let dst_index = dst_offset + 2 * column;
+            dst[dst_index] = u;
+            dst[dst_index + 1] = v;
+        }
+    }
+}
+
+fn copy_packed_frame(
+    src: &[u8],
+    dst: &mut [u8],
+    pitch: usize,
+    width: usize,
+    height: usize,
+    bytes_per_pixel: usize,
+) {
+    let row_size = width * bytes_per_pixel;
+    for row in 0..height {
+        let dst_offset = row * pitch;
+        let src_offset = row * row_size;
+        dst[dst_offset..dst_offset + row_size]
+            .copy_from_slice(&src[src_offset..src_offset + row_size]);
+    }
+}
+
+fn copy_frame(
+    src: &[u8],
+    dst: &mut [u8],
+    pitch: usize,
+    width: usize,
+    height: usize,
+    format: PixelFormat,
+) {
+    match format {
+        PixelFormat::I420 => copy_i420_frame(src, dst, pitch, width, height),
+        PixelFormat::I422 => copy_i422_frame(src, dst, pitch, width, height),
+        PixelFormat::I444 => copy_i444_frame(src, dst, pitch, width, height),
+        PixelFormat::NV12 | PixelFormat::NV21 => copy_nv12_frame(src, dst, pitch, width, height),
+        PixelFormat::YV12 => copy_yv12_frame(src, dst, pitch, width, height),
+        PixelFormat::RGB => copy_packed_frame(src, dst, pitch, width, height, 3),
+        PixelFormat::BGRA | PixelFormat::RGBA | PixelFormat::AYUV => {
+            copy_packed_frame(src, dst, pitch, width, height, 4)
+        }
+        PixelFormat::YUY2 => copy_packed_frame(src, dst, pitch, width, height, 2),
+    }
+}
+
+fn create_raw_dumb_and_fb(
+    card: &Card,
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+    modifier: Option<DrmModifier>,
+) -> std::io::Result<RawFbBundle> {
+    let buffer_height = format.buffer_height(height);
+    let mut db = card.create_dumb_buffer((width, buffer_height), format.fourcc(), format.bpp())?;
+
+    {
+        let frame = vec![0u8; format.frame_size(width, height)];
+        let pitch = db.pitch() as usize;
+        let mut mapping = card.map_dumb_buffer(&mut db)?;
+        copy_frame(
+            &frame,
+            mapping.as_mut(),
+            pitch,
+            width as usize,
+            height as usize,
+            format,
+        );
+    }
+
+    let wrapper = RawDumbWrapper {
+        db: &db,
+        width,
+        height,
+        format,
+        modifier,
+    };
+    let flags = if modifier.is_some() {
+        FbCmd2Flags::MODIFIERS
+    } else {
+        FbCmd2Flags::empty()
+    };
+    let fb = card.add_planar_framebuffer(&wrapper, flags)?;
+
+    Ok(RawFbBundle { db, fb })
+}
+
+fn create_mode_blob(
+    card: &Card,
+    mode: &control::Mode,
+) -> std::io::Result<(property::Value<'static>, u64)> {
+    let blob_value = card.create_property_blob(mode)?;
+    let blob_id = match blob_value {
+        property::Value::Blob(id) => id,
+        _ => unreachable!(),
+    };
+
+    Ok((blob_value, blob_id))
+}
+
+fn build_raw_modeset_request(
+    card: &Card,
+    conn: &connector::Info,
+    crtc: crtc::Handle,
+    plane: plane::Handle,
+    fb: framebuffer::Handle,
+    mode: &control::Mode,
+    mode_blob: property::Value<'static>,
+) -> std::io::Result<AtomicModeReq> {
+    let mut req = AtomicModeReq::new();
+    let name = |value: &str| CString::new(value).unwrap();
+
+    let conn_crtc = find_prop(card, conn.handle(), &name("CRTC_ID"))?;
+    req.add_property(conn.handle(), conn_crtc, property::Value::CRTC(Some(crtc)));
+
+    let crtc_mode = find_prop(card, crtc, &name("MODE_ID"))?;
+    let crtc_active = find_prop(card, crtc, &name("ACTIVE"))?;
+    req.add_property(crtc, crtc_mode, mode_blob);
+    req.add_property(crtc, crtc_active, property::Value::Boolean(true));
+
+    let plane_crtc = find_prop(card, plane, &name("CRTC_ID"))?;
+    let plane_fb = find_prop(card, plane, &name("FB_ID"))?;
+    let plane_src_x = find_prop(card, plane, &name("SRC_X"))?;
+    let plane_src_y = find_prop(card, plane, &name("SRC_Y"))?;
+    let plane_src_w = find_prop(card, plane, &name("SRC_W"))?;
+    let plane_src_h = find_prop(card, plane, &name("SRC_H"))?;
+    let plane_crtc_x = find_prop(card, plane, &name("CRTC_X"))?;
+    let plane_crtc_y = find_prop(card, plane, &name("CRTC_Y"))?;
+    let plane_crtc_w = find_prop(card, plane, &name("CRTC_W"))?;
+    let plane_crtc_h = find_prop(card, plane, &name("CRTC_H"))?;
+
+    req.add_property(plane, plane_crtc, property::Value::CRTC(Some(crtc)));
+    req.add_property(plane, plane_fb, property::Value::Framebuffer(Some(fb)));
+
+    let (width, height) = mode.size();
+    let width = width as u32;
+    let height = height as u32;
+    req.add_property(plane, plane_src_x, property::Value::UnsignedRange(0));
+    req.add_property(plane, plane_src_y, property::Value::UnsignedRange(0));
+    req.add_property(
+        plane,
+        plane_src_w,
+        property::Value::UnsignedRange((width as u64) << 16),
+    );
+    req.add_property(
+        plane,
+        plane_src_h,
+        property::Value::UnsignedRange((height as u64) << 16),
+    );
+    req.add_property(plane, plane_crtc_x, property::Value::SignedRange(0));
+    req.add_property(plane, plane_crtc_y, property::Value::SignedRange(0));
+    req.add_property(
+        plane,
+        plane_crtc_w,
+        property::Value::UnsignedRange(width as u64),
+    );
+    req.add_property(
+        plane,
+        plane_crtc_h,
+        property::Value::UnsignedRange(height as u64),
+    );
+
+    Ok(req)
+}
+
+fn scan_raw_display_info(
+    card_path: &str,
+    config: RawDisplayConfig,
+) -> std::io::Result<DisplayInfo> {
+    let card = open_card(card_path)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("open card: {e}")))?;
+    let is_vc4 = driver_is_vc4(&card);
+    enable_atomic(&card)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("enable atomic: {e}")))?;
+    let res = card
+        .resource_handles()
+        .map_err(|e| std::io::Error::new(e.kind(), format!("get resources: {e}")))?;
+    let conn = pick_connected_connector(&card, &res, is_vc4)?;
+    let (_, crtc) = pick_encoder_and_crtc(&card, &conn)?;
+    let mode = pick_raw_mode(
+        &conn,
+        config.frame_width,
+        config.frame_height,
+        config.preferred_mode,
+    )?;
+    let modifier = {
+        #[cfg(feature = "rpi")]
+        {
+            if is_vc4 {
+                Some(DrmModifier::from(DRM_FORMAT_MOD_BROADCOM_SAND128))
+            } else {
+                None
+            }
+        }
+        #[cfg(not(feature = "rpi"))]
+        {
+            None
+        }
+    };
+    let (plane, _fb_format) = find_raw_plane_for_crtc(&card, &res, crtc, config.format, modifier)?;
 
     Ok(build_display_info(card_path, &conn, crtc, plane, mode))
 }
@@ -1177,7 +1842,552 @@ impl Drop for Display {
     }
 }
 
-struct DisplayRes(Mutex<Option<Display>>);
+#[derive(Clone, Copy)]
+struct RawDisplayConfig {
+    format: PixelFormat,
+    frame_width: u32,
+    frame_height: u32,
+    preferred_mode: Option<(u32, u32, u32)>,
+}
+
+impl RawDisplayConfig {
+    fn frame_size(self) -> usize {
+        self.format.frame_size(self.frame_width, self.frame_height)
+    }
+}
+
+struct RawActiveDisplay {
+    card: Card,
+    blob_id: u64,
+    buffers: Vec<RawFbBundle>,
+    plane: plane::Handle,
+    prop_fb: property::Handle,
+    prop_crtc: property::Handle,
+    crtc: crtc::Handle,
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+    fb_format: PixelFormat,
+    current: usize,
+}
+
+impl RawActiveDisplay {
+    fn new(card_path: &str, config: RawDisplayConfig) -> std::io::Result<(Self, DisplayInfo)> {
+        let format = config.format;
+        let frame_width = config.frame_width;
+        let frame_height = config.frame_height;
+        let preferred_mode = config.preferred_mode;
+        let card = open_card(card_path)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("open card: {e}")))?;
+        let is_vc4 = driver_is_vc4(&card);
+        enable_atomic(&card)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("enable atomic: {e}")))?;
+        let res = card
+            .resource_handles()
+            .map_err(|e| std::io::Error::new(e.kind(), format!("get resources: {e}")))?;
+        let conn = pick_connected_connector(&card, &res, is_vc4)?;
+        let (_enc_info, crtc) = pick_encoder_and_crtc(&card, &conn)?;
+        let mode = pick_raw_mode(&conn, frame_width, frame_height, preferred_mode)?;
+        let (mode_width, mode_height) = mode.size();
+        let (mode_width, mode_height) = (u32::from(mode_width), u32::from(mode_height));
+
+        let modifier = {
+            #[cfg(feature = "rpi")]
+            {
+                if is_vc4 {
+                    Some(DrmModifier::from(DRM_FORMAT_MOD_BROADCOM_SAND128))
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(feature = "rpi"))]
+            {
+                None
+            }
+        };
+
+        let (plane, fb_format) = find_raw_plane_for_crtc(&card, &res, crtc, format, modifier)?;
+        let mut buffers = Vec::with_capacity(3);
+        for _ in 0..3 {
+            buffers.push(create_raw_dumb_and_fb(
+                &card,
+                mode_width,
+                mode_height,
+                fb_format,
+                modifier,
+            )?);
+        }
+
+        let (mode_blob, blob_id) = create_mode_blob(&card, &mode)?;
+        let req =
+            build_raw_modeset_request(&card, &conn, crtc, plane, buffers[0].fb, &mode, mode_blob)?;
+        card.atomic_commit(control::AtomicCommitFlags::ALLOW_MODESET, req)?;
+
+        let name = |value: &str| CString::new(value).unwrap();
+        let prop_fb = find_prop(&card, plane, &name("FB_ID"))?;
+        let prop_crtc = find_prop(&card, plane, &name("CRTC_ID"))?;
+        let info = build_display_info(card_path, &conn, crtc, plane, mode);
+
+        Ok((
+            Self {
+                card,
+                blob_id,
+                buffers,
+                plane,
+                prop_fb,
+                prop_crtc,
+                crtc,
+                width: mode_width,
+                height: mode_height,
+                format,
+                fb_format,
+                current: 0,
+            },
+            info,
+        ))
+    }
+
+    fn choose_writable_slot(
+        &self,
+        pending_slot: Option<usize>,
+        committing_slot: Option<usize>,
+    ) -> std::io::Result<usize> {
+        if let Some(slot) = pending_slot {
+            return Ok(slot);
+        }
+
+        for slot in 0..self.buffers.len() {
+            if slot != self.current && Some(slot) != committing_slot {
+                return Ok(slot);
+            }
+        }
+
+        Err(std::io::Error::other(
+            "no writable raw scanout buffer available",
+        ))
+    }
+
+    fn upload_frame(&mut self, slot: usize, frame: &[u8]) -> std::io::Result<()> {
+        if frame.len() != self.format.frame_size(self.width, self.height) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid raw frame size",
+            ));
+        }
+
+        let buf = self.buffers.get_mut(slot).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid raw buffer slot")
+        })?;
+        let pitch = buf.db.pitch() as usize;
+        let mut mapping = self.card.map_dumb_buffer(&mut buf.db)?;
+
+        if self.format == self.fb_format {
+            copy_frame(
+                frame,
+                mapping.as_mut(),
+                pitch,
+                self.width as usize,
+                self.height as usize,
+                self.format,
+            );
+            Ok(())
+        } else if self.format == PixelFormat::I420 && self.fb_format == PixelFormat::NV12 {
+            copy_i420_to_nv12(
+                frame,
+                mapping.as_mut(),
+                pitch,
+                self.width as usize,
+                self.height as usize,
+            );
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "unsupported raw framebuffer conversion",
+            ))
+        }
+    }
+
+    fn commit_slot(&mut self, slot: usize) -> std::io::Result<()> {
+        let fb = self.buffers.get(slot).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid raw buffer slot")
+        })?;
+        let mut req = AtomicModeReq::new();
+        req.add_property(
+            self.plane,
+            self.prop_crtc,
+            property::Value::CRTC(Some(self.crtc)),
+        );
+        req.add_property(
+            self.plane,
+            self.prop_fb,
+            property::Value::Framebuffer(Some(fb.fb)),
+        );
+        self.card
+            .atomic_commit(control::AtomicCommitFlags::empty(), req)?;
+        self.current = slot;
+        Ok(())
+    }
+}
+
+impl Drop for RawActiveDisplay {
+    fn drop(&mut self) {
+        let _ = self.card.destroy_property_blob(self.blob_id);
+        for RawFbBundle { db, fb } in self.buffers.drain(..) {
+            let _ = self.card.destroy_framebuffer(fb);
+            let _ = self.card.destroy_dumb_buffer(db);
+        }
+    }
+}
+
+struct RawDisplay {
+    shared: Arc<RawDisplayShared>,
+    handle: Option<thread::JoinHandle<()>>,
+    frame_size: usize,
+}
+
+struct RawDisplayShared {
+    state: Mutex<RawDisplayState>,
+    wakeup: Condvar,
+}
+
+struct RawDisplayState {
+    active: Option<Arc<Mutex<RawActiveDisplay>>>,
+    info: Option<DisplayInfo>,
+    pending_slot: Option<usize>,
+    disconnected_frame: Option<Box<[u8]>>,
+    committing_slot: Option<usize>,
+    closed: bool,
+}
+
+impl RawDisplayShared {
+    fn new(active: Option<RawActiveDisplay>, info: Option<DisplayInfo>) -> Self {
+        Self {
+            state: Mutex::new(RawDisplayState {
+                active: active.map(|active| Arc::new(Mutex::new(active))),
+                info,
+                pending_slot: None,
+                disconnected_frame: None,
+                committing_slot: None,
+                closed: false,
+            }),
+            wakeup: Condvar::new(),
+        }
+    }
+
+    fn wait_timeout(&self, timeout: Duration) -> std::io::Result<bool> {
+        let state = self.state.lock().map_err(|_| io::Error::other("lock"))?;
+        if state.closed || state.pending_slot.is_some() || state.disconnected_frame.is_some() {
+            return Ok(state.closed);
+        }
+
+        let (state, _) = self
+            .wakeup
+            .wait_timeout(state, timeout)
+            .map_err(|_| io::Error::other("lock"))?;
+        Ok(state.closed)
+    }
+
+    fn close(&self) -> std::io::Result<()> {
+        let mut state = self.state.lock().map_err(|_| io::Error::other("lock"))?;
+        state.closed = true;
+        self.wakeup.notify_all();
+        Ok(())
+    }
+
+    fn is_closed(&self) -> std::io::Result<bool> {
+        let state = self.state.lock().map_err(|_| io::Error::other("lock"))?;
+        Ok(state.closed)
+    }
+}
+
+impl RawDisplay {
+    fn new(
+        card_path: &str,
+        config: RawDisplayConfig,
+        listener: LocalPid,
+    ) -> std::io::Result<(Self, Option<DisplayInfo>)> {
+        let (active, info, wait_reason) = match RawActiveDisplay::new(card_path, config) {
+            Ok((active, info)) => (Some(active), Some(info), None),
+            Err(err) => (None, None, Some(err.to_string())),
+        };
+        let frame_size = config.frame_size();
+        let shared = Arc::new(RawDisplayShared::new(active, info.clone()));
+        let shared_clone = Arc::clone(&shared);
+        let card_path = card_path.to_owned();
+        let handle = thread::spawn(move || {
+            Self::run(shared_clone, listener, card_path, config, wait_reason)
+        });
+
+        Ok((
+            Self {
+                shared,
+                handle: Some(handle),
+                frame_size,
+            },
+            info,
+        ))
+    }
+
+    fn display_frame(&self, frame: &[u8]) -> std::io::Result<()> {
+        if frame.len() != self.frame_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid raw frame size",
+            ));
+        }
+
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("lock"))?;
+        if state.closed {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
+
+        if let Some(active) = state.active.as_ref().cloned() {
+            let slot = {
+                let mut active = active.lock().map_err(|_| io::Error::other("lock"))?;
+                let slot =
+                    active.choose_writable_slot(state.pending_slot, state.committing_slot)?;
+                active.upload_frame(slot, frame)?;
+                slot
+            };
+            state.pending_slot = Some(slot);
+            state.disconnected_frame = None;
+        } else {
+            state.disconnected_frame = Some(frame.to_vec().into_boxed_slice());
+        }
+
+        self.shared.wakeup.notify_one();
+        Ok(())
+    }
+
+    fn run(
+        shared: Arc<RawDisplayShared>,
+        listener: LocalPid,
+        card_path: String,
+        config: RawDisplayConfig,
+        initial_wait_reason: Option<String>,
+    ) {
+        let reconnect_interval = Duration::from_millis(250);
+        let hotplug_interval = Duration::from_millis(750);
+        let mut next_connect_attempt = Instant::now();
+        let mut next_hotplug_check = Instant::now() + hotplug_interval;
+
+        if matches!(shared.is_closed(), Ok(true)) {
+            return;
+        }
+
+        if matches!(
+            shared
+                .state
+                .lock()
+                .map(|state| state.active.is_none())
+                .map_err(|_| io::Error::other("lock")),
+            Ok(true)
+        ) {
+            notify_display_waiting(
+                &listener,
+                initial_wait_reason.unwrap_or_else(|| "display unavailable".to_string()),
+            );
+        }
+
+        loop {
+            match shared.is_closed() {
+                Ok(true) | Err(_) => break,
+                Ok(false) => {}
+            }
+
+            let active = match shared.state.lock() {
+                Ok(state) => state.active.clone(),
+                Err(_) => break,
+            };
+
+            if let Some(active) = active {
+                let mut disconnect_reason = None;
+
+                if Instant::now() >= next_hotplug_check {
+                    let current_info = match shared.state.lock() {
+                        Ok(state) => state.info.clone(),
+                        Err(_) => break,
+                    };
+
+                    match scan_raw_display_info(&card_path, config) {
+                        Ok(info) if current_info.as_ref() == Some(&info) => {
+                            next_hotplug_check = Instant::now() + hotplug_interval;
+                        }
+                        Ok(_) => {
+                            disconnect_reason = Some("display topology changed".to_string());
+                        }
+                        Err(err) => {
+                            disconnect_reason = Some(err.to_string());
+                        }
+                    }
+                }
+
+                if disconnect_reason.is_none() {
+                    let maybe_disconnected_frame = match shared.state.lock() {
+                        Ok(mut state) => {
+                            if state.pending_slot.is_none() {
+                                state.disconnected_frame.take()
+                            } else {
+                                None
+                            }
+                        }
+                        Err(_) => break,
+                    };
+
+                    if let Some(frame) = maybe_disconnected_frame {
+                        let mut state = match shared.state.lock() {
+                            Ok(state) => state,
+                            Err(_) => break,
+                        };
+                        let upload_result = {
+                            let mut active = match active.lock() {
+                                Ok(active) => active,
+                                Err(_) => break,
+                            };
+                            let slot = match active
+                                .choose_writable_slot(state.pending_slot, state.committing_slot)
+                            {
+                                Ok(slot) => slot,
+                                Err(err) => {
+                                    disconnect_reason = Some(err.to_string());
+                                    0
+                                }
+                            };
+
+                            if disconnect_reason.is_none() {
+                                active.upload_frame(slot, &frame).map(|_| slot)
+                            } else {
+                                Ok(slot)
+                            }
+                        };
+
+                        match upload_result {
+                            Ok(slot) if disconnect_reason.is_none() => {
+                                state.pending_slot = Some(slot);
+                            }
+                            Ok(_) => {
+                                state.disconnected_frame = Some(frame);
+                            }
+                            Err(err) => {
+                                state.disconnected_frame = Some(frame);
+                                disconnect_reason = Some(err.to_string());
+                            }
+                        }
+                    }
+                }
+
+                if disconnect_reason.is_none() {
+                    let slot_to_commit = match shared.state.lock() {
+                        Ok(mut state) => {
+                            if state.committing_slot.is_none() {
+                                if let Some(slot) = state.pending_slot.take() {
+                                    state.committing_slot = Some(slot);
+                                    Some(slot)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        Err(_) => break,
+                    };
+
+                    if let Some(slot) = slot_to_commit {
+                        let commit_result = match active.lock() {
+                            Ok(mut active) => active.commit_slot(slot),
+                            Err(_) => Err(io::Error::other("lock")),
+                        };
+
+                        let mut state = match shared.state.lock() {
+                            Ok(state) => state,
+                            Err(_) => break,
+                        };
+                        state.committing_slot = None;
+
+                        match commit_result {
+                            Ok(()) => {
+                                next_hotplug_check = Instant::now() + hotplug_interval;
+                                continue;
+                            }
+                            Err(err) => {
+                                state.active = None;
+                                state.info = None;
+                                state.pending_slot = None;
+                                disconnect_reason = Some(err.to_string());
+                            }
+                        }
+                    }
+                }
+
+                if let Some(reason) = disconnect_reason {
+                    if let Ok(mut state) = shared.state.lock() {
+                        state.active = None;
+                        state.info = None;
+                        state.pending_slot = None;
+                        state.committing_slot = None;
+                    }
+                    notify_display_disconnected(&listener, reason);
+                    next_connect_attempt = Instant::now();
+                    continue;
+                }
+
+                let timeout = next_hotplug_check.saturating_duration_since(Instant::now());
+                match shared.wait_timeout(timeout) {
+                    Ok(true) | Err(_) => continue,
+                    Ok(false) => continue,
+                }
+            }
+
+            if Instant::now() >= next_connect_attempt {
+                match RawActiveDisplay::new(&card_path, config) {
+                    Ok((active, info)) => {
+                        if let Ok(mut state) = shared.state.lock() {
+                            state.active = Some(Arc::new(Mutex::new(active)));
+                            state.info = Some(info.clone());
+                            state.pending_slot = None;
+                            state.committing_slot = None;
+                        } else {
+                            break;
+                        }
+                        notify_display_connected(&listener, info);
+                        next_hotplug_check = Instant::now() + hotplug_interval;
+                        continue;
+                    }
+                    Err(_) => {
+                        next_connect_attempt = Instant::now() + reconnect_interval;
+                    }
+                }
+            }
+
+            let timeout = next_connect_attempt.saturating_duration_since(Instant::now());
+            match shared.wait_timeout(timeout) {
+                Ok(true) | Err(_) => continue,
+                Ok(false) => {}
+            }
+        }
+    }
+}
+
+impl Drop for RawDisplay {
+    fn drop(&mut self) {
+        let _ = self.shared.close();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+enum ManagedDisplay {
+    Prime(Display),
+    Raw(RawDisplay),
+}
+
+struct DisplayRes(Mutex<Option<ManagedDisplay>>);
 
 unsafe impl Send for DisplayRes {}
 unsafe impl Sync for DisplayRes {}
@@ -1206,7 +2416,42 @@ fn init_display(
     Ok((
         ok(),
         info,
-        ResourceArc::new(DisplayRes(Mutex::new(Some(display)))),
+        ResourceArc::new(DisplayRes(Mutex::new(Some(ManagedDisplay::Prime(display))))),
+    ))
+}
+
+#[rustler::nif]
+fn init_raw_display<'a>(
+    env: Env<'a>,
+    card_path: String,
+    pixel_format: Atom,
+    frame_width: u32,
+    frame_height: u32,
+    preferred_mode: Option<(u32, u32, u32)>,
+    listener: LocalPid,
+) -> NifResult<(Atom, Option<DisplayInfo>, ResourceArc<DisplayRes>)> {
+    let path = if card_path.is_empty() {
+        find_vc4_card().map_err(nif_err)?
+    } else {
+        card_path
+    };
+    let pixel_format = pixel_format
+        .to_term(env)
+        .atom_to_string()
+        .map_err(|e| nif_err(format!("{e:?}")))?;
+    let pixel_format =
+        PixelFormat::from_str(&pixel_format).ok_or_else(|| nif_err("unknown pixel format"))?;
+    let config = RawDisplayConfig {
+        format: pixel_format,
+        frame_width,
+        frame_height,
+        preferred_mode,
+    };
+    let (display, info) = RawDisplay::new(&path, config, listener).map_err(nif_err)?;
+    Ok((
+        ok(),
+        info,
+        ResourceArc::new(DisplayRes(Mutex::new(Some(ManagedDisplay::Raw(display))))),
     ))
 }
 
@@ -1214,12 +2459,38 @@ fn init_display(
 fn display_prime(res: ResourceArc<DisplayRes>, desc: PrimeDesc) -> NifResult<Atom> {
     let mut guard = res.0.lock().map_err(|_| nif_err("lock"))?;
     if let Some(display) = guard.as_mut() {
-        let res = display.display(desc);
-        if let Err(err) = res {
-            let _ = guard.take();
-            Err(nif_err(err))
-        } else {
-            Ok(ok())
+        match display {
+            ManagedDisplay::Prime(display) => {
+                let res = display.display(desc);
+                if let Err(err) = res {
+                    let _ = guard.take();
+                    Err(nif_err(err))
+                } else {
+                    Ok(ok())
+                }
+            }
+            ManagedDisplay::Raw(_) => Err(nif_err("display kind mismatch")),
+        }
+    } else {
+        Err(nif_err("display closed"))
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn display_frame(res: ResourceArc<DisplayRes>, frame: Binary) -> NifResult<Atom> {
+    let mut guard = res.0.lock().map_err(|_| nif_err("lock"))?;
+    if let Some(display) = guard.as_mut() {
+        match display {
+            ManagedDisplay::Prime(_) => Err(nif_err("display kind mismatch")),
+            ManagedDisplay::Raw(display) => {
+                let res = display.display_frame(frame.as_slice());
+                if let Err(err) = res {
+                    let _ = guard.take();
+                    Err(nif_err(err))
+                } else {
+                    Ok(ok())
+                }
+            }
         }
     } else {
         Err(nif_err("display closed"))

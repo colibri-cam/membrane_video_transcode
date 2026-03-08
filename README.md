@@ -5,18 +5,16 @@ Big parts of this codebase have been vibecoded in an extreme hurry, this all wil
 # Membrane DRM sink
 
 Elixir experiment demonstrating how to drive a DRM device from a Rust NIF.
-The project provides four Membrane elements, each paired with a Rust
+The project provides three Membrane elements, each paired with a Rust
 implementation built using [Rustler](https://github.com/rusterlium/rustler):
 
 ## Recreation of standard approach
   * `Membrane.H265.Decoder` – decodes H265 into raw video (`native/h265_decoder`)
-  * `Membrane.DRM.Sink` – renders raw video frames (`native/drm_sink`)
+  * `Membrane.DRM.PrimeSink` – renders raw video frames or scans out DRM Prime descriptors (`native/drm_prime_sink`)
 
 ## DMA buff aproach
   * `Membrane.H265.PrimeDecoder` – outputs DRM Prime (DMABUF) descriptors
     (`native/h265_prime_decoder`)
-  * `Membrane.DRM.PrimeSink` – scans out DRM Prime descriptors
-    (`native/drm_prime_sink`)
 
 ## Installation
 
@@ -57,4 +55,3 @@ MIX_TARGET=rpi mix compile
 
 `Cross.toml` passes through `RUSTFLAGS` and `RUSTLER_NIF_VERSION` so that NIFs
 build correctly under the cross environment.
-

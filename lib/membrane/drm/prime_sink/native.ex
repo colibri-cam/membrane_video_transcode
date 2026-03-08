@@ -13,6 +13,17 @@ defmodule Membrane.DRM.PrimeSink.Native do
   def init_display(_card_path, _preferred_mode, _listener_pid),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  def init_raw_display(
+        _card_path,
+        _pixel_format,
+        _width,
+        _height,
+        _preferred_mode,
+        _listener_pid
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   def display_prime(_handle, _desc), do: :erlang.nif_error(:nif_not_loaded)
+  def display_frame(_handle, _frame), do: :erlang.nif_error(:nif_not_loaded)
   def close_display(_handle), do: :erlang.nif_error(:nif_not_loaded)
 end
