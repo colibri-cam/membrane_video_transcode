@@ -17,7 +17,7 @@ defmodule Membrane.PrimeDesc do
   """
 
   @enforce_keys [:planes, :objects, :width, :height, :format, :keepalive]
-  defstruct [:planes, :objects, :width, :height, :format, :keepalive, :owner_pid]
+  defstruct [:planes, :objects, :width, :height, :format, :keepalive, :owner_pid, :trace_token]
 end
 
 defmodule Membrane.PrimeObject do

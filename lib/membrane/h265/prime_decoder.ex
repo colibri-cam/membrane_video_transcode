@@ -10,8 +10,11 @@ defmodule Membrane.H265.PrimeDecoder do
 
   alias __MODULE__.Native
   alias Membrane.Buffer
+  alias Membrane.DRM.Instrumentation
+  alias Membrane.DRM.Instrumentation.FrameTrace
   alias Membrane.H265
   alias Membrane.H265.Common
+  alias Membrane.PrimeDesc
   alias Membrane.PrimeFormat
   alias Membrane.RawVideo
 
@@ -117,12 +120,35 @@ defmodule Membrane.H265.PrimeDecoder do
   def handle_buffer(:input, buffer, ctx, %{decoder_ref: decoder} = state) do
     dts = Common.to_h265_time_base_truncated(buffer.dts)
     pts = Common.to_h265_time_base_truncated(buffer.pts)
+    input_trace = trace_decoder_input(buffer, state)
 
-    case Native.decode(decoder, buffer.payload, pts, dts) do
+    result =
+      Instrumentation.measure(
+        [:nif, :h265_prime_decoder, :decode],
+        %{
+          decoder: state.decoder,
+          hw_device: state.hw_device,
+          output: state.output,
+          payload_bytes: Membrane.Payload.size(buffer.payload)
+        },
+        fn ->
+          result = Native.decode(decoder, buffer.payload, pts, dts)
+
+          measurements =
+            case result do
+              {:ok, pts_list, frames} -> %{frames: length(frames), output_pts: length(pts_list)}
+              _other -> %{}
+            end
+
+          {result, measurements, %{result: nif_result_label(result)}}
+        end
+      )
+
+    case result do
       {:ok, pts_list, frames} ->
         in_stream_format = ctx.pads.input.stream_format
         {actions, state} = maybe_send_stream_format(state, in_stream_format)
-        bufs = wrap_outputs(state.output, pts_list, frames, state.worker)
+        bufs = wrap_outputs(state.output, pts_list, frames, state.worker, input_trace)
         {actions ++ bufs, state}
 
       {:error, reason} ->
@@ -144,10 +170,27 @@ defmodule Membrane.H265.PrimeDecoder do
 
   @impl true
   def handle_end_of_stream(:input, _ctx, %{decoder_ref: decoder} = state) do
-    case Native.flush(decoder) do
+    result =
+      Instrumentation.measure(
+        [:nif, :h265_prime_decoder, :flush],
+        %{decoder: state.decoder, hw_device: state.hw_device, output: state.output},
+        fn ->
+          result = Native.flush(decoder)
+
+          measurements =
+            case result do
+              {:ok, pts_list, frames} -> %{frames: length(frames), output_pts: length(pts_list)}
+              _other -> %{}
+            end
+
+          {result, measurements, %{result: nif_result_label(result)}}
+        end
+      )
+
+    case result do
       {:ok, pts_list, frames} ->
         :ok = Native.close(decoder)
-        bufs = wrap_outputs(state.output, pts_list, frames, state.worker)
+        bufs = wrap_outputs(state.output, pts_list, frames, state.worker, nil)
         new_state = %{state | decoder_ref: nil}
         {bufs ++ [end_of_stream: :output], new_state}
 
@@ -182,24 +225,48 @@ defmodule Membrane.H265.PrimeDecoder do
   defp output_format_for_nif(%{output: :prime}), do: nil
   defp output_format_for_nif(%{output: :raw, output_format: format}), do: format
 
-  defp wrap_outputs(_output, [], [], _worker), do: []
+  defp wrap_outputs(_output, [], [], _worker, _input_trace), do: []
 
-  defp wrap_outputs(:prime, pts_list, descs, worker) do
+  defp wrap_outputs(:prime, pts_list, descs, worker, input_trace) do
     Enum.zip(pts_list, descs)
     |> Enum.map(fn {pts, desc} ->
+      buffer_pts = Common.to_membrane_time_base_truncated(pts)
+      trace = output_trace(input_trace, buffer_pts)
+      trace = Instrumentation.mark_trace(trace, :decoder_output, %{output: :prime})
+
+      Instrumentation.emit_frame_stage(
+        :prime_decoder,
+        trace,
+        :decoder_output,
+        %{output_frames: 1},
+        %{output: :prime}
+      )
+
       %Buffer{
-        pts: Common.to_membrane_time_base_truncated(pts),
+        pts: buffer_pts,
         payload: <<>>,
-        metadata: %{drm_prime: Map.put(desc, :owner_pid, worker)}
+        metadata: prime_output_metadata(desc, worker, trace)
       }
     end)
     |> then(&[buffer: {:output, &1}])
   end
 
-  defp wrap_outputs(:raw, pts_list, frames, _worker) do
+  defp wrap_outputs(:raw, pts_list, frames, _worker, input_trace) do
     Enum.zip(pts_list, frames)
     |> Enum.map(fn {pts, payload} ->
-      %Buffer{pts: Common.to_membrane_time_base_truncated(pts), payload: payload}
+      buffer_pts = Common.to_membrane_time_base_truncated(pts)
+      trace = output_trace(input_trace, buffer_pts)
+      trace = Instrumentation.mark_trace(trace, :decoder_output, %{output: :raw})
+
+      Instrumentation.emit_frame_stage(
+        :prime_decoder,
+        trace,
+        :decoder_output,
+        %{output_frames: 1},
+        %{output: :raw}
+      )
+
+      %Buffer{pts: buffer_pts, payload: payload, metadata: output_metadata(%{}, trace)}
     end)
     |> then(&[buffer: {:output, &1}])
   end
@@ -250,4 +317,60 @@ defmodule Membrane.H265.PrimeDecoder do
         exit(reason)
     end
   end
+
+  defp trace_decoder_input(buffer, state) do
+    trace = FrameTrace.fetch(buffer) || Instrumentation.derive_trace(nil, pts: buffer.pts)
+    trace = Instrumentation.mark_trace(trace, :decoder_input, %{output: state.output})
+
+    Instrumentation.emit_frame_stage(
+      :prime_decoder,
+      trace,
+      :decoder_input,
+      %{payload_bytes: Membrane.Payload.size(buffer.payload)},
+      %{output: state.output}
+    )
+
+    trace
+  end
+
+  defp output_trace(input_trace, pts) do
+    Instrumentation.derive_trace(input_trace, pts: pts)
+  end
+
+  defp output_metadata(metadata, nil), do: metadata
+
+  defp output_metadata(metadata, trace) do
+    Map.put(metadata, FrameTrace.metadata_key(), trace)
+  end
+
+  defp prime_output_metadata(desc, worker, trace) do
+    desc =
+      desc
+      |> prime_desc_fields()
+      |> Map.merge(%{owner_pid: worker, trace_token: trace_token(trace)})
+      |> then(&struct!(PrimeDesc, &1))
+
+    %{drm_prime: desc}
+    |> output_metadata(trace)
+  end
+
+  defp prime_desc_fields(desc) do
+    cond do
+      is_struct(desc) ->
+        Map.from_struct(desc)
+
+      is_map(desc) ->
+        Map.delete(desc, :__struct__)
+
+      true ->
+        raise "Unexpected prime descriptor: #{inspect(desc)}"
+    end
+  end
+
+  defp trace_token(nil), do: nil
+  defp trace_token(trace), do: FrameTrace.token(trace)
+
+  defp nif_result_label({:ok, _pts_list, _frames}), do: :ok
+  defp nif_result_label({:error, _reason}), do: :error
+  defp nif_result_label(_other), do: :other
 end

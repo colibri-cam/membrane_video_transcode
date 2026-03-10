@@ -12,9 +12,12 @@ defmodule Membrane.DRM.PrimeSink do
   require Membrane.Logger
 
   alias Membrane.Buffer
+  alias Membrane.DRM.Instrumentation
+  alias Membrane.DRM.Instrumentation.FrameTrace
+  alias Membrane.DRM.Instrumentation.TraceToken
   alias Membrane.DRM.PrimeSink.DisplayInfo
-  alias Membrane.PrimeFormat
   alias Membrane.DRM.PrimeSink.Native
+  alias Membrane.PrimeFormat
   alias Membrane.RawVideo
 
   @raw_formats [:I420, :I422, :I444, :RGB, :BGRA, :RGBA, :NV12, :NV21, :YV12, :AYUV, :YUY2]
@@ -60,6 +63,7 @@ defmodule Membrane.DRM.PrimeSink do
        last_pts: nil,
        last_desc: nil,
        last_payload: nil,
+       last_trace: nil,
        card: opts.card,
        preferred_mode: opts.preferred_mode,
        pixel_format: opts.pixel_format,
@@ -75,7 +79,16 @@ defmodule Membrane.DRM.PrimeSink do
   @impl true
   def handle_stream_format(:input, %PrimeFormat{} = format, _ctx, %{display: nil} = state) do
     mode = state.preferred_mode || stream_format_mode(format)
-    {:ok, info, display} = Native.init_display(state.card, mode, self())
+
+    {:ok, info, display} =
+      Instrumentation.measure(
+        [:nif, :drm_prime_sink, :init_display],
+        %{backend: :prime, card: state.card, preferred_mode: mode},
+        fn ->
+          result = Native.init_display(state.card, mode, self())
+          {result, %{}, %{result: nif_result_label(result)}}
+        end
+      )
 
     if info do
       log_display_info(info)
@@ -88,7 +101,8 @@ defmodule Membrane.DRM.PrimeSink do
          backend: :prime,
          last_pts: nil,
          last_desc: nil,
-         last_payload: nil
+         last_payload: nil,
+         last_trace: nil
      }}
   end
 
@@ -109,7 +123,23 @@ defmodule Membrane.DRM.PrimeSink do
     mode = state.preferred_mode || raw_stream_format_mode(format)
 
     {:ok, info, display} =
-      Native.init_raw_display(state.card, pixel_format, format.width, format.height, mode, self())
+      Instrumentation.measure(
+        [:nif, :drm_prime_sink, :init_raw_display],
+        %{backend: :raw, card: state.card, preferred_mode: mode, pixel_format: pixel_format},
+        fn ->
+          result =
+            Native.init_raw_display(
+              state.card,
+              pixel_format,
+              format.width,
+              format.height,
+              mode,
+              self()
+            )
+
+          {result, %{}, %{result: nif_result_label(result)}}
+        end
+      )
 
     if info do
       log_display_info(info)
@@ -124,6 +154,7 @@ defmodule Membrane.DRM.PrimeSink do
          last_pts: nil,
          last_desc: nil,
          last_payload: nil,
+         last_trace: nil,
          raw_stream_format: raw_stream_signature(format)
      }}
   end
@@ -156,6 +187,20 @@ defmodule Membrane.DRM.PrimeSink do
     {[], state}
   end
 
+  def handle_info({:trace_event, stage, %TraceToken{} = token, duration_ns}, _ctx, state) do
+    measurements = if is_integer(duration_ns), do: %{duration_ns: duration_ns}, else: %{}
+
+    Instrumentation.emit_frame_stage_from_token(
+      :drm_prime_sink_native,
+      token,
+      stage,
+      measurements,
+      %{backend: state.backend, card: state.card}
+    )
+
+    {[], state}
+  end
+
   @impl true
   def handle_start_of_stream(:input, _ctx, state) do
     {[demand: :input], state}
@@ -164,16 +209,29 @@ defmodule Membrane.DRM.PrimeSink do
   @impl true
   def handle_buffer(
         :input,
-        %Buffer{pts: pts, metadata: %{drm_prime: desc}},
+        %Buffer{pts: pts, metadata: %{drm_prime: desc}} = buffer,
         _ctx,
         %{ignore_pts: true} = state
       ) do
     :erlang.garbage_collect(self())
+    trace = trace_from_buffer(buffer) || trace_from_desc(desc)
+    trace = emit_sink_stage(trace, :sink_input, %{backend: :prime, ignore_pts: true})
 
-    case Native.display_prime(state.display, desc) do
+    result =
+      Instrumentation.measure(
+        [:nif, :drm_prime_sink, :display_prime],
+        %{backend: :prime, card: state.card, ignore_pts: true},
+        fn ->
+          result = Native.display_prime(state.display, desc)
+          {result, %{}, %{result: display_result_label(result)}}
+        end
+      )
+
+    case result do
       :ok ->
         Membrane.Logger.debug("Displayed frame: #{inspect(desc)}")
-        {[demand: :input], %{state | last_pts: pts, last_desc: desc}}
+        trace = emit_sink_stage(trace, :sink_submitted, %{backend: :prime, ignore_pts: true})
+        {[demand: :input], %{state | last_pts: pts, last_desc: desc, last_trace: trace}}
 
       {:error, reason} ->
         Membrane.Logger.error("Failed to display frame: #{inspect(reason)}")
@@ -184,18 +242,31 @@ defmodule Membrane.DRM.PrimeSink do
   @impl true
   def handle_buffer(
         :input,
-        %Buffer{pts: pts, metadata: %{drm_prime: desc}},
+        %Buffer{pts: pts, metadata: %{drm_prime: desc}} = buffer,
         _ctx,
         state
       ) do
     :erlang.garbage_collect(self())
+    trace = trace_from_buffer(buffer) || trace_from_desc(desc)
+    trace = emit_sink_stage(trace, :sink_input, %{backend: :prime, ignore_pts: false})
 
     actions =
       case state do
         %{last_pts: nil, last_desc: nil} ->
-          case Native.display_prime(state.display, desc) do
+          result =
+            Instrumentation.measure(
+              [:nif, :drm_prime_sink, :display_prime],
+              %{backend: :prime, card: state.card, ignore_pts: false, path: :immediate},
+              fn ->
+                result = Native.display_prime(state.display, desc)
+                {result, %{}, %{result: display_result_label(result)}}
+              end
+            )
+
+          case result do
             :ok ->
               Membrane.Logger.debug("Displayed frame: #{inspect(desc)}")
+              emit_sink_stage(trace, :sink_submitted, %{backend: :prime, path: :immediate})
               [demand: :input, start_timer: {:demand_timer, :no_interval}]
 
             {:error, reason} ->
@@ -204,24 +275,38 @@ defmodule Membrane.DRM.PrimeSink do
           end
 
         %{last_pts: last_pts} ->
+          emit_sink_stage(trace, :sink_buffered, %{backend: :prime, path: :timer})
           [timer_interval: {:demand_timer, pts - last_pts}]
       end
 
-    {actions, %{state | last_pts: pts, last_desc: desc}}
+    {actions, %{state | last_pts: pts, last_desc: desc, last_trace: trace}}
   end
 
   @impl true
   def handle_buffer(
         :input,
-        %Buffer{payload: payload, pts: pts},
+        %Buffer{payload: payload, pts: pts} = buffer,
         _ctx,
         %{backend: :raw, ignore_pts: true} = state
       ) do
     payload = Membrane.Payload.to_binary(payload)
+    trace = trace_from_buffer(buffer)
+    trace = emit_sink_stage(trace, :sink_input, %{backend: :raw, ignore_pts: true})
 
-    case Native.display_frame(state.display, payload) do
+    result =
+      Instrumentation.measure(
+        [:nif, :drm_prime_sink, :display_frame],
+        %{backend: :raw, card: state.card, ignore_pts: true, payload_bytes: byte_size(payload)},
+        fn ->
+          result = Native.display_frame(state.display, payload)
+          {result, %{}, %{result: display_result_label(result)}}
+        end
+      )
+
+    case result do
       :ok ->
-        {[demand: :input], %{state | last_pts: pts, last_payload: payload}}
+        trace = emit_sink_stage(trace, :sink_submitted, %{backend: :raw, ignore_pts: true})
+        {[demand: :input], %{state | last_pts: pts, last_payload: payload, last_trace: trace}}
 
       {:error, reason} ->
         Membrane.Logger.error("Failed to display frame: #{inspect(reason)}")
@@ -230,14 +315,39 @@ defmodule Membrane.DRM.PrimeSink do
   end
 
   @impl true
-  def handle_buffer(:input, %Buffer{payload: payload, pts: pts}, _ctx, %{backend: :raw} = state) do
+  def handle_buffer(
+        :input,
+        %Buffer{payload: payload, pts: pts} = buffer,
+        _ctx,
+        %{backend: :raw} = state
+      ) do
     payload = Membrane.Payload.to_binary(payload)
+
+    trace =
+      emit_sink_stage(trace_from_buffer(buffer), :sink_input, %{backend: :raw, ignore_pts: false})
 
     actions =
       case state do
         %{last_pts: nil, last_payload: nil} ->
-          case Native.display_frame(state.display, payload) do
+          result =
+            Instrumentation.measure(
+              [:nif, :drm_prime_sink, :display_frame],
+              %{
+                backend: :raw,
+                card: state.card,
+                ignore_pts: false,
+                path: :immediate,
+                payload_bytes: byte_size(payload)
+              },
+              fn ->
+                result = Native.display_frame(state.display, payload)
+                {result, %{}, %{result: display_result_label(result)}}
+              end
+            )
+
+          case result do
             :ok ->
+              emit_sink_stage(trace, :sink_submitted, %{backend: :raw, path: :immediate})
               [demand: :input, start_timer: {:demand_timer, :no_interval}]
 
             {:error, reason} ->
@@ -246,10 +356,11 @@ defmodule Membrane.DRM.PrimeSink do
           end
 
         %{last_pts: last_pts} ->
+          emit_sink_stage(trace, :sink_buffered, %{backend: :raw, path: :timer})
           [timer_interval: {:demand_timer, pts - last_pts}]
       end
 
-    {actions, %{state | last_pts: pts, last_payload: payload}}
+    {actions, %{state | last_pts: pts, last_payload: payload, last_trace: trace}}
   end
 
   @impl true
@@ -260,12 +371,23 @@ defmodule Membrane.DRM.PrimeSink do
   def handle_tick(:demand_timer, _ctx, %{backend: :prime} = state) do
     :erlang.garbage_collect(self())
 
-    case Native.display_prime(state.display, state.last_desc) do
+    result =
+      Instrumentation.measure(
+        [:nif, :drm_prime_sink, :display_prime],
+        %{backend: :prime, card: state.card, ignore_pts: false, path: :timer},
+        fn ->
+          result = Native.display_prime(state.display, state.last_desc)
+          {result, %{}, %{result: display_result_label(result)}}
+        end
+      )
+
+    case result do
       :ok ->
         Membrane.Logger.debug("Displayed frame: #{inspect(state.last_desc)}")
+        emit_sink_stage(state.last_trace, :sink_submitted, %{backend: :prime, path: :timer})
 
         {[timer_interval: {:demand_timer, :no_interval}, demand: :input],
-         %{state | last_desc: nil}}
+         %{state | last_desc: nil, last_trace: nil}}
 
       {:error, reason} ->
         Membrane.Logger.error("Failed to display frame: #{inspect(reason)}")
@@ -274,10 +396,28 @@ defmodule Membrane.DRM.PrimeSink do
   end
 
   def handle_tick(:demand_timer, _ctx, %{backend: :raw} = state) do
-    case Native.display_frame(state.display, state.last_payload) do
+    result =
+      Instrumentation.measure(
+        [:nif, :drm_prime_sink, :display_frame],
+        %{
+          backend: :raw,
+          card: state.card,
+          ignore_pts: false,
+          path: :timer,
+          payload_bytes: byte_size(state.last_payload)
+        },
+        fn ->
+          result = Native.display_frame(state.display, state.last_payload)
+          {result, %{}, %{result: display_result_label(result)}}
+        end
+      )
+
+    case result do
       :ok ->
+        emit_sink_stage(state.last_trace, :sink_submitted, %{backend: :raw, path: :timer})
+
         {[timer_interval: {:demand_timer, :no_interval}, demand: :input],
-         %{state | last_payload: nil}}
+         %{state | last_payload: nil, last_trace: nil}}
 
       {:error, reason} ->
         Membrane.Logger.error("Failed to display frame: #{inspect(reason)}")
@@ -288,7 +428,7 @@ defmodule Membrane.DRM.PrimeSink do
   @impl true
   def handle_end_of_stream(:input, _ctx, %{display: display} = state) do
     if display do
-      case Native.close_display(display) do
+      case close_display(display, state) do
         :ok -> :ok
         {:error, reason} -> Membrane.Logger.error("Failed to close display: #{inspect(reason)}")
       end
@@ -309,6 +449,7 @@ defmodule Membrane.DRM.PrimeSink do
          last_pts: nil,
          last_desc: nil,
          last_payload: nil,
+         last_trace: nil,
          raw_stream_format: nil
      }}
   end
@@ -316,7 +457,7 @@ defmodule Membrane.DRM.PrimeSink do
   @impl true
   def handle_terminate_request(_ctx, %{display: display} = state) do
     if display do
-      case Native.close_display(display) do
+      case close_display(display, state) do
         :ok -> :ok
         {:error, reason} -> Membrane.Logger.warning("Failed to close display: #{inspect(reason)}")
       end
@@ -330,6 +471,7 @@ defmodule Membrane.DRM.PrimeSink do
          last_pts: nil,
          last_desc: nil,
          last_payload: nil,
+         last_trace: nil,
          raw_stream_format: nil
      }}
   end
@@ -367,4 +509,49 @@ defmodule Membrane.DRM.PrimeSink do
         "plane #{info.plane_id}, mode #{w}x#{h}@#{r}"
     )
   end
+
+  defp trace_from_buffer(%Buffer{} = buffer), do: FrameTrace.fetch(buffer)
+
+  defp trace_from_desc(desc) do
+    case desc do
+      %{trace_token: %TraceToken{} = token} ->
+        if Instrumentation.frame_metrics_enabled?() and token.sampled do
+          FrameTrace.derive(nil,
+            trace_id: token.trace_id,
+            frame_id: token.frame_id,
+            created_at_ns: token.created_at_ns,
+            sampled?: token.sampled,
+            pts: token.pts
+          )
+        end
+
+      _other ->
+        nil
+    end
+  end
+
+  defp emit_sink_stage(trace, stage, metadata) do
+    trace = Instrumentation.mark_trace(trace, stage, metadata)
+    Instrumentation.emit_frame_stage(:prime_sink, trace, stage, %{}, metadata)
+    trace
+  end
+
+  defp display_result_label(:ok), do: :ok
+  defp display_result_label({:error, _reason}), do: :error
+  defp display_result_label(_other), do: :other
+
+  defp close_display(display, state) do
+    Instrumentation.measure(
+      [:nif, :drm_prime_sink, :close_display],
+      %{backend: state.backend, card: state.card},
+      fn ->
+        result = Native.close_display(display)
+        {result, %{}, %{result: display_result_label(result)}}
+      end
+    )
+  end
+
+  defp nif_result_label({:ok, _info, _display}), do: :ok
+  defp nif_result_label({:error, _reason}), do: :error
+  defp nif_result_label(_other), do: :other
 end

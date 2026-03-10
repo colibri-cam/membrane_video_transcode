@@ -188,7 +188,13 @@ rustler::atoms! {
     keepalive,
     display_connected,
     display_waiting,
-    display_disconnected
+    display_disconnected,
+    trace_event,
+    native_submit,
+    native_submit_error,
+    native_release_replaced,
+    native_release_displayed,
+    native_release_pending
 }
 
 #[derive(Debug)]
@@ -225,6 +231,17 @@ struct PrimeDesc {
     planes: Vec<PrimePlane>,
     keepalive: FrozenTerm,
     owner_pid: LocalPid,
+    trace_token: Option<TraceToken>,
+}
+
+#[derive(Clone, Debug, rustler::NifStruct)]
+#[module = "Membrane.DRM.Instrumentation.TraceToken"]
+struct TraceToken {
+    trace_id: u64,
+    frame_id: u64,
+    created_at_ns: u64,
+    sampled: bool,
+    pts: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rustler::NifStruct)]
@@ -242,7 +259,18 @@ fn send_keepalive_message(mut keepalive_term: FrozenTerm, owner_pid: &LocalPid) 
     keepalive_term.send_once_with(owner_pid, |env, payload| (keepalive(), payload).encode(env));
 }
 
-fn release_prime_desc(desc: PrimeDesc) {
+fn send_trace_event(pid: &LocalPid, stage: Atom, token: TraceToken, duration_ns: Option<u64>) {
+    send_message(pid, move |env| {
+        (trace_event(), stage, token, duration_ns).encode(env)
+    });
+}
+
+fn release_prime_desc(desc: PrimeDesc, listener: &LocalPid, stage: Atom) {
+    if let Some(token) = desc.trace_token.clone()
+        && token.sampled
+    {
+        send_trace_event(listener, stage, token, None);
+    }
     send_keepalive_message(desc.keepalive, &desc.owner_pid);
 }
 
@@ -297,6 +325,7 @@ struct DisplayUnit {
     fbwh: FbWithHandles,
     keepalive: FrozenTerm,
     owner_pid: LocalPid,
+    trace_token: Option<TraceToken>,
 }
 
 /// In-memory PlanarBuffer based on your PrimeDesc.
@@ -383,6 +412,7 @@ fn find_vc4_card() -> std::io::Result<String> {
 
 struct DisplayInner {
     card: Card,
+    listener: LocalPid,
     conn: connector::Handle,
     crtc: crtc::Handle,
     plane: plane::Handle,
@@ -1248,6 +1278,7 @@ impl DisplayInner {
     fn new(
         card_path: &str,
         preferred_mode: Option<(u32, u32, u32)>,
+        listener: LocalPid,
     ) -> std::io::Result<(Self, DisplayInfo)> {
         let card = open_card(card_path)
             .map_err(|e| std::io::Error::new(e.kind(), format!("open card: {e}")))?;
@@ -1317,6 +1348,7 @@ impl DisplayInner {
         Ok((
             Self {
                 card,
+                listener,
                 conn: conn.handle(),
                 crtc,
                 plane,
@@ -1343,14 +1375,27 @@ impl DisplayInner {
         ))
     }
 
+    #[allow(clippy::result_large_err)]
     fn display(&mut self, desc: PrimeDesc) -> Result<(), DisplayAttemptError> {
         let width = desc.width as u64;
         let height = desc.height as u64;
+        let submit_started = Instant::now();
+        let trace_token = desc.trace_token.clone();
 
         let new_fb = match self.add_fb_from_prime_desc(&desc) {
             Ok(new_fb) => new_fb,
             Err(e) => {
                 log!("Add fb from prime error: {}", e);
+                if let Some(token) = trace_token.clone()
+                    && token.sampled
+                {
+                    send_trace_event(
+                        &self.listener,
+                        native_submit_error(),
+                        token,
+                        Some(submit_started.elapsed().as_nanos() as u64),
+                    );
+                }
                 return Err(DisplayAttemptError {
                     source: io::Error::other(e),
                     desc,
@@ -1439,6 +1484,16 @@ impl DisplayInner {
             eprintln!("atomic_commit error: {e:?}");
             let _ = self.card.destroy_framebuffer(new_fb.fb);
             let _ = close_unique_handles(&new_fb.handles, |h| self.card.close_buffer(h));
+            if let Some(token) = trace_token.clone()
+                && token.sampled
+            {
+                send_trace_event(
+                    &self.listener,
+                    native_submit_error(),
+                    token,
+                    Some(submit_started.elapsed().as_nanos() as u64),
+                );
+            }
             return Err(DisplayAttemptError {
                 source: std::io::Error::new(e.kind(), format!("atomic commit: {e}")),
                 desc,
@@ -1451,7 +1506,12 @@ impl DisplayInner {
             let _ = self.card.destroy_framebuffer(stale_fb.fbwh.fb);
             // 2) Close handles associated with the stale framebuffer
             let _ = close_unique_handles(&stale_fb.fbwh.handles, |h| self.card.close_buffer(h));
-            self.on_displayed(stale_fb.keepalive, &stale_fb.owner_pid);
+            self.on_displayed(
+                stale_fb.keepalive,
+                &stale_fb.owner_pid,
+                stale_fb.trace_token,
+                native_release_displayed(),
+            );
         }
 
         self.stale = self.in_flight.take();
@@ -1459,7 +1519,18 @@ impl DisplayInner {
             fbwh: new_fb,
             keepalive: desc.keepalive,
             owner_pid: desc.owner_pid,
+            trace_token: desc.trace_token.clone(),
         });
+        if let Some(token) = desc.trace_token
+            && token.sampled
+        {
+            send_trace_event(
+                &self.listener,
+                native_submit(),
+                token,
+                Some(submit_started.elapsed().as_nanos() as u64),
+            );
+        }
         Ok(())
     }
 
@@ -1541,7 +1612,18 @@ impl DisplayInner {
         result
     }
 
-    fn on_displayed(&self, ka: FrozenTerm, owner_pid: &LocalPid) {
+    fn on_displayed(
+        &self,
+        ka: FrozenTerm,
+        owner_pid: &LocalPid,
+        trace_token: Option<TraceToken>,
+        stage: Atom,
+    ) {
+        if let Some(token) = trace_token
+            && token.sampled
+        {
+            send_trace_event(&self.listener, stage, token, None);
+        }
         send_keepalive_message(ka, owner_pid);
     }
 }
@@ -1551,12 +1633,22 @@ impl Drop for DisplayInner {
         if let Some(du) = self.stale.take() {
             let _ = self.card.destroy_framebuffer(du.fbwh.fb);
             let _ = close_unique_handles(&du.fbwh.handles, |h| self.card.close_buffer(h));
-            self.on_displayed(du.keepalive, &du.owner_pid);
+            self.on_displayed(
+                du.keepalive,
+                &du.owner_pid,
+                du.trace_token,
+                native_release_displayed(),
+            );
         }
         if let Some(du) = self.in_flight.take() {
             let _ = self.card.destroy_framebuffer(du.fbwh.fb);
             let _ = close_unique_handles(&du.fbwh.handles, |h| self.card.close_buffer(h));
-            self.on_displayed(du.keepalive, &du.owner_pid);
+            self.on_displayed(
+                du.keepalive,
+                &du.owner_pid,
+                du.trace_token,
+                native_release_displayed(),
+            );
         }
         let _ = self.card.destroy_property_blob(self.mode_blob);
     }
@@ -1659,11 +1751,11 @@ impl DisplayQueue {
 }
 
 impl Display {
-    fn release_queued_descs(queue: &DisplayQueue) -> bool {
+    fn release_queued_descs(queue: &DisplayQueue, listener: &LocalPid) -> bool {
         match queue.take_releases() {
             Ok(descs) => {
                 for desc in descs {
-                    release_prime_desc(desc);
+                    release_prime_desc(desc, listener, native_release_replaced());
                 }
                 true
             }
@@ -1671,10 +1763,10 @@ impl Display {
         }
     }
 
-    fn release_pending_desc(queue: &DisplayQueue) -> bool {
+    fn release_pending_desc(queue: &DisplayQueue, listener: &LocalPid) -> bool {
         match queue.take_pending() {
             Ok(Some(desc)) => {
-                release_prime_desc(desc);
+                release_prime_desc(desc, listener, native_release_pending());
                 true
             }
             Ok(None) => true,
@@ -1688,17 +1780,18 @@ impl Display {
         listener: LocalPid,
     ) -> std::io::Result<(Self, Option<DisplayInfo>)> {
         let queue = Arc::new(DisplayQueue::new());
-        let (active, info, wait_reason) = match DisplayInner::new(card_path, preferred_mode) {
-            Ok((inner, info)) => (
-                Some(ActiveDisplay {
-                    inner,
-                    info: info.clone(),
-                }),
-                Some(info),
-                None,
-            ),
-            Err(err) => (None, None, Some(err.to_string())),
-        };
+        let (active, info, wait_reason) =
+            match DisplayInner::new(card_path, preferred_mode, listener) {
+                Ok((inner, info)) => (
+                    Some(ActiveDisplay {
+                        inner,
+                        info: info.clone(),
+                    }),
+                    Some(info),
+                    None,
+                ),
+                Err(err) => (None, None, Some(err.to_string())),
+            };
 
         let queue_clone = Arc::clone(&queue);
         let card_path = card_path.to_owned();
@@ -1747,17 +1840,17 @@ impl Display {
         }
 
         loop {
-            if !Self::release_queued_descs(&queue) {
+            if !Self::release_queued_descs(&queue, &listener) {
                 break;
             }
 
             match queue.is_closed() {
                 Ok(true) => {
-                    if !Self::release_pending_desc(&queue) {
+                    if !Self::release_pending_desc(&queue, &listener) {
                         break;
                     }
 
-                    let _ = Self::release_queued_descs(&queue);
+                    let _ = Self::release_queued_descs(&queue, &listener);
                     break;
                 }
                 Ok(false) => {}
@@ -1811,7 +1904,7 @@ impl Display {
             }
 
             if Instant::now() >= next_connect_attempt {
-                match DisplayInner::new(&card_path, preferred_mode) {
+                match DisplayInner::new(&card_path, preferred_mode, listener) {
                     Ok((inner, info)) => {
                         notify_display_connected(&listener, info.clone());
                         active = Some(ActiveDisplay { inner, info });
