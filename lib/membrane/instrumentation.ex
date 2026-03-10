@@ -11,7 +11,7 @@ defmodule Membrane.Instrumentation do
   alias Membrane.Instrumentation.Supervisor
   alias Membrane.Instrumentation.TraceToken
 
-  @app :membrane_linux_video
+  @app :membrane_video_linux
   @event_prefix [:membrane_drm]
 
   @default_events [

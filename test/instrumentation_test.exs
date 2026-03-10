@@ -7,7 +7,7 @@ defmodule MembraneDRM.InstrumentationTest do
   alias Membrane.Instrumentation.WindowedStats
 
   setup do
-    Application.put_env(:membrane_linux_video, Instrumentation,
+    Application.put_env(:membrane_video_linux, Instrumentation,
       average_windows: [:timer.seconds(1), :timer.seconds(5), :timer.seconds(30)],
       bucket_resolution: 250,
       snapshot_interval: :timer.seconds(1),

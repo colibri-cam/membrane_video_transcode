@@ -21,7 +21,7 @@ by adding `drm_experiments` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:membrane_linux_video, git: "https://github.com/colibri-cam/membrane_linux_video"}
+    {:membrane_video_linux, git: "https://github.com/colibri-cam/membrane_video_linux"}
   ]
 end
 ```

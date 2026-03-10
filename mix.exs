@@ -1,9 +1,9 @@
-defmodule MembraneLinuxVideo.MixProject do
+defmodule MembraneVideoLinux.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :membrane_linux_video,
+      app: :membrane_video_linux,
       version: "0.1.0",
       elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,

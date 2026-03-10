@@ -5,7 +5,7 @@ defmodule Membrane.Display.Sink.Native do
   use Rustler,
       Keyword.merge(
         @rustler_opts,
-        otp_app: :membrane_linux_video,
+        otp_app: :membrane_video_linux,
         crate: "drm_prime_sink",
         features: @features
       )

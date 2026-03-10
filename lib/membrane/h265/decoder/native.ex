@@ -4,7 +4,7 @@ defmodule Membrane.H265.Decoder.Native do
   use Rustler,
       Keyword.merge(
         [
-          otp_app: :membrane_linux_video,
+          otp_app: :membrane_video_linux,
           crate: "h265_prime_decoder"
         ],
         @rustler_opts
