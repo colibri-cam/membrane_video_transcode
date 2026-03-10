@@ -1,10 +1,10 @@
-defmodule Membrane.H265.PrimeDecoder.Native do
+defmodule Membrane.H265.Decoder.Native do
   @rustler_opts Mix.Project.config()[:rustler_opts]
 
   use Rustler,
       Keyword.merge(
         [
-          otp_app: :membrane_drm_sink,
+          otp_app: :membrane_linux_video,
           crate: "h265_prime_decoder"
         ],
         @rustler_opts

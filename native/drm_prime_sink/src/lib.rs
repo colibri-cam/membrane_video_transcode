@@ -235,7 +235,7 @@ struct PrimeDesc {
 }
 
 #[derive(Clone, Debug, rustler::NifStruct)]
-#[module = "Membrane.DRM.Instrumentation.TraceToken"]
+#[module = "Membrane.Instrumentation.TraceToken"]
 struct TraceToken {
     trace_id: u64,
     frame_id: u64,
@@ -245,7 +245,7 @@ struct TraceToken {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rustler::NifStruct)]
-#[module = "Membrane.DRM.PrimeSink.DisplayInfo"]
+#[module = "Membrane.Display.Sink.DisplayInfo"]
 struct DisplayInfo {
     card_path: String,
     connector_id: u32,
@@ -2597,4 +2597,4 @@ fn close_display(res: ResourceArc<DisplayRes>) -> NifResult<Atom> {
     Ok(ok())
 }
 
-rustler::init!("Elixir.Membrane.DRM.PrimeSink.Native", load = load);
+rustler::init!("Elixir.Membrane.Display.Sink.Native", load = load);

@@ -1,12 +1,12 @@
-defmodule Membrane.DRM.Instrumentation.Manager do
+defmodule Membrane.Instrumentation.Manager do
   @moduledoc false
 
   use GenServer
 
-  alias Membrane.DRM.Instrumentation
-  alias Membrane.DRM.Instrumentation.Router
-  alias Membrane.DRM.Instrumentation.Session
-  alias Membrane.DRM.Instrumentation.SessionConfig
+  alias Membrane.Instrumentation
+  alias Membrane.Instrumentation.Router
+  alias Membrane.Instrumentation.Session
+  alias Membrane.Instrumentation.SessionConfig
 
   @handler_id "membrane-drm-runtime-router"
   @snapshot_table :membrane_drm_instrumentation_snapshots

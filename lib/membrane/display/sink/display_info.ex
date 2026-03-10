@@ -1,4 +1,4 @@
-defmodule Membrane.DRM.PrimeSink.DisplayInfo do
+defmodule Membrane.Display.Sink.DisplayInfo do
   @moduledoc """
   Information about DRM resources selected by the sink.
   """

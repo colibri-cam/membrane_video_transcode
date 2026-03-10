@@ -1,10 +1,10 @@
-defmodule Membrane.DRM.Instrumentation.FrameTrace do
+defmodule Membrane.Instrumentation.FrameTrace do
   @moduledoc """
   Lightweight per-frame trace used to correlate latency stages.
   """
 
   alias Membrane.Buffer
-  alias Membrane.DRM.Instrumentation.TraceToken
+  alias Membrane.Instrumentation.TraceToken
 
   @metadata_key :drm_trace
 

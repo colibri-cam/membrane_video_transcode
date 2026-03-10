@@ -1,10 +1,10 @@
-defmodule Membrane.DRM.Instrumentation.Session do
+defmodule Membrane.Instrumentation.Session do
   @moduledoc false
 
   use GenServer
   require Logger
 
-  alias Membrane.DRM.Instrumentation.MetricCollector
+  alias Membrane.Instrumentation.MetricCollector
 
   @snapshot_table :membrane_drm_instrumentation_snapshots
 

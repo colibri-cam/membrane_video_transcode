@@ -1,11 +1,11 @@
-defmodule Membrane.DRM.PrimeSink.Native do
+defmodule Membrane.Display.Sink.Native do
   @rustler_opts Mix.Project.config()[:rustler_opts]
   @features ["verbose" | Keyword.get(@rustler_opts, :features, [])]
 
   use Rustler,
       Keyword.merge(
         @rustler_opts,
-        otp_app: :membrane_drm_sink,
+        otp_app: :membrane_linux_video,
         crate: "drm_prime_sink",
         features: @features
       )

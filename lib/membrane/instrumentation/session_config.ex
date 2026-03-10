@@ -1,4 +1,4 @@
-defmodule Membrane.DRM.Instrumentation.SessionConfig do
+defmodule Membrane.Instrumentation.SessionConfig do
   @moduledoc false
 
   @default_windows [:timer.seconds(1), :timer.seconds(5), :timer.seconds(30)]

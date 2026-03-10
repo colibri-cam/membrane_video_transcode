@@ -1,4 +1,4 @@
-defmodule Membrane.DRM.Instrumentation.Reporter do
+defmodule Membrane.Instrumentation.Reporter do
   @moduledoc """
   Attachable Telemetry reporter for Membrane DRM experiments.
   """
@@ -6,7 +6,7 @@ defmodule Membrane.DRM.Instrumentation.Reporter do
   use GenServer
   require Logger
 
-  alias Membrane.DRM.Instrumentation
+  alias Membrane.Instrumentation
 
   @native_unit :native
 

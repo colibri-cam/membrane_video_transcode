@@ -1,9 +1,9 @@
-defmodule Membrane.DRM.Instrumentation.Supervisor do
+defmodule Membrane.Instrumentation.Supervisor do
   @moduledoc false
 
   use Supervisor
 
-  alias Membrane.DRM.Instrumentation.Manager
+  alias Membrane.Instrumentation.Manager
 
   @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts \\ []) do
@@ -14,7 +14,7 @@ defmodule Membrane.DRM.Instrumentation.Supervisor do
   def init(_opts) do
     children = [
       {DynamicSupervisor,
-       strategy: :one_for_one, name: Membrane.DRM.Instrumentation.SessionSupervisor},
+       strategy: :one_for_one, name: Membrane.Instrumentation.SessionSupervisor},
       {Manager, []}
     ]
 

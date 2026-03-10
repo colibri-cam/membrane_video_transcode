@@ -1,4 +1,4 @@
-defmodule Membrane.DRM.Instrumentation.WindowedStats do
+defmodule Membrane.Instrumentation.WindowedStats do
   @moduledoc false
 
   defstruct [:kind, :resolution_ms, :windows_ms, :bucket_count, buckets: %{}]

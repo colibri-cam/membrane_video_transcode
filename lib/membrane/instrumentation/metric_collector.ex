@@ -1,9 +1,9 @@
-defmodule Membrane.DRM.Instrumentation.MetricCollector do
+defmodule Membrane.Instrumentation.MetricCollector do
   @moduledoc false
 
   use GenServer
 
-  alias Membrane.DRM.Instrumentation.WindowedStats
+  alias Membrane.Instrumentation.WindowedStats
 
   defstruct [:kind, :windows_ms, :resolution_ms, metrics: %{}]
 

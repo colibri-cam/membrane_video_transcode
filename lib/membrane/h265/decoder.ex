@@ -1,4 +1,4 @@
-defmodule Membrane.H265.PrimeDecoder do
+defmodule Membrane.H265.Decoder do
   @moduledoc """
   Decodes H265 into either DRM Prime descriptors or raw video frames.
 
@@ -10,8 +10,8 @@ defmodule Membrane.H265.PrimeDecoder do
 
   alias __MODULE__.Native
   alias Membrane.Buffer
-  alias Membrane.DRM.Instrumentation
-  alias Membrane.DRM.Instrumentation.FrameTrace
+  alias Membrane.Instrumentation
+  alias Membrane.Instrumentation.FrameTrace
   alias Membrane.H265
   alias Membrane.H265.Common
   alias Membrane.PrimeDesc

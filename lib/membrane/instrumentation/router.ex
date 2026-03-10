@@ -1,4 +1,4 @@
-defmodule Membrane.DRM.Instrumentation.Router do
+defmodule Membrane.Instrumentation.Router do
   @moduledoc false
 
   @routing_key {__MODULE__, :routes}

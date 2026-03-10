@@ -1,4 +1,4 @@
-defmodule Membrane.DRM.PrimeSink do
+defmodule Membrane.Display.Sink do
   @moduledoc """
   Sink that displays either DRM Prime descriptors or raw video frames on a DRM
   display.
@@ -12,11 +12,11 @@ defmodule Membrane.DRM.PrimeSink do
   require Membrane.Logger
 
   alias Membrane.Buffer
-  alias Membrane.DRM.Instrumentation
-  alias Membrane.DRM.Instrumentation.FrameTrace
-  alias Membrane.DRM.Instrumentation.TraceToken
-  alias Membrane.DRM.PrimeSink.DisplayInfo
-  alias Membrane.DRM.PrimeSink.Native
+  alias Membrane.Display.Sink.DisplayInfo
+  alias Membrane.Display.Sink.Native
+  alias Membrane.Instrumentation
+  alias Membrane.Instrumentation.FrameTrace
+  alias Membrane.Instrumentation.TraceToken
   alias Membrane.PrimeFormat
   alias Membrane.RawVideo
 

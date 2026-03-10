@@ -1,13 +1,13 @@
 defmodule MembraneDRM.InstrumentationTest do
   use ExUnit.Case, async: false
 
-  alias Membrane.DRM.Instrumentation
-  alias Membrane.DRM.Instrumentation.FrameTrace
-  alias Membrane.DRM.Instrumentation.SessionConfig
-  alias Membrane.DRM.Instrumentation.WindowedStats
+  alias Membrane.Instrumentation
+  alias Membrane.Instrumentation.FrameTrace
+  alias Membrane.Instrumentation.SessionConfig
+  alias Membrane.Instrumentation.WindowedStats
 
   setup do
-    Application.put_env(:membrane_drm_sink, Instrumentation,
+    Application.put_env(:membrane_linux_video, Instrumentation,
       average_windows: [:timer.seconds(1), :timer.seconds(5), :timer.seconds(30)],
       bucket_resolution: 250,
       snapshot_interval: :timer.seconds(1),
@@ -21,7 +21,7 @@ defmodule MembraneDRM.InstrumentationTest do
     Instrumentation.ensure_started()
 
     on_exit(fn ->
-      if Process.whereis(Membrane.DRM.Instrumentation.Manager) do
+      if Process.whereis(Membrane.Instrumentation.Manager) do
         for session <- Instrumentation.list_sessions() do
           :ok = Instrumentation.stop_session(session)
         end

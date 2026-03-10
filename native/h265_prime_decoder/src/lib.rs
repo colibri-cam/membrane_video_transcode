@@ -746,4 +746,4 @@ fn pixel_from_atom(atom: Atom) -> Option<Pixel> {
     }
 }
 
-rustler::init!("Elixir.Membrane.H265.PrimeDecoder.Native", load = load);
+rustler::init!("Elixir.Membrane.H265.Decoder.Native", load = load);
