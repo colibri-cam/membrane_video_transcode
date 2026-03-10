@@ -1,9 +1,9 @@
-defmodule DrmExperiments.MixProject do
+defmodule MembraneLinuxVideo.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :membrane_drm_sink,
+      app: :membrane_linux_video,
       version: "0.1.0",
       elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,

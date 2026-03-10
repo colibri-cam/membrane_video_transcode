@@ -14,7 +14,7 @@ config :membrane_core,
     ]
   ]
 
-config :membrane_drm_sink, Membrane.DRM.Instrumentation,
+config :membrane_linux_video, Membrane.Instrumentation,
   average_windows: [:timer.seconds(1), :timer.seconds(5), :timer.seconds(30)],
   bucket_resolution: 250,
   snapshot_interval: :timer.seconds(1),

@@ -2,15 +2,15 @@
 
 Big parts of this codebase have been vibecoded in an extreme hurry, this all will get a proper redo. For now it just an AI slop
 
-# Membrane DRM sink
+# Membrane Linux Video
 
 Elixir experiment demonstrating how to drive a DRM device from a Rust NIF.
 The project provides two Membrane elements, each paired with a Rust
 implementation built using [Rustler](https://github.com/rusterlium/rustler):
 
-  * `Membrane.H265.PrimeDecoder` – decodes H265 into raw video or DRM Prime (DMABUF)
+  * `Membrane.H265.Decoder` – decodes H265 into raw video or DRM Prime (DMABUF)
     descriptors (`native/h265_prime_decoder`)
-  * `Membrane.DRM.PrimeSink` – renders raw video frames or scans out DRM Prime descriptors
+  * `Membrane.Display.Sink` – renders raw video frames or scans out DRM Prime descriptors
     (`native/drm_prime_sink`)
 
 ## Installation
@@ -21,7 +21,7 @@ by adding `drm_experiments` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:membrane_drm_sink, git: "https://github.com/colibri-cam/membrane_drm_sink"}
+    {:membrane_linux_video, git: "https://github.com/colibri-cam/membrane_linux_video"}
   ]
 end
 ```
