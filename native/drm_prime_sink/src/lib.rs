@@ -2485,13 +2485,11 @@ struct DisplayRes(Mutex<Option<ManagedDisplay>>);
 unsafe impl Send for DisplayRes {}
 unsafe impl Sync for DisplayRes {}
 
+#[rustler::resource_impl]
+impl rustler::Resource for DisplayRes {}
+
 fn nif_err<E: std::fmt::Display>(e: E) -> rustler::Error {
     rustler::Error::Term(Box::new(format!("{e}")))
-}
-
-#[allow(non_local_definitions)]
-fn load(env: rustler::Env, _info: rustler::Term) -> bool {
-    rustler::resource!(DisplayRes, env)
 }
 
 #[rustler::nif]
@@ -2597,4 +2595,4 @@ fn close_display(res: ResourceArc<DisplayRes>) -> NifResult<Atom> {
     Ok(ok())
 }
 
-rustler::init!("Elixir.Membrane.Display.Sink.Native", load = load);
+rustler::init!("Elixir.Membrane.Display.Sink.Native");

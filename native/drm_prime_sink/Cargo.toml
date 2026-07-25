@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 anyhow = "1"
 drm = "0.14"  # aka "drm-rs"
-rustler = "0.36.2"
+rustler = "0.38"
 drm-ffi = "0.9"
 libc = "0.2"
 drm-fourcc = "2.2"

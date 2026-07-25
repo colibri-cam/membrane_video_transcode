@@ -15,9 +15,11 @@ use ffmpeg_next::{
     software::scaling::{context::Context as Scaler, flag::Flags},
     util::{error::EAGAIN, frame::Video},
 };
+use membrane_dmabuf::{Descriptor, Layer, Modifier, Object, Plane};
 use rustler::{Atom, Binary, Encoder, Env, Error, NifResult, OwnedBinary, ResourceArc, Term};
 
 const NO_PTS: i64 = i64::MIN;
+const DRM_FORMAT_MOD_INVALID: u64 = (1_u64 << 56) - 1;
 
 // get_format callback: choose DRM_PRIME when offered
 unsafe extern "C" fn get_format_drm_prime(
@@ -48,6 +50,7 @@ enum Backend {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OutputMode {
     Prime,
+    Dmabuf,
     Raw,
 }
 
@@ -114,6 +117,16 @@ struct PrimeDesc {
     keepalive: ResourceArc<Keepalive>,
 }
 
+#[derive(rustler::NifStruct)]
+#[module = "Membrane.H265.Decoder.Native.DMABufFrame"]
+struct DmabufFrame {
+    width: u32,
+    height: u32,
+    modifier: Modifier,
+    descriptor: Descriptor,
+    keepalive: ResourceArc<Keepalive>,
+}
+
 impl Encoder for Fd {
     fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
         let dup_fd = unsafe { libc::dup(self.0.as_raw_fd()) };
@@ -147,16 +160,36 @@ struct Decoder {
     inner: Mutex<DecoderInner>,
 }
 
-pub struct Keepalive(Mutex<Option<Video>>);
+struct KeepaliveResources {
+    frame: Video,
+    object_fds: Vec<OwnedFd>,
+}
+
+pub struct Keepalive {
+    resources: Mutex<Option<KeepaliveResources>>,
+}
+
+#[rustler::resource_impl]
+impl rustler::Resource for Decoder {}
+
+#[rustler::resource_impl]
+impl rustler::Resource for Keepalive {}
 
 impl Keepalive {
+    fn new(frame: Video, object_fds: Vec<OwnedFd>) -> Self {
+        Self {
+            resources: Mutex::new(Some(KeepaliveResources { frame, object_fds })),
+        }
+    }
+
     fn release(&self) {
-        if let Ok(mut guard) = self.0.lock()
-            && let Some(mut frame) = guard.take()
+        if let Ok(mut guard) = self.resources.lock()
+            && let Some(mut resources) = guard.take()
         {
             unsafe {
-                sys::av_frame_unref(frame.as_mut_ptr());
+                sys::av_frame_unref(resources.frame.as_mut_ptr());
             }
+            resources.object_fds.clear();
         }
     }
 }
@@ -408,7 +441,7 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
     unsafe {
         sys::av_frame_ref(keepalive_frame.as_mut_ptr(), frame.as_ptr());
     }
-    let keepalive = ResourceArc::new(Keepalive(Mutex::new(Some(keepalive_frame))));
+    let keepalive = ResourceArc::new(Keepalive::new(keepalive_frame, Vec::new()));
 
     Ok(PrimeDesc {
         width: frame.width(),
@@ -416,6 +449,174 @@ fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
         format: Fourcc(fourcc),
         objects,
         planes,
+        keepalive,
+    })
+}
+
+fn owned_drm_frame(frame: &Video) -> Result<Video> {
+    if frame.format() == Pixel::DRM_PRIME {
+        let mut owned = Video::empty();
+        let result = unsafe { sys::av_frame_ref(owned.as_mut_ptr(), frame.as_ptr()) };
+        if result < 0 {
+            return Err(anyhow!("av_frame_ref failed: {result}"));
+        }
+        return Ok(owned);
+    }
+
+    let hw_frames_ctx = unsafe { (*frame.as_ptr()).hw_frames_ctx };
+    if hw_frames_ctx.is_null() {
+        return Err(anyhow!("no hw_frames_ctx"));
+    }
+
+    let mut drm = Video::empty();
+    unsafe {
+        (*drm.as_mut_ptr()).format = sys::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+        (*drm.as_mut_ptr()).width = frame.width() as i32;
+        (*drm.as_mut_ptr()).height = frame.height() as i32;
+
+        let ctx_ref = sys::av_buffer_ref(hw_frames_ctx);
+        if ctx_ref.is_null() {
+            return Err(anyhow!("av_buffer_ref failed"));
+        }
+        (*drm.as_mut_ptr()).hw_frames_ctx = ctx_ref;
+
+        const AV_HWFRAME_MAP_DRM_PRIME: i32 = 0x0002_0000;
+        let flags = (sys::AV_HWFRAME_MAP_READ as i32) | AV_HWFRAME_MAP_DRM_PRIME;
+        let result = sys::av_hwframe_map(drm.as_mut_ptr(), frame.as_ptr(), flags);
+        if result < 0 {
+            sys::av_frame_unref(drm.as_mut_ptr());
+            return Err(anyhow!("av_hwframe_map failed: {result}"));
+        }
+    }
+
+    Ok(drm)
+}
+
+fn export_dmabuf(frame: &Video) -> Result<DmabufFrame> {
+    let drm_frame = owned_drm_frame(frame)?;
+    let desc_ptr = unsafe { (*drm_frame.as_ptr()).data[0] as *const sys::AVDRMFrameDescriptor };
+    if desc_ptr.is_null() {
+        return Err(anyhow!("no drm descriptor"));
+    }
+
+    let desc = unsafe { &*desc_ptr };
+    if !(1..=4).contains(&desc.nb_objects) || !(1..=4).contains(&desc.nb_layers) {
+        return Err(anyhow!(
+            "invalid AVDRM object/layer counts: {}/{}",
+            desc.nb_objects,
+            desc.nb_layers
+        ));
+    }
+    if derive_fourcc(desc)? != DrmFourcc::Nv12 {
+        return Err(anyhow!("canonical DMA-BUF output currently requires NV12"));
+    }
+
+    let mut object_fds = Vec::with_capacity(desc.nb_objects as usize);
+    let mut objects = Vec::with_capacity(desc.nb_objects as usize);
+    let mut stream_modifier = None;
+
+    for object_index in 0..desc.nb_objects as usize {
+        let source = &desc.objects[object_index];
+        if source.fd < 0 {
+            return Err(anyhow!("object {object_index} has a negative fd"));
+        }
+        let duplicated = unsafe { libc::fcntl(source.fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicated < 0 {
+            return Err(anyhow!(
+                "failed to duplicate object {object_index}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(duplicated) };
+        let modifier = if source.format_modifier == DRM_FORMAT_MOD_INVALID {
+            Modifier::Implicit
+        } else {
+            Modifier::Explicit(source.format_modifier)
+        };
+        if let Some(expected) = stream_modifier {
+            if expected != modifier {
+                return Err(anyhow!("DMA-BUF objects use different modifiers"));
+            }
+        } else {
+            stream_modifier = Some(modifier);
+        }
+        let size = u64::try_from(source.size).map_err(|_| anyhow!("object size overflow"))?;
+        objects.push(Object {
+            fd: owned.as_raw_fd(),
+            size,
+            modifier,
+        });
+        object_fds.push(owned);
+    }
+
+    let layer_order: Vec<usize> = if desc.nb_layers == 1 {
+        if desc.layers[0].format != DrmFourcc::Nv12 as u32 {
+            return Err(anyhow!("single-layer descriptor is not NV12"));
+        }
+        vec![0]
+    } else if desc.nb_layers == 2 {
+        let first = DrmFourcc::try_from(desc.layers[0].format)
+            .map_err(|_| anyhow!("unsupported first layer format"))?;
+        let second = DrmFourcc::try_from(desc.layers[1].format)
+            .map_err(|_| anyhow!("unsupported second layer format"))?;
+        match (first, second) {
+            (DrmFourcc::R8, DrmFourcc::Gr88) => vec![0, 1],
+            (DrmFourcc::Gr88, DrmFourcc::R8) => vec![1, 0],
+            #[cfg(feature = "rpi")]
+            (DrmFourcc::R8, DrmFourcc::R8) => vec![0, 1],
+            _ => return Err(anyhow!("unsupported NV12 layer ordering")),
+        }
+    } else {
+        return Err(anyhow!(
+            "NV12 export requires one or two layers, got {}",
+            desc.nb_layers
+        ));
+    };
+
+    let mut planes = Vec::new();
+    for layer_index in layer_order {
+        let layer = &desc.layers[layer_index];
+        if !(1..=4).contains(&layer.nb_planes) {
+            return Err(anyhow!(
+                "invalid AVDRM plane count in layer {layer_index}: {}",
+                layer.nb_planes
+            ));
+        }
+        for plane_index in 0..layer.nb_planes as usize {
+            let plane = layer.planes[plane_index];
+            planes.push(Plane {
+                object_index: u32::try_from(plane.object_index)
+                    .map_err(|_| anyhow!("object index overflow"))?,
+                pitch: u32::try_from(plane.pitch).map_err(|_| anyhow!("pitch overflow"))?,
+                offset: u64::try_from(plane.offset).map_err(|_| anyhow!("offset overflow"))?,
+            });
+        }
+    }
+    if planes.len() != 2 {
+        return Err(anyhow!(
+            "NV12 export requires two planes, got {}",
+            planes.len()
+        ));
+    }
+
+    let descriptor = Descriptor {
+        version: 1,
+        objects,
+        layers: vec![Layer {
+            fourcc: DrmFourcc::Nv12 as u32,
+            planes,
+        }],
+    };
+    descriptor.validate().map_err(|error| anyhow!(error))?;
+
+    let modifier = stream_modifier.ok_or_else(|| anyhow!("missing DMA-BUF modifier"))?;
+    let keepalive = ResourceArc::new(Keepalive::new(drm_frame, object_fds));
+
+    Ok(DmabufFrame {
+        width: frame.width(),
+        height: frame.height(),
+        modifier,
+        descriptor,
         keepalive,
     })
 }
@@ -548,6 +749,7 @@ fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> Result<DecodeRes
                         Ok(desc) => Some(desc.encode(env)),
                         Err(_) => None,
                     },
+                    OutputMode::Dmabuf => Some(export_dmabuf(&decoded)?.encode(env)),
                     OutputMode::Raw => Some(export_raw_frame(
                         env,
                         inner,
@@ -579,13 +781,10 @@ fn keepalive_release(ka: ResourceArc<Keepalive>) -> NifResult<Atom> {
     Ok(atoms::ok())
 }
 
-#[allow(non_local_definitions)]
-fn load(env: Env, _info: Term) -> bool {
-    assert!(
-        rustler::resource!(Keepalive, env),
-        "register Keepalive resource failed"
-    );
-    rustler::resource!(Decoder, env)
+#[rustler::nif]
+fn release_frame(keepalive: ResourceArc<Keepalive>) -> NifResult<Atom> {
+    keepalive.release();
+    Ok(atoms::ok())
 }
 
 #[rustler::nif]
@@ -602,13 +801,15 @@ fn create(
     };
     let output_mode = if output == atoms::prime() {
         OutputMode::Prime
+    } else if output == atoms::dmabuf() {
+        OutputMode::Dmabuf
     } else if output == atoms::raw() {
         OutputMode::Raw
     } else {
         return Err(Error::BadArg);
     };
     let raw_target = match output_mode {
-        OutputMode::Prime => None,
+        OutputMode::Prime | OutputMode::Dmabuf => None,
         OutputMode::Raw => {
             let atom = output_format.ok_or(Error::BadArg)?;
             let pixel = pixel_from_atom(atom).ok_or(Error::Atom("bad_pixel_format"))?;
@@ -703,6 +904,7 @@ mod atoms {
         v4l2m2m,
         software,
         prime,
+        dmabuf,
         raw,
         I420,
         I422,
@@ -746,4 +948,4 @@ fn pixel_from_atom(atom: Atom) -> Option<Pixel> {
     }
 }
 
-rustler::init!("Elixir.Membrane.H265.Decoder.Native", load = load);
+rustler::init!("Elixir.Membrane.H265.Decoder.Native");

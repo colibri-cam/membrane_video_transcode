@@ -22,8 +22,9 @@ defmodule MembraneVideoLinux.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:rustler, "~> 0.36.2"},
+      {:rustler, "~> 0.38.0"},
       {:membrane_core, "~> 1.2.4"},
+      {:membrane_dmabuf, path: "../membrane_dmabuf"},
       {:membrane_h265_format, "~> 0.2"},
       {:membrane_raw_video_format, "~> 0.4"}
     ]

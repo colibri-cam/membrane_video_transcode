@@ -8,8 +8,10 @@ Elixir experiment demonstrating how to drive a DRM device from a Rust NIF.
 The project provides two Membrane elements, each paired with a Rust
 implementation built using [Rustler](https://github.com/rusterlium/rustler):
 
-  * `Membrane.H265.Decoder` – decodes H265 into raw video or DRM Prime (DMABUF)
-    descriptors (`native/h265_prime_decoder`)
+  * `Membrane.H265.Decoder` – decodes H265 into canonical `Membrane.DMABuf`
+    frames (the default), legacy DRM Prime descriptors (`output: :prime`), or copied raw video
+    (`native/h265_prime_decoder`). Canonical native resources are retired through an isolated
+    `Membrane.DMABuf.LeaseOwner`.
   * `Membrane.Display.Sink` – renders raw video frames or scans out DRM Prime descriptors
     (`native/drm_prime_sink`)
 

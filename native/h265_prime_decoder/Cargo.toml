@@ -9,8 +9,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1"
-ffmpeg-next = { version = "8.0", features = ["codec", "format", "software-scaling"] }
-rustler = "0.36"
+ffmpeg-next = { version = "8.1", features = ["codec", "format", "software-scaling"] }
+rustler = "0.38"
+membrane-dmabuf = "0.1.0"
 libc = "0.2"
 drm-fourcc = "2.2"
 
@@ -23,5 +24,7 @@ lto = "fat"
 codegen-units = 1
 strip = "symbols"
 
+# Development override until membrane-dmabuf 0.1.0 is published to crates.io.
 [patch.crates-io]
+membrane-dmabuf = { path = "../../../membrane_dmabuf/rust/membrane-dmabuf" }
 ffmpeg-sys-next = { git = "https://github.com/Damirados/rust-ffmpeg-sys.git", branch = "cross-target-linking" }
