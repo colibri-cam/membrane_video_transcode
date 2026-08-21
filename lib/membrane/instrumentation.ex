@@ -1,6 +1,6 @@
 defmodule Membrane.Instrumentation do
   @moduledoc """
-  Runtime-configurable instrumentation for Membrane DRM pipelines.
+  Runtime-configurable instrumentation for Membrane video transcoding pipelines.
   """
 
   alias Membrane.ComponentPath
@@ -11,8 +11,8 @@ defmodule Membrane.Instrumentation do
   alias Membrane.Instrumentation.Supervisor
   alias Membrane.Instrumentation.TraceToken
 
-  @app :membrane_video_linux
-  @event_prefix [:membrane_drm]
+  @app :membrane_video_transcode
+  @event_prefix [:membrane_video_transcode]
 
   @default_events [
     [:membrane, :element, :handle_setup, :stop],
@@ -23,14 +23,9 @@ defmodule Membrane.Instrumentation do
     [:membrane, :element, :handle_info, :stop],
     [:membrane, :element, :handle_end_of_stream, :stop],
     [:membrane, :element, :handle_terminate_request, :stop],
-    [:membrane_drm, :nif, :h265_prime_decoder, :decode, :stop],
-    [:membrane_drm, :nif, :h265_prime_decoder, :flush, :stop],
-    [:membrane_drm, :nif, :drm_prime_sink, :init_display, :stop],
-    [:membrane_drm, :nif, :drm_prime_sink, :init_raw_display, :stop],
-    [:membrane_drm, :nif, :drm_prime_sink, :display_prime, :stop],
-    [:membrane_drm, :nif, :drm_prime_sink, :display_frame, :stop],
-    [:membrane_drm, :nif, :drm_prime_sink, :close_display, :stop],
-    [:membrane_drm, :frame, :stage]
+    [:membrane_video_transcode, :nif, :h265_decoder, :decode, :stop],
+    [:membrane_video_transcode, :nif, :h265_decoder, :flush, :stop],
+    [:membrane_video_transcode, :frame, :stage]
   ]
 
   @type config :: keyword()

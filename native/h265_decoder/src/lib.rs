@@ -1,8 +1,12 @@
 use std::ffi::CString;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use drm_fourcc::DrmFourcc;
@@ -15,8 +19,14 @@ use ffmpeg_next::{
     software::scaling::{context::Context as Scaler, flag::Flags},
     util::{error::EAGAIN, frame::Video},
 };
-use membrane_dmabuf::{Descriptor, Layer, Modifier, Object, Plane};
-use rustler::{Atom, Binary, Encoder, Env, Error, NifResult, OwnedBinary, ResourceArc, Term};
+use rustler::types::reference::Reference;
+use rustler::{
+    Atom, Binary, Encoder, Env, Error, LocalPid, NifResult, OwnedBinary, ResourceArc, Term,
+};
+use video_interop::{
+    AbandonmentGuard, Descriptor, Layer, Modifier, Object, Plane, ReleaseDispatcher,
+    is_abandonment_guard_resource, new_abandonment_guard as make_abandonment_guard,
+};
 
 const NO_PTS: i64 = i64::MIN;
 const DRM_FORMAT_MOD_INVALID: u64 = (1_u64 << 56) - 1;
@@ -49,7 +59,6 @@ enum Backend {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OutputMode {
-    Prime,
     Dmabuf,
     Raw,
 }
@@ -64,59 +73,6 @@ struct ScalerSpec {
     dst_height: u32,
 }
 
-#[derive(Debug)]
-struct Fd(OwnedFd);
-
-impl AsFd for Fd {
-    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        self.0.as_fd()
-    }
-}
-
-#[derive(rustler::NifStruct)]
-#[module = "Membrane.PrimePlane"]
-struct PrimePlane {
-    obj_idx: u32,
-    pitch: u32,
-    offset: u32,
-}
-
-#[derive(Debug)]
-struct Fourcc(DrmFourcc);
-
-impl Encoder for Fourcc {
-    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
-        (self.0 as u32).encode(env)
-    }
-}
-
-impl<'a> rustler::Decoder<'a> for Fourcc {
-    fn decode(term: Term<'a>) -> NifResult<Self> {
-        let val: u32 = term.decode()?;
-        Ok(Fourcc(
-            DrmFourcc::try_from(val).map_err(|_| rustler::Error::BadArg)?,
-        ))
-    }
-}
-
-#[derive(rustler::NifStruct)]
-#[module = "Membrane.PrimeObject"]
-struct PrimeObject {
-    fd: Fd,
-    modifier: Option<u64>,
-}
-
-#[derive(rustler::NifStruct)]
-#[module = "Membrane.PrimeDesc"]
-struct PrimeDesc {
-    width: u32,
-    height: u32,
-    format: Fourcc,
-    objects: Vec<PrimeObject>,
-    planes: Vec<PrimePlane>,
-    keepalive: ResourceArc<Keepalive>,
-}
-
 #[derive(rustler::NifStruct)]
 #[module = "Membrane.H265.Decoder.Native.DMABufFrame"]
 struct DmabufFrame {
@@ -125,24 +81,6 @@ struct DmabufFrame {
     modifier: Modifier,
     descriptor: Descriptor,
     keepalive: ResourceArc<Keepalive>,
-}
-
-impl Encoder for Fd {
-    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
-        let dup_fd = unsafe { libc::dup(self.0.as_raw_fd()) };
-        dup_fd.encode(env)
-    }
-}
-
-impl<'a> rustler::Decoder<'a> for Fd {
-    fn decode(term: Term<'a>) -> NifResult<Self> {
-        let fd: i32 = term.decode()?;
-        if fd < 0 {
-            Err(rustler::Error::BadArg)
-        } else {
-            Ok(Fd(unsafe { OwnedFd::from_raw_fd(fd) }))
-        }
-    }
 }
 
 struct DecoderInner {
@@ -336,121 +274,6 @@ fn derive_fourcc(desc: &sys::AVDRMFrameDescriptor) -> Result<DrmFourcc> {
             desc.nb_layers
         )),
     }
-}
-
-fn export_drm_prime(frame: &Video) -> Result<PrimeDesc> {
-    let already_drm = frame.format() == Pixel::DRM_PRIME;
-    let mut mapped: Option<Video> = None;
-
-    let src_avframe = if already_drm {
-        unsafe { frame.as_ptr() }
-    } else {
-        let hw_frames_ctx = unsafe { (*frame.as_ptr()).hw_frames_ctx };
-        if hw_frames_ctx.is_null() {
-            return Err(anyhow!("no hw_frames_ctx"));
-        }
-
-        let mut drm = Video::empty();
-        unsafe {
-            (*drm.as_mut_ptr()).format = sys::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
-            (*drm.as_mut_ptr()).width = frame.width() as i32;
-            (*drm.as_mut_ptr()).height = frame.height() as i32;
-
-            let ctx_ref = sys::av_buffer_ref(hw_frames_ctx);
-            if ctx_ref.is_null() {
-                sys::av_frame_unref(drm.as_mut_ptr());
-                return Err(anyhow!("av_buffer_ref failed"));
-            }
-            (*drm.as_mut_ptr()).hw_frames_ctx = ctx_ref;
-
-            const AV_HWFRAME_MAP_DRM_PRIME: i32 = 0x0002_0000;
-            let flags = (sys::AV_HWFRAME_MAP_READ as i32) | AV_HWFRAME_MAP_DRM_PRIME;
-            let res = sys::av_hwframe_map(drm.as_mut_ptr(), frame.as_ptr(), flags);
-            if res < 0 {
-                sys::av_frame_unref(drm.as_mut_ptr());
-                return Err(anyhow!("av_hwframe_map failed: {res}"));
-            }
-        }
-
-        let ptr = unsafe { drm.as_ptr() };
-        mapped = Some(drm);
-        ptr
-    };
-
-    let desc_ptr = unsafe { (*src_avframe).data[0] as *const sys::AVDRMFrameDescriptor };
-    if desc_ptr.is_null() {
-        if let Some(ref mut frame) = mapped {
-            unsafe {
-                sys::av_frame_unref(frame.as_mut_ptr());
-            }
-        }
-        return Err(anyhow!("no drm descriptor"));
-    }
-
-    let desc = unsafe { &*desc_ptr };
-    if desc.nb_objects == 0 || desc.nb_layers == 0 {
-        if let Some(ref mut frame) = mapped {
-            unsafe {
-                sys::av_frame_unref(frame.as_mut_ptr());
-            }
-        }
-        return Err(anyhow!("empty drm descriptor"));
-    }
-
-    let fourcc = derive_fourcc(desc)?;
-    let mut objects = Vec::with_capacity(desc.nb_objects as usize);
-    for object_idx in 0..desc.nb_objects as usize {
-        let object_fd = desc.objects[object_idx].fd;
-        let dup_fd = unsafe { libc::dup(object_fd) };
-        let modifier = desc.objects[object_idx].format_modifier;
-        if dup_fd < 0 {
-            if let Some(ref mut frame) = mapped {
-                unsafe {
-                    sys::av_frame_unref(frame.as_mut_ptr());
-                }
-            }
-            return Err(anyhow!("object fd is {object_fd}"));
-        }
-
-        objects.push(PrimeObject {
-            fd: unsafe { Fd(OwnedFd::from_raw_fd(dup_fd)) },
-            modifier: Some(modifier),
-        });
-    }
-
-    let mut planes = Vec::new();
-    for layer_idx in 0..desc.nb_layers as usize {
-        let layer = &desc.layers[layer_idx];
-        for plane_idx in 0..layer.nb_planes as usize {
-            let plane = layer.planes[plane_idx];
-            planes.push(PrimePlane {
-                obj_idx: plane.object_index as u32,
-                pitch: plane.pitch as u32,
-                offset: plane.offset as u32,
-            });
-        }
-    }
-
-    if let Some(mut frame) = mapped {
-        unsafe {
-            sys::av_frame_unref(frame.as_mut_ptr());
-        }
-    }
-
-    let mut keepalive_frame = Video::empty();
-    unsafe {
-        sys::av_frame_ref(keepalive_frame.as_mut_ptr(), frame.as_ptr());
-    }
-    let keepalive = ResourceArc::new(Keepalive::new(keepalive_frame, Vec::new()));
-
-    Ok(PrimeDesc {
-        width: frame.width(),
-        height: frame.height(),
-        format: Fourcc(fourcc),
-        objects,
-        planes,
-        keepalive,
-    })
 }
 
 fn owned_drm_frame(frame: &Video) -> Result<Video> {
@@ -745,10 +568,6 @@ fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> Result<DecodeRes
                 let pts = decoded.pts().unwrap_or(NO_PTS);
 
                 let emitted = match inner.output_mode {
-                    OutputMode::Prime => match export_drm_prime(&decoded) {
-                        Ok(desc) => Some(desc.encode(env)),
-                        Err(_) => None,
-                    },
                     OutputMode::Dmabuf => Some(export_dmabuf(&decoded)?.encode(env)),
                     OutputMode::Raw => Some(export_raw_frame(
                         env,
@@ -775,10 +594,69 @@ fn decode_frames<'a>(env: Env<'a>, inner: &mut DecoderInner) -> Result<DecodeRes
     Ok((pts_list, frames))
 }
 
+static RELEASE_DISPATCHER_QUARANTINED: AtomicBool = AtomicBool::new(false);
+static RELEASE_DISPATCHER_ADMISSION: Mutex<()> = Mutex::new(());
+
+fn lifecycle_error(message: impl Into<String>) -> Error {
+    Error::Term(Box::new((atoms::error(), message.into())))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn start_release_dispatcher() -> NifResult<(Atom, ResourceArc<ReleaseDispatcher>)> {
+    let _admission = RELEASE_DISPATCHER_ADMISSION
+        .lock()
+        .map_err(|_| lifecycle_error("release dispatcher admission lock poisoned"))?;
+
+    if RELEASE_DISPATCHER_QUARANTINED.load(Ordering::Acquire) {
+        return Err(lifecycle_error(
+            "release dispatcher admission is disabled until cold VM restart",
+        ));
+    }
+
+    ReleaseDispatcher::start("membrane-video-transcode-release")
+        .map(|dispatcher| (atoms::ok(), dispatcher))
+        .map_err(|error| lifecycle_error(format!("could not start release dispatcher: {error}")))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn quarantine_release_dispatchers() -> NifResult<bool> {
+    let _admission = RELEASE_DISPATCHER_ADMISSION
+        .lock()
+        .map_err(|_| lifecycle_error("release dispatcher admission lock poisoned"))?;
+    Ok(!RELEASE_DISPATCHER_QUARANTINED.swap(true, Ordering::SeqCst))
+}
+
 #[rustler::nif]
-fn keepalive_release(ka: ResourceArc<Keepalive>) -> NifResult<Atom> {
-    ka.release();
-    Ok(atoms::ok())
+fn release_dispatcher_quarantined() -> bool {
+    RELEASE_DISPATCHER_QUARANTINED.load(Ordering::Acquire)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn close_release_dispatcher(
+    dispatcher: ResourceArc<ReleaseDispatcher>,
+    timeout_ms: u64,
+) -> NifResult<(Atom, bool)> {
+    dispatcher
+        .close_and_join(Duration::from_millis(timeout_ms))
+        .map(|()| (atoms::ok(), true))
+        .map_err(|error| lifecycle_error(format!("could not close release dispatcher: {error}")))
+}
+
+#[rustler::nif]
+fn new_abandonment_guard_resource<'a>(
+    dispatcher: ResourceArc<ReleaseDispatcher>,
+    owner: LocalPid,
+    token: Term<'a>,
+    holder: Reference<'a>,
+) -> NifResult<(Atom, ResourceArc<AbandonmentGuard>)> {
+    make_abandonment_guard(dispatcher, owner, token, holder)
+        .map(|guard| (atoms::ok(), guard))
+        .map_err(|error| lifecycle_error(format!("could not create abandonment guard: {error}")))
+}
+
+#[rustler::nif]
+fn abandonment_guard_resource(term: Term<'_>) -> bool {
+    is_abandonment_guard_resource(term)
 }
 
 #[rustler::nif]
@@ -799,9 +677,7 @@ fn create(
     } else {
         Some(hw_device)
     };
-    let output_mode = if output == atoms::prime() {
-        OutputMode::Prime
-    } else if output == atoms::dmabuf() {
+    let output_mode = if output == atoms::dmabuf() {
         OutputMode::Dmabuf
     } else if output == atoms::raw() {
         OutputMode::Raw
@@ -809,7 +685,7 @@ fn create(
         return Err(Error::BadArg);
     };
     let raw_target = match output_mode {
-        OutputMode::Prime | OutputMode::Dmabuf => None,
+        OutputMode::Dmabuf => None,
         OutputMode::Raw => {
             let atom = output_format.ok_or(Error::BadArg)?;
             let pixel = pixel_from_atom(atom).ok_or(Error::Atom("bad_pixel_format"))?;
@@ -897,13 +773,13 @@ fn get_metadata(state: ResourceArc<Decoder>) -> NifResult<(Atom, u32, u32, Optio
 mod atoms {
     rustler::atoms! {
         ok,
+        error,
         create_failed,
         auto,
         vaapi,
         v4l2request,
         v4l2m2m,
         software,
-        prime,
         dmabuf,
         raw,
         I420,

@@ -148,8 +148,6 @@ defmodule Membrane.Instrumentation.SessionConfig do
     {[container_segment(value)], nil}
   end
 
-  defp normalize_pipeline_prefix(nil), do: nil
-
   defp normalize_pipeline_prefix(prefix) when is_list(prefix) and prefix != [] do
     Enum.map(prefix, &normalize_path_segment/1)
   end

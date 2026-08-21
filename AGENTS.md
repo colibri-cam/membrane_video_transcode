@@ -1,16 +1,18 @@
 # Code Style and Testing Guidelines
 
-This project contains Elixir modules backed by Rust NIFs for H.265 decoding and
-low level atomic modesetting.
+This project contains Membrane video decoding, encoding, and transcoding elements backed by Rust
+NIFs. Display presentation and DRM/KMS sinks are outside this repository.
 
-Check `native/drm_prime_sink/AGENTS.md` and `native/h265_prime_decoder/AGENTS.md`
-for the Rust instructions.
+Check `native/h265_decoder/AGENTS.md` for Rust instructions.
 
 ## Code Style
-- Use elixir specified in .tool-versions
-- Format code with `cargo fmt -all` before committing.
+
+- Use the Elixir version specified in `.tool-versions`.
+- Run `mix format` before committing.
 - Keep imports sorted and grouped.
-- Use 2 spaces for indentation and try to keep lines under 100 characters.
+- Use two spaces for Elixir indentation.
 
 ## Testing
-- Run `mix test` to ensure tests are passing.
+
+- Run `mix test`.
+- Run the Rust checks listed in the native crate instructions.

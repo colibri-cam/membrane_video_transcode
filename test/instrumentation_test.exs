@@ -7,7 +7,7 @@ defmodule MembraneDRM.InstrumentationTest do
   alias Membrane.Instrumentation.WindowedStats
 
   setup do
-    Application.put_env(:membrane_video_linux, Instrumentation,
+    Application.put_env(:membrane_video_transcode, Instrumentation,
       average_windows: [:timer.seconds(1), :timer.seconds(5), :timer.seconds(30)],
       bucket_resolution: 250,
       snapshot_interval: :timer.seconds(1),
@@ -98,7 +98,7 @@ defmodule MembraneDRM.InstrumentationTest do
       )
 
     Instrumentation.emit(
-      [:nif, :h265_prime_decoder, :decode, :stop],
+      [:nif, :h265_decoder, :decode, :stop],
       %{duration_ns: 2_500_000},
       %{component_path: [pipeline_segment(self()), ":video_decoder"], result: :ok}
     )
@@ -112,7 +112,7 @@ defmodule MembraneDRM.InstrumentationTest do
   end
 
   test "session writes snapshots to configured file" do
-    tmp_dir = Path.join(System.tmp_dir!(), "membrane_drm_session_snapshot_test")
+    tmp_dir = Path.join(System.tmp_dir!(), "membrane_video_transcode_session_snapshot_test")
     snapshot_file = Path.join(tmp_dir, "snapshot.txt")
     File.rm_rf!(tmp_dir)
 

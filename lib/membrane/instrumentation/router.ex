@@ -29,13 +29,18 @@ defmodule Membrane.Instrumentation.Router do
     dispatch(routes().callbacks, {callback, component_key}, component_path, duration_ns)
   end
 
-  def handle_event([:membrane_drm, :nif, _domain, metric, :stop], measurements, metadata, _config) do
+  def handle_event(
+        [:membrane_video_transcode, :nif, _domain, metric, :stop],
+        measurements,
+        metadata,
+        _config
+      ) do
     component_path = metadata[:component_path] || []
     component_key = List.last(component_path)
     dispatch(routes().nifs, {metric, component_key}, component_path, measurements.duration_ns)
   end
 
-  def handle_event([:membrane_drm, :frame, :stage], measurements, metadata, _config) do
+  def handle_event([:membrane_video_transcode, :frame, :stage], measurements, metadata, _config) do
     component_path = metadata[:component_path] || []
     component_key = List.last(component_path)
 

@@ -112,7 +112,7 @@ defmodule Membrane.Instrumentation.Reporter do
 
   defp reduce_event(
          state,
-         [:membrane_drm, :nif, component, action, :stop],
+         [:membrane_video_transcode, :nif, component, action, :stop],
          measurements,
          metadata
        ) do
@@ -120,7 +120,7 @@ defmodule Membrane.Instrumentation.Reporter do
     update_in(state.nif_stats, &update_stats(&1, name, measurements.duration_ns))
   end
 
-  defp reduce_event(state, [:membrane_drm, :frame, :stage], measurements, metadata) do
+  defp reduce_event(state, [:membrane_video_transcode, :frame, :stage], measurements, metadata) do
     key = {metadata.component, metadata.stage}
 
     update_in(state.frame_stats, fn stats_map ->

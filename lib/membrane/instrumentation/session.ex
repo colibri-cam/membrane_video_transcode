@@ -6,7 +6,7 @@ defmodule Membrane.Instrumentation.Session do
 
   alias Membrane.Instrumentation.MetricCollector
 
-  @snapshot_table :membrane_drm_instrumentation_snapshots
+  @snapshot_table :membrane_video_transcode_instrumentation_snapshots
 
   defstruct [
     :name,

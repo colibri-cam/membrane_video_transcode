@@ -1,0 +1,25 @@
+[package]
+name = "h265_decoder"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "h265_decoder"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+ffmpeg-next = { version = "8.1", features = ["codec", "format", "software-scaling"] }
+rustler = "0.38"
+video-interop = { version = "0.1.0", path = "../../../../video_interop/rust/video-interop" }
+libc = "0.2"
+drm-fourcc = "2.2"
+
+[features]
+rpi = ["ffmpeg-next/rpi"]
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

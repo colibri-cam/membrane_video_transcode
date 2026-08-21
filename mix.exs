@@ -1,9 +1,9 @@
-defmodule MembraneVideoLinux.MixProject do
+defmodule MembraneVideoTranscode.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :membrane_video_linux,
+      app: :membrane_video_transcode,
       version: "0.1.0",
       elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
@@ -24,7 +24,8 @@ defmodule MembraneVideoLinux.MixProject do
     [
       {:rustler, "~> 0.38.0"},
       {:membrane_core, "~> 1.2.4"},
-      {:membrane_dmabuf, path: "../membrane_dmabuf"},
+      {:video_interop, path: "../../video_interop", override: true},
+      {:membrane_video_interop, path: "../../membrane_video_interop"},
       {:membrane_h265_format, "~> 0.2"},
       {:membrane_raw_video_format, "~> 0.4"}
     ]
