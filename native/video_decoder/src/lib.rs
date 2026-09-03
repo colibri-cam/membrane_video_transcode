@@ -1,5 +1,5 @@
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::ptr;
 use std::sync::{
@@ -30,22 +30,59 @@ use video_interop::{
 
 const NO_PTS: i64 = i64::MIN;
 const DRM_FORMAT_MOD_INVALID: u64 = (1_u64 << 56) - 1;
+const DMA_BUF_SYNC_READ: u32 = 1 << 0;
+const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: libc::c_ulong = 0xc008_6202;
+const SYNC_IOC_MERGE: libc::c_ulong = 0xc030_3e03;
 
-// get_format callback: choose DRM_PRIME when offered
+#[repr(C)]
+struct DmaBufExportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+#[repr(C)]
+struct SyncMergeData {
+    name: [libc::c_char; 32],
+    fd2: i32,
+    fence: i32,
+    flags: u32,
+    pad: u32,
+}
+
+unsafe fn select_pixel_format(
+    pix_fmts: *const sys::AVPixelFormat,
+    desired: sys::AVPixelFormat,
+) -> sys::AVPixelFormat {
+    unsafe {
+        let mut current = pix_fmts;
+        while !current.is_null() && *current != sys::AVPixelFormat::AV_PIX_FMT_NONE {
+            if *current == desired {
+                return *current;
+            }
+            current = current.add(1);
+        }
+        *pix_fmts
+    }
+}
+
 unsafe extern "C" fn get_format_drm_prime(
     _ctx: *mut sys::AVCodecContext,
     pix_fmts: *const sys::AVPixelFormat,
 ) -> sys::AVPixelFormat {
-    unsafe {
-        let mut p = pix_fmts;
-        while !p.is_null() && *p != sys::AVPixelFormat::AV_PIX_FMT_NONE {
-            if *p == sys::AVPixelFormat::AV_PIX_FMT_DRM_PRIME {
-                return *p;
-            }
-            p = p.add(1);
-        }
-        *pix_fmts
-    }
+    unsafe { select_pixel_format(pix_fmts, sys::AVPixelFormat::AV_PIX_FMT_DRM_PRIME) }
+}
+
+unsafe extern "C" fn get_format_vaapi(
+    _ctx: *mut sys::AVCodecContext,
+    pix_fmts: *const sys::AVPixelFormat,
+) -> sys::AVPixelFormat {
+    unsafe { select_pixel_format(pix_fmts, sys::AVPixelFormat::AV_PIX_FMT_VAAPI) }
+}
+
+#[derive(Clone, Copy)]
+enum CodecKind {
+    H264,
+    H265,
 }
 
 #[derive(Clone, Copy)]
@@ -74,12 +111,22 @@ struct ScalerSpec {
 }
 
 #[derive(rustler::NifStruct)]
-#[module = "Membrane.H265.Decoder.Native.DMABufFrame"]
+#[module = "Membrane.VideoTranscode.Decoder.Native.DMABufFrame"]
 struct DmabufFrame {
     width: u32,
     height: u32,
     modifier: Modifier,
     descriptor: Descriptor,
+    acquire_fence_fd: i32,
+    color_primaries: u32,
+    color_transfer: u32,
+    color_matrix: u32,
+    color_range: u32,
+    chroma_location: u32,
+    pixel_aspect_ratio_num: u32,
+    pixel_aspect_ratio_den: u32,
+    interlaced: bool,
+    top_field_first: bool,
     keepalive: ResourceArc<Keepalive>,
 }
 
@@ -101,6 +148,7 @@ struct Decoder {
 struct KeepaliveResources {
     frame: Video,
     object_fds: Vec<OwnedFd>,
+    acquire_sync: OwnedFd,
 }
 
 pub struct Keepalive {
@@ -114,9 +162,13 @@ impl rustler::Resource for Decoder {}
 impl rustler::Resource for Keepalive {}
 
 impl Keepalive {
-    fn new(frame: Video, object_fds: Vec<OwnedFd>) -> Self {
+    fn new(frame: Video, object_fds: Vec<OwnedFd>, acquire_sync: OwnedFd) -> Self {
         Self {
-            resources: Mutex::new(Some(KeepaliveResources { frame, object_fds })),
+            resources: Mutex::new(Some(KeepaliveResources {
+                frame,
+                object_fds,
+                acquire_sync,
+            })),
         }
     }
 
@@ -128,6 +180,7 @@ impl Keepalive {
                 sys::av_frame_unref(resources.frame.as_mut_ptr());
             }
             resources.object_fds.clear();
+            drop(resources.acquire_sync);
         }
     }
 }
@@ -160,7 +213,30 @@ fn find_any(names: &[&str]) -> Option<Codec> {
         .find_map(|name| codec::decoder::find_by_name(name))
 }
 
+fn software_codec(codec_kind: CodecKind) -> Result<Codec> {
+    let (id, name) = match codec_kind {
+        CodecKind::H264 => (codec::Id::H264, "h264"),
+        CodecKind::H265 => (codec::Id::HEVC, "hevc"),
+    };
+    codec::decoder::find(id).ok_or_else(|| anyhow!("no {name} codec"))
+}
+
+fn v4l2_request_codec(codec_kind: CodecKind) -> Option<Codec> {
+    match codec_kind {
+        CodecKind::H264 => find_any(&["h264_v4l2request"]),
+        CodecKind::H265 => find_any(&["hevc_v4l2request", "h265_v4l2request"]),
+    }
+}
+
+fn v4l2_m2m_codec(codec_kind: CodecKind) -> Option<Codec> {
+    match codec_kind {
+        CodecKind::H264 => find_any(&["h264_v4l2m2m"]),
+        CodecKind::H265 => find_any(&["hevc_v4l2m2m", "h265_v4l2m2m"]),
+    }
+}
+
 fn init_decoder(
+    codec_kind: CodecKind,
     output_mode: OutputMode,
     raw_target: Option<(Pixel, Atom)>,
     hw_device: Option<String>,
@@ -168,58 +244,67 @@ fn init_decoder(
 ) -> Result<Decoder> {
     ffmpeg::init().context("ffmpeg init failed")?;
     let mut use_v4l2 = matches!(backend, Backend::V4l2Request | Backend::V4l2M2M);
-    let hevc = match backend {
+    let selected_codec = match backend {
         Backend::Auto => {
-            if let Some(codec) = find_any(&["hevc_v4l2request", "h265_v4l2request"]) {
+            if let Some(codec) = v4l2_request_codec(codec_kind) {
                 use_v4l2 = true;
                 codec
-            } else if let Some(codec) = find_any(&["hevc_v4l2m2m", "h265_v4l2m2m"]) {
+            } else if let Some(codec) = v4l2_m2m_codec(codec_kind) {
                 use_v4l2 = true;
                 codec
             } else {
-                codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?
+                software_codec(codec_kind)?
             }
         }
-        Backend::V4l2Request => find_any(&["hevc_v4l2request", "h265_v4l2request"])
-            .ok_or_else(|| anyhow!("no v4l2request codec"))?,
-        Backend::V4l2M2M => find_any(&["hevc_v4l2m2m", "h265_v4l2m2m"])
-            .ok_or_else(|| anyhow!("no v4l2m2m codec"))?,
-        Backend::Vaapi | Backend::Software => {
-            codec::decoder::find(codec::Id::HEVC).ok_or_else(|| anyhow!("no hevc codec"))?
+        Backend::V4l2Request => {
+            v4l2_request_codec(codec_kind).ok_or_else(|| anyhow!("no v4l2request codec"))?
         }
+        Backend::V4l2M2M => {
+            v4l2_m2m_codec(codec_kind).ok_or_else(|| anyhow!("no v4l2m2m codec"))?
+        }
+        Backend::Vaapi | Backend::Software => software_codec(codec_kind)?,
     };
 
     let mut decoder = codec::decoder::new();
     unsafe {
         if use_v4l2 {
             let mut hw_device_ctx = ptr::null_mut();
-            let ret = sys::av_hwdevice_ctx_create(
+            let result = sys::av_hwdevice_ctx_create(
                 &mut hw_device_ctx,
                 sys::AVHWDeviceType::AV_HWDEVICE_TYPE_DRM,
                 ptr::null(),
                 ptr::null_mut(),
                 0,
             );
-            if ret < 0 || hw_device_ctx.is_null() {
-                return Err(anyhow!("av_hwdevice_ctx_create DRM failed: {ret}"));
+            if result < 0 || hw_device_ctx.is_null() {
+                return Err(anyhow!("av_hwdevice_ctx_create DRM failed: {result}"));
             }
             (*decoder.as_mut_ptr()).hw_device_ctx = sys::av_buffer_ref(hw_device_ctx);
             (*decoder.as_mut_ptr()).get_format = Some(get_format_drm_prime);
             sys::av_buffer_unref(&mut hw_device_ctx);
         } else if matches!(backend, Backend::Vaapi | Backend::Auto) {
-            let path_str = hw_device.unwrap_or_else(|| "/dev/dri/renderD129".to_string());
-            if Path::new(&path_str).exists() {
+            let device = hw_device.unwrap_or_else(|| "/dev/dri/renderD128".to_string());
+            if matches!(backend, Backend::Vaapi) && !Path::new(&device).exists() {
+                return Err(anyhow!("VAAPI device does not exist: {device}"));
+            }
+
+            if Path::new(&device).exists() {
+                let device = CString::new(device).context("VAAPI device contains NUL")?;
                 let mut hw_device_ctx = ptr::null_mut();
-                if let Ok(path) = CString::new(path_str)
-                    && sys::av_hwdevice_ctx_create(
-                        &mut hw_device_ctx,
-                        sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-                        path.as_ptr(),
-                        ptr::null_mut(),
-                        0,
-                    ) >= 0
-                {
+                let result = sys::av_hwdevice_ctx_create(
+                    &mut hw_device_ctx,
+                    sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                    device.as_ptr(),
+                    ptr::null_mut(),
+                    0,
+                );
+                if result < 0 || hw_device_ctx.is_null() {
+                    if matches!(backend, Backend::Vaapi) {
+                        return Err(anyhow!("av_hwdevice_ctx_create VAAPI failed: {result}"));
+                    }
+                } else {
                     (*decoder.as_mut_ptr()).hw_device_ctx = sys::av_buffer_ref(hw_device_ctx);
+                    (*decoder.as_mut_ptr()).get_format = Some(get_format_vaapi);
                     sys::av_buffer_unref(&mut hw_device_ctx);
                 }
             }
@@ -228,7 +313,7 @@ fn init_decoder(
         (*decoder.as_mut_ptr()).extra_hw_frames = 16;
     }
 
-    let opened = decoder.open_as(hevc).context("open codec")?;
+    let opened = decoder.open_as(selected_codec).context("open codec")?;
     let video = opened.video().context("video decoder")?;
     let (raw_target, raw_target_atom) =
         raw_target.map_or((None, None), |(pixel, atom)| (Some(pixel), Some(atom)));
@@ -315,6 +400,76 @@ fn owned_drm_frame(frame: &Video) -> Result<Video> {
     Ok(drm)
 }
 
+fn export_object_sync_file(dmabuf_fd: RawFd) -> Result<OwnedFd> {
+    let mut data = DmaBufExportSyncFile {
+        flags: DMA_BUF_SYNC_READ,
+        fd: -1,
+    };
+    let result = unsafe {
+        libc::ioctl(
+            dmabuf_fd,
+            DMA_BUF_IOCTL_EXPORT_SYNC_FILE,
+            &mut data as *mut DmaBufExportSyncFile,
+        )
+    };
+
+    if result < 0 || data.fd < 0 {
+        Err(anyhow!(
+            "failed to export acquire sync file from DMA-BUF fd {dmabuf_fd}: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(data.fd) })
+    }
+}
+
+fn merge_sync_files(left: OwnedFd, right: OwnedFd) -> Result<OwnedFd> {
+    let mut data = SyncMergeData {
+        name: [0; 32],
+        fd2: right.as_raw_fd(),
+        fence: -1,
+        flags: 0,
+        pad: 0,
+    };
+    b"video_decoder"
+        .iter()
+        .enumerate()
+        .for_each(|(index, byte)| data.name[index] = *byte as libc::c_char);
+
+    let result = unsafe {
+        libc::ioctl(
+            left.as_raw_fd(),
+            SYNC_IOC_MERGE,
+            &mut data as *mut SyncMergeData,
+        )
+    };
+
+    if result < 0 || data.fence < 0 {
+        Err(anyhow!(
+            "failed to merge decoded-frame sync files: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(data.fence) })
+    }
+}
+
+fn export_acquire_sync_file(descriptor: &sys::AVDRMFrameDescriptor) -> Result<OwnedFd> {
+    let mut sync_files = descriptor.objects[..descriptor.nb_objects as usize]
+        .iter()
+        .map(|object| export_object_sync_file(object.fd));
+    let first = sync_files
+        .next()
+        .ok_or_else(|| anyhow!("DRM PRIME descriptor has no objects to synchronize"))?;
+    let mut merged = first?;
+
+    for sync_file in sync_files {
+        merged = merge_sync_files(merged, sync_file?)?;
+    }
+
+    Ok(merged)
+}
+
 fn export_dmabuf(frame: &Video) -> Result<DmabufFrame> {
     let drm_frame = owned_drm_frame(frame)?;
     let desc_ptr = unsafe { (*drm_frame.as_ptr()).data[0] as *const sys::AVDRMFrameDescriptor };
@@ -372,6 +527,8 @@ fn export_dmabuf(frame: &Video) -> Result<DmabufFrame> {
         object_fds.push(owned);
     }
 
+    let acquire_sync = export_acquire_sync_file(desc)?;
+    let acquire_fence_fd = acquire_sync.as_raw_fd();
     let layer_order: Vec<usize> = if desc.nb_layers == 1 {
         if desc.layers[0].format != DrmFourcc::Nv12 as u32 {
             return Err(anyhow!("single-layer descriptor is not NV12"));
@@ -433,13 +590,31 @@ fn export_dmabuf(frame: &Video) -> Result<DmabufFrame> {
     descriptor.validate().map_err(|error| anyhow!(error))?;
 
     let modifier = stream_modifier.ok_or_else(|| anyhow!("missing DMA-BUF modifier"))?;
-    let keepalive = ResourceArc::new(Keepalive::new(drm_frame, object_fds));
+    let raw_frame = unsafe { &*frame.as_ptr() };
+    let sample_aspect_ratio = raw_frame.sample_aspect_ratio;
+    let pixel_aspect_ratio = match (sample_aspect_ratio.num, sample_aspect_ratio.den) {
+        (num, den) if num > 0 && den > 0 => (num as u32, den as u32),
+        _ => (1, 1),
+    };
+    let interlaced = raw_frame.flags & sys::AV_FRAME_FLAG_INTERLACED != 0;
+    let top_field_first = raw_frame.flags & sys::AV_FRAME_FLAG_TOP_FIELD_FIRST != 0;
+    let keepalive = ResourceArc::new(Keepalive::new(drm_frame, object_fds, acquire_sync));
 
     Ok(DmabufFrame {
         width: frame.width(),
         height: frame.height(),
         modifier,
         descriptor,
+        acquire_fence_fd,
+        color_primaries: raw_frame.color_primaries as u32,
+        color_transfer: raw_frame.color_trc as u32,
+        color_matrix: raw_frame.colorspace as u32,
+        color_range: raw_frame.color_range as u32,
+        chroma_location: raw_frame.chroma_location as u32,
+        pixel_aspect_ratio_num: pixel_aspect_ratio.0,
+        pixel_aspect_ratio_den: pixel_aspect_ratio.1,
+        interlaced,
+        top_field_first,
         keepalive,
     })
 }
@@ -667,11 +842,19 @@ fn release_frame(keepalive: ResourceArc<Keepalive>) -> NifResult<Atom> {
 
 #[rustler::nif]
 fn create(
+    codec: Atom,
     output: Atom,
     output_format: Option<Atom>,
     hw_device: String,
     decoder: Atom,
 ) -> NifResult<ResourceArc<Decoder>> {
+    let codec_kind = if codec == atoms::h264() {
+        CodecKind::H264
+    } else if codec == atoms::h265() {
+        CodecKind::H265
+    } else {
+        return Err(Error::BadArg);
+    };
     let path = if hw_device.is_empty() {
         None
     } else {
@@ -706,7 +889,7 @@ fn create(
         return Err(Error::BadArg);
     };
 
-    init_decoder(output_mode, raw_target, path, backend)
+    init_decoder(codec_kind, output_mode, raw_target, path, backend)
         .map(ResourceArc::new)
         .map_err(|err| Error::Term(Box::new((atoms::create_failed(), format!("{err:?}")))))
 }
@@ -775,6 +958,8 @@ mod atoms {
         ok,
         error,
         create_failed,
+        h264,
+        h265,
         auto,
         vaapi,
         v4l2request,
@@ -824,4 +1009,4 @@ fn pixel_from_atom(atom: Atom) -> Option<Pixel> {
     }
 }
 
-rustler::init!("Elixir.Membrane.H265.Decoder.Native");
+rustler::init!("Elixir.Membrane.VideoTranscode.Decoder.Native");

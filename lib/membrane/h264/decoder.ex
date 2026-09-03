@@ -1,7 +1,7 @@
-defmodule Membrane.H265.Decoder do
+defmodule Membrane.H264.Decoder do
   @moduledoc """
-  Decodes H.265 access units into leased NV12 DMA-BUF `%VideoInterop.Frame{}` payloads or copied
-  raw frames.
+  Decodes Annex B H.264 access units into leased NV12 DMA-BUF `%VideoInterop.Frame{}` payloads or
+  copied raw frames.
 
   DMA-BUF output carries a concrete sync-file acquire fence. Its native storage and fence lifetime
   are owned by a bounded `VideoInterop.LeaseOwner` with authenticated abandonment guards.
@@ -11,7 +11,7 @@ defmodule Membrane.H265.Decoder do
 
   use Membrane.Filter
 
-  alias Membrane.H265
+  alias Membrane.H264
   alias Membrane.RawVideo
   alias Membrane.VideoTranscode.Decoder.Core
   alias VideoInterop.Format
@@ -70,7 +70,7 @@ defmodule Membrane.H265.Decoder do
 
   def_input_pad(:input,
     flow_control: :auto,
-    accepted_format: %H265{alignment: :au}
+    accepted_format: %H264{alignment: :au, stream_structure: :annexb}
   )
 
   def_output_pad(:output,
@@ -83,7 +83,7 @@ defmodule Membrane.H265.Decoder do
   )
 
   @impl true
-  def handle_init(_ctx, opts), do: Core.init(opts, :h265)
+  def handle_init(_ctx, opts), do: Core.init(opts, :h264)
 
   @impl true
   def handle_setup(_ctx, state), do: Core.setup(state)

@@ -1,10 +1,11 @@
 defmodule MembraneVideoTranscodeTest do
   use ExUnit.Case, async: false
 
-  alias Membrane.H265.Decoder.Native
+  alias Membrane.VideoTranscode.Decoder.Native
   alias VideoInterop.{AbandonmentGuard, LeaseOwner}
 
   test "package exposes codec elements without legacy presentation modules" do
+    assert Code.ensure_loaded?(Membrane.H264.Decoder)
     assert Code.ensure_loaded?(Membrane.H265.Decoder)
     refute Code.ensure_loaded?(Membrane.Display.Sink)
     refute Code.ensure_loaded?(Membrane.PrimeFormat)

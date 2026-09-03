@@ -3,7 +3,7 @@
 This project contains Membrane video decoding, encoding, and transcoding elements backed by Rust
 NIFs. Display presentation and DRM/KMS sinks are outside this repository.
 
-Check `native/h265_decoder/AGENTS.md` for Rust instructions.
+Check `native/video_decoder/AGENTS.md` for Rust instructions.
 
 ## Code Style
 

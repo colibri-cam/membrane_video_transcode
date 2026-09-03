@@ -23,6 +23,8 @@ defmodule Membrane.Instrumentation do
     [:membrane, :element, :handle_info, :stop],
     [:membrane, :element, :handle_end_of_stream, :stop],
     [:membrane, :element, :handle_terminate_request, :stop],
+    [:membrane_video_transcode, :nif, :h264_decoder, :decode, :stop],
+    [:membrane_video_transcode, :nif, :h264_decoder, :flush, :stop],
     [:membrane_video_transcode, :nif, :h265_decoder, :decode, :stop],
     [:membrane_video_transcode, :nif, :h265_decoder, :flush, :stop],
     [:membrane_video_transcode, :frame, :stage]

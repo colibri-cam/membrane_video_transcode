@@ -1,9 +1,25 @@
-defmodule Membrane.H265.Decoder.Native do
+defmodule Membrane.VideoTranscode.Decoder.Native do
   @rustler_opts Mix.Project.config()[:rustler_opts]
 
   defmodule DMABufFrame do
     @moduledoc false
-    @enforce_keys [:width, :height, :modifier, :descriptor, :keepalive]
+    @enforce_keys [
+      :width,
+      :height,
+      :modifier,
+      :descriptor,
+      :acquire_fence_fd,
+      :color_primaries,
+      :color_transfer,
+      :color_matrix,
+      :color_range,
+      :chroma_location,
+      :pixel_aspect_ratio_num,
+      :pixel_aspect_ratio_den,
+      :interlaced,
+      :top_field_first,
+      :keepalive
+    ]
     defstruct @enforce_keys
   end
 
@@ -11,12 +27,12 @@ defmodule Membrane.H265.Decoder.Native do
       Keyword.merge(
         [
           otp_app: :membrane_video_transcode,
-          crate: "h265_decoder"
+          crate: "video_decoder"
         ],
         @rustler_opts
       )
 
-  def create(_output, _output_format, _hw_device, _decoder),
+  def create(_codec, _output, _output_format, _hw_device, _decoder),
     do: :erlang.nif_error(:nif_not_loaded)
 
   def decode(_state, _data, _pts, _dts), do: :erlang.nif_error(:nif_not_loaded)

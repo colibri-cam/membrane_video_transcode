@@ -1,7 +1,7 @@
 # Code Style and Testing Guidelines
 
-This Rust NIF exposes hardware-accelerated H.265 decoding through FFmpeg and canonical
-VideoInterop DMA-BUF output.
+This Rust NIF exposes hardware-accelerated H.264 and H.265 decoding through FFmpeg and
+canonical VideoInterop DMA-BUF output.
 
 ## Code Style
 

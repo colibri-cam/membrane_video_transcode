@@ -1,9 +1,9 @@
-defmodule Membrane.H265.Decoder.ReleaseDispatcherCustodian do
+defmodule Membrane.VideoTranscode.Decoder.ReleaseDispatcherCustodian do
   @moduledoc false
 
   use GenServer
 
-  alias Membrane.H265.Decoder.Native
+  alias Membrane.VideoTranscode.Decoder.Native
 
   @type status :: :active | {:quarantined, term()}
 

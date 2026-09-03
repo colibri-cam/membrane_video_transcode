@@ -23,9 +23,9 @@ defmodule MembraneVideoTranscode.MixProject do
   defp deps do
     [
       {:rustler, "~> 0.38.0"},
-      {:membrane_core, "~> 1.2.4"},
-      {:video_interop, path: "../../video_interop", override: true},
-      {:membrane_video_interop, path: "../../membrane_video_interop"},
+      {:membrane_core, "~> 1.2"},
+      {:video_interop, path: "../video_interop", override: true},
+      {:membrane_h264_format, "~> 0.6"},
       {:membrane_h265_format, "~> 0.2"},
       {:membrane_raw_video_format, "~> 0.4"}
     ]

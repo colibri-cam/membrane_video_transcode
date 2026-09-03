@@ -1,4 +1,4 @@
-defmodule MembraneDRM.InstrumentationTest do
+defmodule MembraneVideoTranscode.InstrumentationTest do
   use ExUnit.Case, async: false
 
   alias Membrane.Instrumentation

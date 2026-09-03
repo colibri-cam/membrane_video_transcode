@@ -1,26 +1,40 @@
-# Raspberry Pi 5 Support Plan
+# Raspberry Pi 5 Decoder Support
 
-This document outlines proposed changes required for the H265 decoder, H265 prime decoder, DRM sink, and DRM prime sink NIFs to run on a Raspberry Pi 5.
+Raspberry Pi 5 support is hardware-qualified separately from the desktop VAAPI path.
+`membrane_video_transcode` remains codec-only: display, DRM/KMS, and presentation concerns belong to
+consumers outside this package.
 
-## Build and Toolchain
-- Cross-compile all native crates for `aarch64-unknown-linux-gnu` since Raspberry Pi 5 defaults to a 64-bit kernel.
-- Update `Cross.toml` files to include an explicit target for Raspberry Pi 5 and verify that `cross` uses a recent `aarch64` GCC toolchain.
-- Ensure `ffmpeg` is built with the `v4l2-request` and `drm` backends enabled so hardware blocks are available.
+## Build requirements
 
-## Decoder NIF Changes
-- Allow explicitly selecting the decoder backend (e.g., `:vaapi` or `:v4l2request`) or
-  fall back to auto detection that probes for the `hevc_v4l2request` or `hevc_v4l2m2m`
-  codecs before using VAAPI or software. This applies to both the regular and prime H265
-  decoder NIFs.
-- Fall back to software decoding when no hardware decoder is available.
-- Handle the NV12 pixel format produced by the Raspberry Pi hardware decoder without additional copies.
+- Cross-compile `native/video_decoder` for `aarch64-unknown-linux-gnu` when the target system uses
+  the standard 64-bit Raspberry Pi kernel.
+- Provide target FFmpeg libraries and headers through the Nerves sysroot.
+- Build FFmpeg with the selected V4L2 Request or V4L2 M2M decoder and DRM PRIME support.
+- Keep the `video-interop` Rust source aligned with the Elixir `video_interop` dependency.
 
-## Sink NIF Changes
-- Select the `vc4` DRM driver used on the Pi 5 instead of assuming `card0`.
-- Add plane and connector selection logic based on `vc4` DRM capabilities so the correct HDMI output is used.
-- Support modifiers required by the Raspberry Pi framebuffer, e.g., `DRM_FORMAT_MOD_BROADCOM_SAND128` for direct scan‑out. These updates cover both the standard DRM sink and the DRM prime sink NIFs.
+## Runtime contract
 
-## Testing
-- Integrate the Pi into CI by running the decoder and sink elements inside a Nerves deployment on real hardware.
-- Exercise end-to-end playback with `mix test` to confirm the NIFs operate correctly on the board.
+Select `:v4l2request` or `:v4l2m2m` explicitly after confirming the codec exposed by the target
+FFmpeg build. DMA-BUF output must satisfy the same contract as VAAPI output:
 
+- NV12 `%VideoInterop.Format{}` stream format;
+- `%VideoInterop.Frame{}` buffer payloads;
+- complete DMA-BUF allocation sizes and exact planes;
+- one uniform explicit modifier per stream;
+- a concrete acquire sync-file exported from the DMA-BUF reservation object;
+- one bounded lease that retires all native frame, descriptor, and synchronization resources.
+
+The `rpi` Cargo feature accepts the Raspberry Pi multi-layer DRM PRIME descriptions and normalizes
+them into one canonical NV12 layer. It does not add display or scanout behavior.
+
+## Qualification
+
+On physical Raspberry Pi 5 hardware:
+
+1. Decode both H.264 and H.265 fixtures with the selected backend.
+2. Validate every stream format and frame with `VideoInterop.validate/1`.
+3. Confirm the advertised modifier imports on the intended consumer GPU.
+4. Release every frame and verify the decoder lease owner drains at EOS and shutdown.
+5. Exercise held-frame backpressure and abandonment without leaking DMA-BUF or sync-file FDs.
+6. Run `cargo test`, Clippy with warnings denied, a release build, and the Elixir test suite against
+   the target FFmpeg build.
