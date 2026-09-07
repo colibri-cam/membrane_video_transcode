@@ -8,8 +8,12 @@ consumers outside this package.
 
 - Cross-compile `native/video_decoder` for `aarch64-unknown-linux-gnu` when the target system uses
   the standard 64-bit Raspberry Pi kernel.
-- Provide target FFmpeg libraries and headers through the Nerves sysroot.
-- Build FFmpeg with the selected V4L2 Request or V4L2 M2M decoder and DRM PRIME support.
+- Use the `ffmpeg-rpi` libraries and headers supplied by `colibri-cam/nerves_system_gs`, or an
+  equivalent Raspberry Pi-patched FFmpeg build, through the Nerves sysroot. Stock upstream FFmpeg
+  does not currently provide the same V4L2 Request, DRM PRIME, and Raspberry Pi pixel-format
+  contract.
+- Build `ffmpeg-rpi` with V4L2 Request, DRM, and SAND support. Enable any V4L2 M2M codec used by a
+  selected deployment backend as well.
 - Keep the `video-interop` Rust source aligned with the Elixir `video_interop` dependency.
 
 ## Runtime contract
@@ -24,8 +28,10 @@ FFmpeg build. DMA-BUF output must satisfy the same contract as VAAPI output:
 - a concrete acquire sync-file exported from the DMA-BUF reservation object;
 - one bounded lease that retires all native frame, descriptor, and synchronization resources.
 
-The `rpi` Cargo feature accepts the Raspberry Pi multi-layer DRM PRIME descriptions and normalizes
-them into one canonical NV12 layer. It does not add display or scanout behavior.
+The `rpi` Cargo feature forwards to `ffmpeg-next/rpi`. This is required when compiling against
+`ffmpeg-rpi` headers so `ffmpeg-next` recognizes the additional SAND and RPI4 pixel formats. The
+feature does not build or install FFmpeg; the Nerves system must supply the matching patched
+libraries. It also does not add display or scanout behavior.
 
 ## Qualification
 

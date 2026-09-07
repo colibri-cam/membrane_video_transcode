@@ -11,6 +11,15 @@ defmodule MembraneVideoTranscodeTest do
     refute Code.ensure_loaded?(Membrane.PrimeFormat)
   end
 
+  test "Raspberry Pi builds enable ffmpeg-next pixel-format compatibility" do
+    manifest =
+      __DIR__
+      |> Path.join("../native/video_decoder/Cargo.toml")
+      |> File.read!()
+
+    assert manifest =~ ~r/^rpi = \["ffmpeg-next\/rpi"\]$/m
+  end
+
   test "guarded decoder leases release and drain before dispatcher shutdown" do
     assert {:ok, dispatcher} = Native.start_release_dispatcher()
     test_pid = self()

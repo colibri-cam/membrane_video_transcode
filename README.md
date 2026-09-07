@@ -29,23 +29,15 @@ def deps do
   [
     {:membrane_video_transcode,
      git: "https://github.com/colibri-cam/membrane_video_transcode.git"},
-    {:video_interop, path: "../video_interop"},
+    {:video_interop, "~> 0.1.0"},
     {:membrane_video_interop, path: "../membrane_video_interop"}
   ]
 end
 ```
 
-Until the VideoInterop packages are published, the development checkout expects this sibling
-layout:
-
-```text
-/workspace/video_interop
-/workspace/membrane_video_interop
-/workspace/membrane_video_transcode
-```
-
-`membrane_video_transcode` itself depends only on `video_interop`; it does not depend on a
-transport or renderer.
+Until `membrane_video_interop` is published, applications can use its sibling checkout as shown
+above. `membrane_video_transcode` itself depends only on the published `video_interop` package; it
+does not depend on a transport or renderer.
 
 ## Canonical decoded output
 
@@ -98,4 +90,8 @@ When `NERVES_SDK_SYSROOT` is set, `mix.exs` maps the Nerves C compiler prefix to
 target and passes the target linker and FFmpeg paths to Rustler. The current mapping includes the
 standard ARMv6, ARMv7, AArch64, and x86_64 Nerves targets.
 
-The target sysroot must provide FFmpeg with the hardware decoder support selected at runtime.
+Raspberry Pi deployments must use the `ffmpeg-rpi` libraries and headers supplied by
+`colibri-cam/nerves_system_gs`, or an equivalent patched FFmpeg build with V4L2 Request, DRM, and
+SAND support. Nerves cross-compilation enables the crate's `rpi` feature, which forwards to
+`ffmpeg-next/rpi`; that feature exposes the patched pixel formats but does not supply FFmpeg itself.
+Stock upstream FFmpeg is not a substitute for this target contract.
