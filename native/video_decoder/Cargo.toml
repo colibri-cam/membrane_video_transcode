@@ -11,16 +11,13 @@ crate-type = ["cdylib"]
 anyhow = "1"
 ffmpeg-next = { version = "9.0", features = ["codec", "format", "software-scaling"] }
 rustler = "0.38"
-video-interop = "0.1.1"
+video-interop = "0.1.2"
 libc = "0.2"
 drm-fourcc = "2.2"
 
 [features]
 # The target sysroot supplies ffmpeg-rpi; this enables its additional pixel formats.
 rpi = ["ffmpeg-next/rpi"]
-
-[patch.crates-io]
-video-interop = { path = "../../../video_interop/rust/video-interop" }
 
 [profile.release]
 opt-level = "z"
